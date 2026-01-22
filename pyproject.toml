@@ -1,0 +1,29 @@
+[project]
+name = "robust-segmentation"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "albumentations>0.5",
+    "cffi>=2.0.0",
+    "cython>=3.1.4",
+    "easydict>=1.13",
+    "future>=1.0.0",
+    "graphviz>=0.21",
+    "imgaug>=0.4",
+    "matplotlib>=3.10.7",
+    "ninja>=1.13.0",
+    "numpy==1.23.5",
+    "opencv-python-headless>=4.8.1.78",
+    "pillow>=11.3.0",
+    "pyyaml>=6.0.3",
+    "scikit-image>=0.24.0",
+    "scipy>=1.15.3",
+    "segment-anything>=1.0",
+    "segmentation-models-pytorch>=0.5.0",
+    "tensorboard>=2.20.0",
+    "torch>=1.4.0",
+    "torchvision>=0.5.0",
+    "tqdm>=4.67.1",
+]
