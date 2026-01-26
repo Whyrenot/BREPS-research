@@ -1,13 +1,15 @@
 # [AAAI 2026] BREPS: Bounding-Box Robustness Evaluation of Promptable Segmentation
 [![Paper](https://img.shields.io/badge/Paper-arXiv-red)](https://arxiv.org/abs/2601.15123)
 
-This repository contains offiсial implementation of algorithms proposed in paper: [BREPS: Bounding-Box Robustness Evaluation of Promptable Segmentation](arxiv_placeholder)
+This repository contains offiсial dataset and code implementation for the paper:  
+[BREPS: Bounding-Box Robustness Evaluation of Promptable Segmentation](https://arxiv.org/abs/2601.15123)
 
-![preview](assets/clickbait-1.png)
+<img width="790" height="564" alt="image" src="https://github.com/user-attachments/assets/0f8414f7-603c-4b4b-911c-30c726f23f36" />
 
-# Setting up an environment
 
-## Install dependencies:
+# Setting Environment
+
+## Install Dependencies:
 
 ```pip3 install torch==1.13.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu117
 conda install -y scikit-image
@@ -15,7 +17,7 @@ conda install -y -c anaconda cmake
 pip install -e .
 ```
 
-## Prepare datasets & models checkpoints
+## Prepare Datasets & Models Checkpoints
 
 #### This project builds upon on [RITM](https://github.com/saic-vul/ritm_interactive_segmentation) and [TETRIS](https://arxiv.org/abs/2402.06132),and so it uses the same dataset structure and evaluation scripts. Thus, you should configure the paths to the datasets in [config.yml](./config.yml). We measured out BREPS attack on datasets below.
 
@@ -43,14 +45,14 @@ pip install -e .
 
 ---
 
-## Collected real user-study:
+## Real-Users Study:
 
 We collected 25000 annotations, 50 user bboxes for 500 images from 10 datasets (All attack datasets and also [ADE20K](https://ade20k.csail.mit.edu/) and [PascalVOC](https://zenodo.org/records/8312614)).
 You can download full user study data from this [link](https://drive.google.com/file/d/1cl2AheaxxvAt1pHeSvCtySqVYpE6BOQB/view?usp=sharing).
 
 To download checkpoints, please refer to the repositories of the relevant papers or download all checkpoints used in this work at once — [MODELS_CHECKPONTS.zip (18 GB)](https://mega.nz/file/stIkCQLT#P53Pfw9YKzDVMBgELmjCdhMZlBpic3tzXols2snavrI)
 
-# Run optimization
+# Run Optimization
 
 ## Short Example
 
@@ -82,7 +84,7 @@ etc.
 
 To benchmark all models after setting up an environment and downloading all checkpoints to `MODEL_CHECKPOINTS` folder and just run: `bash runbboxparallel.sh`, selecting the amount of models appropriate for your server. All hyperparameters are set following author implementations.
 
-# Metrics calculation
+# Metrics Calculation
 
 After benchmarking, each model creates entries in the folder `EXPS_PATH` from config.yml. Merge it with baseline experiments folder if you need IoU-Base@BBox scores.Use provided `Evaluate Models.ipynb` Jupyter Notebook to calculate all metrics — IoU-Min@BBox, IoU-Max@BBox, IoU-Base@BBox. One can download obtained results from benchmarking all models — [experiments.zip (570 MB)](https://drive.google.com/file/d/14efw-_o83HJOXt449-SbuURf7ZJJVioy/view?usp=sharing). Sample output:
 
@@ -105,5 +107,10 @@ To compute and visualise heatmaps, please checkout [HEATMAPS.md](heatmaps/HEATMA
 If you find this work useful for your research, please cite the original paper:
 
 ```
-
+@article{moskalenko2026breps,
+  title={BREPS: Bounding-Box Robustness Evaluation of Promptable Segmentation},
+  author={Moskalenko, Andrey and Kuznetsov, Danil and Dudko, Irina and Iasakova, Anastasiia and Boldyrev, Nikita and Shepelev, Denis and Spiridonov, Andrei and Kuznetsov, Andrey and Shakhuro, Vlad},
+  journal={arXiv preprint arXiv:2601.15123},
+  year={2026}
+}
 ```
