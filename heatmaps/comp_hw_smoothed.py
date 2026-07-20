@@ -7,6 +7,180 @@ import torch
 import torch.distributed as dist
 from loguru import logger
 from tqdm import tqdm
+from torchvision.ops import box_iou
+
+
+def sample_shifted_boxes_normal(base_box: torch.Tensor, image_shape, num_samples=10, X=0.05, seed=0):
+    H, W = image_shape
+    np.random.seed(seed)
+    boxes = []
+    gx0, gy0, gx1, gy1 = base_box.tolist()
+    w, h = gx1 - gx0, gy1 - gy0
+    
+    for i in range(num_samples * 10):
+        dx = np.random.normal(loc=0.0, scale=X) * w
+        dy = np.random.normal(loc=0.0, scale=X) * h
+        cand = torch.tensor([gx0 + dx, gy0 + dy, gx1 + dx, gy1 + dy])
+        cand[0::2].clamp_(0, W - 1)
+        cand[1::2].clamp_(0, H - 1)
+        
+        iou = box_iou(cand.unsqueeze(0), base_box.unsqueeze(0))[0, 0].item()
+        if iou > 0.5:
+            boxes.append(cand)
+        if len(boxes) >= num_samples:
+            break
+            
+    if not boxes:
+        boxes = [base_box]
+        
+    while len(boxes) < num_samples:
+        boxes.append(boxes[-1])
+        
+    return torch.stack(boxes[:num_samples]).to(torch.float32)
+
+
+def sample_size_perturbed_boxes(
+    base_box: torch.Tensor,
+    image_shape: tuple[int, int],
+    num_samples: int = 10,
+    sigma_w: float = 0.05,
+    sigma_h: float = 0.05,
+    seed: int = 0,
+) -> torch.Tensor:
+    """Randomized Smoothing defence: generate box copies with perturbed width/height.
+
+    The center of the bounding box is kept fixed; only width and height are
+    varied independently using zero-mean normal noise scaled by ``sigma_w`` and
+    ``sigma_h`` (fractions of the original side length).  Always includes the
+    original box as the first sample.
+
+    Args:
+        base_box: [x0, y0, x1, y1] tensor (float).
+        image_shape: (H, W) of the image.
+        num_samples: total number of boxes to return (including the original).
+        sigma_w: std-dev of relative width perturbation (e.g. 0.05 = ±5% of w).
+        sigma_h: std-dev of relative height perturbation (e.g. 0.05 = ±5% of h).
+        seed: random seed for reproducibility.
+
+    Returns:
+        Tensor of shape ``(num_samples, 4)`` with [x0, y0, x1, y1] boxes.
+    """
+    H, W = image_shape
+    rng = np.random.default_rng(seed)
+
+    gx0, gy0, gx1, gy1 = base_box.tolist()
+    w = gx1 - gx0
+    h = gy1 - gy0
+    cx = (gx0 + gx1) / 2.0
+    cy = (gy0 + gy1) / 2.0
+
+    boxes: list[torch.Tensor] = [base_box.float()]
+
+    attempts = 0
+    while len(boxes) < num_samples and attempts < num_samples * 20:
+        attempts += 1
+        dw = rng.normal(loc=0.0, scale=sigma_w) * w
+        dh = rng.normal(loc=0.0, scale=sigma_h) * h
+        new_w = max(1.0, w + dw)
+        new_h = max(1.0, h + dh)
+
+        x0 = cx - new_w / 2.0
+        x1 = cx + new_w / 2.0
+        y0 = cy - new_h / 2.0
+        y1 = cy + new_h / 2.0
+
+        cand = torch.tensor(
+            [
+                float(np.clip(x0, 0, W - 1)),
+                float(np.clip(y0, 0, H - 1)),
+                float(np.clip(x1, 0, W - 1)),
+                float(np.clip(y1, 0, H - 1)),
+            ],
+            dtype=torch.float32,
+        )
+        boxes.append(cand)
+
+    # Pad with the original box if we could not generate enough samples
+    while len(boxes) < num_samples:
+        boxes.append(base_box.float())
+
+    return torch.stack(boxes[:num_samples])
+
+
+def sample_size_and_center_perturbed_boxes(
+    base_box: torch.Tensor,
+    image_shape: tuple[int, int],
+    num_samples: int = 10,
+    sigma_w: float = 0.05,
+    sigma_h: float = 0.05,
+    sigma_cx: float = 0.03,
+    sigma_cy: float = 0.03,
+    seed: int = 0,
+) -> torch.Tensor:
+    """Randomized Smoothing defence: perturb width, height AND center position.
+
+    Each sample independently draws:
+      - width  noise ~ N(0, sigma_w) * w
+      - height noise ~ N(0, sigma_h) * h
+      - cx     noise ~ N(0, sigma_cx) * w   (scaled by box width)
+      - cy     noise ~ N(0, sigma_cy) * h   (scaled by box height)
+
+    The first sample is always the original (unperturbed) box.
+    All coordinates are clipped to the valid image range.
+
+    Args:
+        base_box:   [x0, y0, x1, y1] tensor (float).
+        image_shape: (H, W) of the image.
+        num_samples: total number of boxes to return (incl. original).
+        sigma_w:    std-dev of relative width  perturbation.
+        sigma_h:    std-dev of relative height perturbation.
+        sigma_cx:   std-dev of relative center-x shift (fraction of w).
+        sigma_cy:   std-dev of relative center-y shift (fraction of h).
+        seed:       random seed.
+
+    Returns:
+        Tensor of shape ``(num_samples, 4)`` with [x0, y0, x1, y1] boxes.
+    """
+    H, W = image_shape
+    rng = np.random.default_rng(seed)
+
+    gx0, gy0, gx1, gy1 = base_box.tolist()
+    w  = gx1 - gx0
+    h  = gy1 - gy0
+    cx = (gx0 + gx1) / 2.0
+    cy = (gy0 + gy1) / 2.0
+
+    boxes: list[torch.Tensor] = [base_box.float()]
+
+    attempts = 0
+    while len(boxes) < num_samples and attempts < num_samples * 20:
+        attempts += 1
+
+        new_w  = max(1.0, w  + rng.normal(0.0, sigma_w)  * w)
+        new_h  = max(1.0, h  + rng.normal(0.0, sigma_h)  * h)
+        new_cx = cx + rng.normal(0.0, sigma_cx) * w
+        new_cy = cy + rng.normal(0.0, sigma_cy) * h
+
+        x0 = new_cx - new_w / 2.0
+        x1 = new_cx + new_w / 2.0
+        y0 = new_cy - new_h / 2.0
+        y1 = new_cy + new_h / 2.0
+
+        cand = torch.tensor(
+            [
+                float(np.clip(x0, 0, W - 1)),
+                float(np.clip(y0, 0, H - 1)),
+                float(np.clip(x1, 0, W - 1)),
+                float(np.clip(y1, 0, H - 1)),
+            ],
+            dtype=torch.float32,
+        )
+        boxes.append(cand)
+
+    while len(boxes) < num_samples:
+        boxes.append(base_box.float())
+
+    return torch.stack(boxes[:num_samples])
 
 
 def generate_random_bboxes(
@@ -284,10 +458,16 @@ def load_samhq2_model(
     device: torch.device,
     model_type: str = "vit_l",
 ):
-    """SysCV/sam-hq2 -- package also named ``sam2``, clashes with the
-    official sam2 package used by load_sam2_model(). Only import-safe inside
-    the ``sam_hq2`` conda env (scripts/setup_repo.sh); route through
-    heatmaps.env_dispatch.maybe_dispatch_to_env("SAM-HQ2", ...) first."""
+    """SysCV/sam-hq -- the sam-hq2 subproject (github.com/SysCV/sam-hq).
+
+    Its Python package is ALSO named ``sam2`` -- the same import path as the
+    official facebookresearch/sam2 package already used by load_sam2_model()
+    above. The two cannot coexist on one interpreter's sys.path, so this
+    only works when actually running inside the ``sam_hq2`` conda env
+    created by scripts/setup_repo.sh. Callers should route through
+    heatmaps.env_dispatch.maybe_dispatch_to_env("SAM-HQ2", ...) first (all
+    scripts in this repo that accept --model_name already do).
+    """
     from sam2.build_sam import build_sam2
     from sam2.sam2_image_predictor import SAM2ImagePredictor
 
@@ -307,12 +487,28 @@ def load_sam3_model(
     device: torch.device,
     model_type: str = "vit_b",
 ):
-    """NOT YET WIRED IN -- see heatmaps/comp_hw_smoothed.load_sam3_model for
-    why (different predictor API, unconfirmed prompt_encoder/mask_decoder
-    access needed for gradient-based box optimisation)."""
+    """NOT YET WIRED IN.
+
+    SAM3 (facebookresearch/sam3) uses a different predictor
+    (``Sam3Processor`` / ``build_sam3_image_model()``), not the
+    SamPredictor/SAM2ImagePredictor box-prompt API the rest of this repo
+    assumes. It is UNCONFIRMED whether SAM3 exposes ``model.prompt_encoder``
+    / ``model.mask_decoder`` the way scripts/refine_box_iou_grad.py's
+    gradient-ascent path (refine_box_by_iou_grad) needs for autograd through
+    the box prompt.
+
+    Before wiring this up: in the ``sam3`` conda env (scripts/setup_repo.sh),
+    inspect build_sam3_image_model()'s returned model for a
+    prompt_encoder/mask_decoder pair with the same forward signature as
+    SAM1/SAM2, or adapt the gradient path to Sam3Processor's actual API.
+    """
     raise NotImplementedError(
-        "SAM3 is not wired into load_model() yet -- see "
-        "heatmaps/comp_hw_smoothed.load_sam3_model for details."
+        "SAM3 is not wired into load_model() yet -- its predictor API "
+        "(Sam3Processor / build_sam3_image_model) differs from SAM1/SAM2's "
+        "SamPredictor/SAM2ImagePredictor, and it's unconfirmed whether the "
+        "differentiable box->mask_decoder path refine_box_iou_grad.py needs "
+        "exists for SAM3. Verify on the `sam3` conda env first, then "
+        "implement load_sam3_model() here."
     )
 
 
@@ -336,12 +532,13 @@ def prepare_input(
     image_path: str,
     predictor,
     all_bboxes: np.ndarray,
-) -> tuple[np.ndarray, torch.Tensor]:
+) -> tuple[np.ndarray, torch.Tensor, tuple[int, int]]:
     image_bgr = cv2.imread(image_path)
     if image_bgr is None:
         raise FileNotFoundError(f"Failed to read image: {image_path}")
 
     image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    image_shape = image.shape[:2]
 
     if image.shape[0] > 1024 and image.shape[1] > 1024:
         image = cv2.resize(image, (1024, 1024))
@@ -354,59 +551,119 @@ def prepare_input(
         dtype=torch.float32,
     )
 
-    if hasattr(predictor, "transform"):
-        transformed_boxes = predictor.transform.apply_boxes_torch(
-            boxes_tensor,
-            predictor.original_size,
-        )
-    else:
-        transformed_boxes = boxes_tensor
-
-    return image, transformed_boxes
+    return image, boxes_tensor, image_shape
 
 
 @torch.inference_mode()
-def multi_bbox_inference(
+def multi_bbox_inference_smoothed(
     image_path: str,
     predictor,
     all_bboxes_list: np.ndarray,
     rank: int,
-    batch_size: int = 8,
+    Y: int,
+    X: float,
+    averaging_mode: str,
+    batch_size: int = 1024,
 ):
-    _, transformed_boxes = prepare_input(
+    _, base_boxes_tensor, image_shape = prepare_input(
         image_path=image_path,
         predictor=predictor,
         all_bboxes=all_bboxes_list,
     )
 
     predictor.model.eval()
-    indice = 0
+    thresh = 0.0
 
-    for bboxes in transformed_boxes.split(batch_size, dim=0):
-        if hasattr(predictor, "predict_torch"):
-            masks, scores, _ = predictor.predict_torch(
-                point_coords=None,
-                point_labels=None,
-                boxes=bboxes.to(rank),
-                multimask_output=False,
+    base_batch_size = max(1, batch_size // Y)
+
+    for i in range(0, len(base_boxes_tensor), base_batch_size):
+        base_batch = base_boxes_tensor[i : i + base_batch_size]
+
+        all_noisy_boxes = []
+        for j, base_box in enumerate(base_batch):
+            noisy_boxes = sample_shifted_boxes_normal(
+                base_box,
+                image_shape=image_shape,
+                num_samples=Y,
+                X=X,
+                seed=42
+            )
+            all_noisy_boxes.append(noisy_boxes)
+            
+        all_noisy_boxes = torch.cat(all_noisy_boxes, dim=0)
+
+        if hasattr(predictor, "transform"):
+            transformed_boxes = predictor.transform.apply_boxes_torch(
+                all_noisy_boxes,
+                predictor.original_size,
             )
         else:
-            masks, scores, _ = predictor.predict_batch_single_image(
-                point_coords_batch=None,
-                point_labels_batch=None,
-                box_batch=bboxes.to(rank),
-                multimask_output=False,
-            )
-            masks = torch.stack(masks).squeeze(0)
+            transformed_boxes = all_noisy_boxes
+            
+        transformed_boxes = transformed_boxes.to(rank)
+
+        with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
+            if hasattr(predictor, "predict_torch"):
+                try:
+                    masks_logits, scores, _ = predictor.predict_torch(
+                        point_coords=None,
+                        point_labels=None,
+                        boxes=transformed_boxes,
+                        multimask_output=False,
+                        return_logits=True,
+                    )
+                except TypeError:
+                    masks_logits, scores, _ = predictor.predict_torch(
+                        point_coords=None,
+                        point_labels=None,
+                        boxes=transformed_boxes,
+                        multimask_output=False,
+                    )
+            else:
+                try:
+                    masks_logits, scores, _ = predictor.predict_batch_single_image(
+                        point_coords_batch=None,
+                        point_labels_batch=None,
+                        box_batch=transformed_boxes,
+                        multimask_output=False,
+                        return_logits=True,
+                    )
+                except (TypeError, RuntimeError):
+                    masks_logits, scores, _ = predictor.predict_batch_single_image(
+                        point_coords_batch=None,
+                        point_labels_batch=None,
+                        box_batch=transformed_boxes,
+                        multimask_output=False,
+                    )
+                masks_logits = torch.stack(masks_logits).squeeze(0)
+
+        masks_logits = masks_logits.float()
+        
+        B = base_batch.size(0)
+        _, C, H, W = masks_logits.shape
+        masks_logits = masks_logits.view(B, Y, C, H, W)
+        scores = scores.view(B, Y, -1)
+
+        if "logit" in averaging_mode:
+            avg_res = masks_logits.mean(dim=1)
+            smoothed_prob = torch.sigmoid(avg_res)
+        elif "sigmoid" in averaging_mode:
+            p_perturb = torch.sigmoid(masks_logits)
+            smoothed_prob = p_perturb.mean(dim=1)
+        elif "binary" in averaging_mode:
+            m_perturb = (masks_logits > thresh).float()
+            smoothed_prob = m_perturb.mean(dim=1)
+        else:
+            avg_res = masks_logits.mean(dim=1)
+            smoothed_prob = torch.sigmoid(avg_res)
+
+        smoothed_mask = (smoothed_prob > 0.5)
 
         yield {
-            "indice": indice,
-            "masks": masks,
-            "scores": scores,
-            "boxes": bboxes,
+            "masks": smoothed_mask,
+            "scores": scores.mean(dim=1),
+            "boxes": base_batch,
         }
-
-        indice += bboxes.size(0)
 
 
 def evaluate_mask(args, device: torch.device, rank: int):
@@ -460,8 +717,6 @@ def evaluate_mask(args, device: torch.device, rank: int):
         "original_bbox": bbox.tolist(),
     }
 
-    batch_size = args.batch_size
-
     predictor = load_model(
         model_name=args.model_name,
         model_type=args.model_type,
@@ -476,14 +731,19 @@ def evaluate_mask(args, device: torch.device, rank: int):
         .unsqueeze(0)
     )
 
-    total_batches = (len(local_boxes) + batch_size - 1) // batch_size
+    batch_size = args.batch_size if hasattr(args, "batch_size") else 1024
+    base_batch_size = max(1, batch_size // args.Y)
+    total_batches = (len(local_boxes) + base_batch_size - 1) // base_batch_size
 
     for res in tqdm(
-        multi_bbox_inference(
+        multi_bbox_inference_smoothed(
             args.image_path,
             predictor=predictor,
             all_bboxes_list=local_boxes,
             rank=rank,
+            Y=args.Y,
+            X=args.X,
+            averaging_mode=args.averaging_mode,
             batch_size=batch_size,
         ),
         total=total_batches,
@@ -510,44 +770,44 @@ def evaluate_mask(args, device: torch.device, rank: int):
     return results
 
 
-def get_output_filename(image_name: str, random_boxes: bool) -> str:
+def get_output_filename(image_name: str, random_boxes: bool, Y: int, X: float, averaging_mode: str) -> str:
     stem = os.path.splitext(image_name)[0]
     suffix = "_random" if random_boxes else "_"
-    return f"res_final_{stem}{suffix}.csv"
+    return f"res_final_{stem}{suffix}smoothed_{averaging_mode}_Y{Y}_X{X}.csv"
 
 
-def get_output_path(output_dir: str, image_name: str, random_boxes: bool) -> str:
-    return os.path.join(output_dir, get_output_filename(image_name, random_boxes))
+def get_output_path(output_dir: str, image_name: str, random_boxes: bool, Y: int, X: float, averaging_mode: str) -> str:
+    return os.path.join(output_dir, get_output_filename(image_name, random_boxes, Y, X, averaging_mode))
 
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Evaluate SAM with bounding boxes"
+        description="Evaluate SAM with smoothed bounding boxes (Randomized Smoothing)"
     )
     parser.add_argument(
         "--images_dir",
         type=str,
-        default="../datasets/mvp_attacks/dataset/clean",
+        default="/home/jovyan/shares/SR006.nfs2/pishugin/rclicks/datasets/Berkeley/images",
         help="directory containing input images",
     )
     parser.add_argument(
         "--masks_dir",
         type=str,
-        default="../datasets/mvp_attacks/dataset/masks",
+        default="/home/jovyan/shares/SR006.nfs2/pishugin/rclicks/datasets/Berkeley/masks",
         help="directory containing ground truth masks",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="outputs",
+        default="outputs_smoothed",
         help="directory for output files",
     )
     parser.add_argument(
         "--checkpoint_path",
         type=str,
-        default="MODEL_CHECKPOINTS/SAM/sam_vit_b_01ec64.pth",
+        default="/home/jovyan/shares/SR006.nfs2/pishugin/rclicks/MODEL_CHECKPOINTS/SAM/sam_vit_b_01ec64.pth",
         help="model checkpoint path",
     )
     parser.add_argument(
@@ -576,16 +836,16 @@ if __name__ == "__main__":
         help="model type / backbone name",
     )
     parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=1024,
-        help="batch size",
-    )
-    parser.add_argument(
         "--mask_ext",
         type=str,
         default=".png",
         help="extension of mask files (e.g. .png, .bmp)",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1024,
+        help="batch size for model inference",
     )
     parser.add_argument(
         "--limit",
@@ -593,23 +853,46 @@ if __name__ == "__main__":
         default=0,
         help="limit number of images to process (0 for all)",
     )
+    parser.add_argument(
+        "--Y",
+        type=int,
+        default=10,
+        help="Number of samples (batch size) for smoothing",
+    )
+    parser.add_argument(
+        "--X",
+        type=float,
+        default=0.05,
+        help="Standard deviation fraction for normal noise",
+    )
+    parser.add_argument(
+        "--averaging_mode",
+        type=str,
+        choices=["logit", "sigmoid", "binary"],
+        default="logit",
+        help="Averaging mode strategy.",
+    )
 
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    local_rank = int(os.environ["LOCAL_RANK"])
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
+    if "LOCAL_RANK" in os.environ:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        dist.init_process_group(
+            backend="nccl",
+            rank=rank,
+            world_size=world_size,
+        )
+    else:
+        local_rank = 0
+        rank = 0
+        world_size = 1
 
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
-
-    dist.init_process_group(
-        backend="nccl",
-        rank=rank,
-        world_size=world_size,
-    )
 
     all_images = sorted(
         [
@@ -628,6 +911,7 @@ if __name__ == "__main__":
             output_dir=args.output_dir,
             image_name=image_name,
             random_boxes=bool(args.random_boxes),
+            Y=args.Y, X=args.X, averaging_mode=args.averaging_mode
         )
 
         if args.continue_from and os.path.exists(output_path):
@@ -657,6 +941,7 @@ if __name__ == "__main__":
             output_dir=args.output_dir,
             image_name=image_name,
             random_boxes=bool(args.random_boxes),
+            Y=args.Y, X=args.X, averaging_mode=args.averaging_mode
         )
 
         results = evaluate_mask(args, device=device, rank=rank)
@@ -670,4 +955,5 @@ if __name__ == "__main__":
             index=False,
         )
 
-    dist.destroy_process_group()
+    if world_size > 1:
+        dist.destroy_process_group()

@@ -104,7 +104,8 @@ def evaluate_functor(dataset:ISDataset, predictor, index,evaluate_sample=evaluat
             kwargs["negative_prompt_mask"] = sample.prompt_negative
         _, sample_ious, _ = evaluate_sample(sample.image, gt_mask, predictor,
                                             sample_id=index, **kwargs)
-        entry = [str(sample.imname),  str(sample.maskname), sample_ious, sample.objects_ids]
+        maskname = str(getattr(sample, 'maskname', sample.imname))
+        entry = [str(sample.imname), maskname, sample_ious, sample.objects_ids]
         all_ious.append(entry)
     return all_ious
 

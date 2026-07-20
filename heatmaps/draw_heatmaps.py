@@ -244,25 +244,33 @@ def main() -> None:
         default=1,
         help="Number of workers for image processing",
     )
+    parser.add_argument(
+        "--csv_suffix",
+        type=str,
+        default="_",
+        help="Suffix of the CSV files, e.g. '_smoothed_logit_Y3_X0.05'",
+    )
     args = parser.parse_args()
 
     model_name = Path(args.input_data).stem
 
     for dataset_name in args.dataset_names:
-        dataset_path = Path("../tetris/datasets") / dataset_name
-        image_paths = list(dataset_path.glob("images/*.*"))
-        mask_paths = list(dataset_path.glob("masks/*.png"))
+        dataset_path = Path("/home/jovyan/shares/SR006.nfs2/pishugin/rclicks/datasets") / dataset_name
+        image_paths = list(dataset_path.glob("images/*.*")) if list(dataset_path.glob("images/*.*")) else list(dataset_path.glob("data_GT/*.*"))
+        mask_paths = list(dataset_path.glob("masks/*.*")) if list(dataset_path.glob("masks/*.*")) else list(dataset_path.glob("boundary_GT/*.*"))
 
         image_mask_df_paths = []
         for image_path in image_paths:
             image_name = image_path.stem
             mask_candidates = [p for p in mask_paths if image_name in str(p)]
-            assert (
-                len(mask_candidates) == 1
-            ), f"Expected exactly one mask for {image_path}, got {len(mask_candidates)}"
+            if len(mask_candidates) != 1:
+                continue
             mask_path = mask_candidates[0]
 
-            df_path = Path(args.input_data) / dataset_name / f"res_final_{image_name}_.csv"
+            df_path = Path(args.input_data) / dataset_name / f"res_final_{image_name}{args.csv_suffix}.csv"
+            # Fallback to direct input dir if not nested
+            if not df_path.exists():
+                df_path = Path(args.input_data) / f"res_final_{image_name}{args.csv_suffix}.csv"
             if not df_path.exists():
                 continue
 

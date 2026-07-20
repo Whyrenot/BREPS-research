@@ -8,6 +8,24 @@ experiments/
 *.pickle
 batch_scripts/
 installation_scripts/
+
+# Datasets and user-study data (not part of the repo; live on the cluster,
+# see config.yml paths)
+/datasets/
+user_study/
+FOR_TEST/
+
+# Generated experiment artifacts (heatmaps, plots, csv dumps) -- big and
+# reproducible from the scripts, don't belong in git
+/visualizations/
+/results/
+/outputs_smoothed/
+/heatmaps/outputs_smoothed/
+/heatmaps/SAM/
+/computed_test_comp_boxes/
+
+# Claude Code local project settings (machine-specific, not shared)
+.claude/
 lr*/
 *.zip
 drafts/

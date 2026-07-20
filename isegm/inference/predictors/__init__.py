@@ -1,5 +1,5 @@
 from .base import BasePredictor
-from .scribble_predictor import ScribblePredictor
+# from .scribble_predictor import ScribblePredictor
 from .bbox_predictor import BaseBboxPredictor
 from isegm.inference.transforms import ZoomIn
 

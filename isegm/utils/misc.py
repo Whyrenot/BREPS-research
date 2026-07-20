@@ -152,7 +152,7 @@ def save_results(args, row_name, dataset_name, logs_path, logs_prefix, dataset_r
     #     pickle.dump({"all_ious":all_ious}, fp)
 
     print(np.array(all_ious, dtype=object).shape)
-    all_ious = np.array(all_ious, dtype=object)[:, 1]
+    all_ious = np.array(all_ious, dtype=object)[:, 2]
 
     mean_spc, mean_spi = utils.get_time_metrics(all_ious, elapsed_time)
 

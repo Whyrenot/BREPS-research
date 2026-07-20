@@ -10,10 +10,10 @@ from isegm.data.datasets import (
     DavisDataset,
     SBDEvaluationDataset,
     TETRISDataset,
-    InteractionDataset,
+    # InteractionDataset,
     Split1kDataset,
     # HeLaNucDataset,
-    WBCDataset,
+    # WBCDataset,
     ACDCDataset,
     BUIDDataset,
 )
@@ -243,16 +243,20 @@ def get_boundary_iou(gt_mask, pred_mask, ignore_label=-1):
 
 def compute_noc_metric(all_ious, iou_thrs, max_clicks=20):
     def _get_noc(iou_arr, iou_thr):
-        # logger.debug(iou_arr)
-        vals = iou_arr[0] >= iou_thr
+        if isinstance(iou_arr, dict) and 'iou' in iou_arr:
+            ious = np.array(iou_arr['iou'])
+            if ious.ndim > 1:
+                ious = ious[0] if len(ious) > 0 and isinstance(ious[0], np.ndarray) else ious
+        else:
+            ious = np.array([x[0] if isinstance(x, (list, np.ndarray, tuple)) else x for x in iou_arr])
+        vals = ious >= iou_thr
         return np.argmax(vals) + 1 if np.any(vals) else max_clicks
-    logger.debug(all_ious)
-    logger.debug(type(all_ious))
+
     noc_list = []
     over_max_list = []
     for iou_thr in iou_thrs:
         scores_arr = np.array(
-            [_get_noc(iou_arr['iou'], iou_thr) for iou_arr in all_ious], dtype=int
+            [_get_noc(iou_arr, iou_thr) for iou_arr in all_ious], dtype=int
         )
 
         score = scores_arr.mean()

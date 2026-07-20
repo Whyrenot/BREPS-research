@@ -65,7 +65,10 @@ def parse_args():
     parser.add_argument('--lr_mult', type=float, default=1, help='LR for optim multiplyer')
     parser.add_argument('--n_workers', type=int, default=1, help='Number of parallel workers on inference')
     parser.add_argument('--n_samples', type=int, default=0, help='Slice only N samples (for debug only)')
-
+    parser.add_argument('--n-clicks', type=int, default=20, help='Maximum number of clicks for the NoC metric.')
+    parser.add_argument('--min-n-clicks', type=int, default=1, help='Minimum number of clicks for the evaluation.')
+    parser.add_argument('--clicks-limit', type=int, default=20)
+    parser.add_argument('--eval-mode', type=str, default='cv2', help='Evaluation mode (e.g. cv2)')
     args = parser.parse_args()
     if args.cpu:
         args.device = torch.device('cpu')

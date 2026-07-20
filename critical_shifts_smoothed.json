@@ -1,0 +1,97 @@
+[
+    {
+        "csv_path": "outputs_smoothed/res_final_101085_smoothed_logit_Y3_X0.05.csv",
+        "image_name": "101085_smoothed_logit_Y3_X0.05",
+        "best_box": [
+            26.0,
+            29.0,
+            152.0,
+            473.0
+        ],
+        "bad_box": [
+            23.0,
+            29.0,
+            155.0,
+            474.0
+        ],
+        "best_iou": 0.9796565175056458,
+        "bad_iou": 0.009738097898662,
+        "iou_drop": 0.9699184196069838
+    },
+    {
+        "csv_path": "outputs_smoothed/res_final_101085_smoothed_logit_Y3_X0.05.csv",
+        "image_name": "101085_smoothed_logit_Y3_X0.05",
+        "best_box": [
+            26.0,
+            26.0,
+            153.0,
+            476.0
+        ],
+        "bad_box": [
+            19.0,
+            30.0,
+            159.0,
+            472.0
+        ],
+        "best_iou": 0.9792102575302124,
+        "bad_iou": 0.0395007766783237,
+        "iou_drop": 0.9397094808518887
+    },
+    {
+        "csv_path": "outputs_smoothed/res_final_101085_smoothed_logit_Y3_X0.05.csv",
+        "image_name": "101085_smoothed_logit_Y3_X0.05",
+        "best_box": [
+            32.0,
+            4.0,
+            147.0,
+            480.0
+        ],
+        "bad_box": [
+            23.0,
+            2.0,
+            155.0,
+            480.0
+        ],
+        "best_iou": 0.978602647781372,
+        "bad_iou": 0.1664452999830246,
+        "iou_drop": 0.8121573477983474
+    },
+    {
+        "csv_path": "outputs_smoothed/res_final_101085_smoothed_logit_Y3_X0.05.csv",
+        "image_name": "101085_smoothed_logit_Y3_X0.05",
+        "best_box": [
+            9.0,
+            34.0,
+            169.0,
+            469.0
+        ],
+        "bad_box": [
+            9.0,
+            38.0,
+            170.0,
+            464.0
+        ],
+        "best_iou": 0.9785999655723572,
+        "bad_iou": 0.0,
+        "iou_drop": 0.9785999655723572
+    },
+    {
+        "csv_path": "outputs_smoothed/res_final_101085_smoothed_logit_Y3_X0.05.csv",
+        "image_name": "101085_smoothed_logit_Y3_X0.05",
+        "best_box": [
+            20.0,
+            29.0,
+            158.0,
+            473.0
+        ],
+        "bad_box": [
+            12.0,
+            38.0,
+            166.0,
+            465.0
+        ],
+        "best_iou": 0.9785764217376708,
+        "bad_iou": 0.1036172956228256,
+        "iou_drop": 0.8749591261148452
+    }
+]

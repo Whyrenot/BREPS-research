@@ -125,10 +125,10 @@ class ISModelSAM(nn.Module):
                     if torch.isnan(ciou_loss).item():
                         ciou_loss = torch.nan_to_num(ciou_loss)
                     reg_value = self.regularization_distribution.log_prob(ciou_loss)
-                    reg_grad = torch.autograd.grad(alpha*reg_value, bbox, )
+                    reg_grad = torch.autograd.grad(alpha*reg_value, bbox, retain_graph=True)
                     reg_grad = (reg_grad[0].norm(2).item() ** 2)
 
-                    dice_grad = torch.autograd.grad(main_loss, bbox, )
+                    dice_grad = torch.autograd.grad(main_loss, bbox, retain_graph=True)
                     dice_grad = (dice_grad[0].norm(2).item() ** 2)
                     if ciou_loss != 0 :
                         loss = main_loss+ alpha * reg_value * (-1)
