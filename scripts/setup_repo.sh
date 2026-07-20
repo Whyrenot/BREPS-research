@@ -123,7 +123,11 @@ setup_base_env() {
     else
         log "diffvg already present at $diffvg_dir, skipping clone"
     fi
-    (cd "$diffvg_dir" && conda run -n "$BASE_ENV_NAME" python setup.py install)
+    # diffvg vendors an old pybind11 (cmake_minimum_required < 3.5); modern
+    # CMake (>=3.31) refuses to configure that outright. CMAKE_POLICY_VERSION_MINIMUM
+    # is CMake's own documented escape hatch for exactly this (old vendored
+    # subdirectory, no local edits to diffvg's checkout needed).
+    (cd "$diffvg_dir" && CMAKE_POLICY_VERSION_MINIMUM=3.5 conda run -n "$BASE_ENV_NAME" python setup.py install)
     conda run -n "$BASE_ENV_NAME" pip install svgpathtools cssutils
 
     # 3 -- pyproject.toml packaging fix: already committed in this repo's
