@@ -30,6 +30,11 @@
 #   ./scripts/setup_repo.sh --envs base         # only the base env
 #   ./scripts/setup_repo.sh --envs base,sam_hq2 # base + SAM-HQ2
 #   ./scripts/setup_repo.sh --vendor-dir ../vendor --cuda-tag cu121
+#   ./scripts/setup_repo.sh --envs base --base-env-name my-existing-env
+#   ./scripts/setup_repo.sh --envs base --skip-diffvg   # skip pydiffvg build
+#       (only needed by scripts/evaluate_boxes_model_sam*.py; everything
+#        under heatmaps/ and scripts/refine_box_iou_grad.py etc. works
+#        without it)
 #
 # Idempotent: re-running skips a conda env that already exists (use
 # --recreate to force-recreate) and steps that already succeeded (pydiffvg
@@ -57,6 +62,7 @@ HQ2_CUDA_TAG="cu121"           # torch>=2.3.1 wheel index
 SAM3_CUDA_TAG="cu128"          # matches facebookresearch/sam3 README
 
 RECREATE=0
+SKIP_DIFFVG=0
 
 usage() {
     grep '^#' "${BASH_SOURCE[0]}" | sed -e 's/^#//' -e 's/^ //'
@@ -72,6 +78,7 @@ while [[ $# -gt 0 ]]; do
         --sam3-env-name) SAM3_ENV_NAME="$2"; shift 2 ;;
         --cuda-tag) BASE_CUDA_TAG="$2"; HQ2_CUDA_TAG="$2"; SAM3_CUDA_TAG="$2"; shift 2 ;;
         --recreate) RECREATE=1; shift ;;
+        --skip-diffvg) SKIP_DIFFVG=1; shift ;;
         -h|--help) usage ;;
         *) echo "Unknown arg: $1" >&2; usage ;;
     esac
@@ -114,21 +121,32 @@ setup_base_env() {
     conda install -n "$BASE_ENV_NAME" -y scikit-image
     conda install -n "$BASE_ENV_NAME" -y -c anaconda cmake
 
-    # 2 -- pydiffvg from source (INSTALL_FIXES.md #2)
-    local diffvg_dir="$VENDOR_DIR/diffvg"
-    if [[ ! -d "$diffvg_dir" ]]; then
-        log "Cloning diffvg -> $diffvg_dir"
-        git clone https://github.com/BachiLi/diffvg.git "$diffvg_dir"
-        (cd "$diffvg_dir" && git submodule update --init --recursive)
+    # 2 -- pydiffvg from source (INSTALL_FIXES.md #2). ONLY needed for
+    # isegm/model/ops.py's differentiable click-circle rendering, i.e. the
+    # scripts/evaluate_boxes_model_sam*.py + runbboxparallel.sh optimization
+    # pipeline. Not imported anywhere under heatmaps/ or by
+    # scripts/refine_box_iou_grad.py, scripts/probe_decoder_activations.py,
+    # scripts/draw_critical_shifts.py etc -- pass --skip-diffvg if all you
+    # need today is that (pydiffvg-free) analysis pipeline.
+    if [[ "$SKIP_DIFFVG" == "1" ]]; then
+        log "Skipping diffvg/pydiffvg (--skip-diffvg). evaluate_boxes_model_sam*.py" \
+            "will NOT work in this env until you rerun without --skip-diffvg."
     else
-        log "diffvg already present at $diffvg_dir, skipping clone"
+        local diffvg_dir="$VENDOR_DIR/diffvg"
+        if [[ ! -d "$diffvg_dir" ]]; then
+            log "Cloning diffvg -> $diffvg_dir"
+            git clone https://github.com/BachiLi/diffvg.git "$diffvg_dir"
+            (cd "$diffvg_dir" && git submodule update --init --recursive)
+        else
+            log "diffvg already present at $diffvg_dir, skipping clone"
+        fi
+        # diffvg vendors an old pybind11 (cmake_minimum_required < 3.5); modern
+        # CMake (>=3.31) refuses to configure that outright. CMAKE_POLICY_VERSION_MINIMUM
+        # is CMake's own documented escape hatch for exactly this (old vendored
+        # subdirectory, no local edits to diffvg's checkout needed).
+        (cd "$diffvg_dir" && CMAKE_POLICY_VERSION_MINIMUM=3.5 conda run -n "$BASE_ENV_NAME" python setup.py install)
+        conda run -n "$BASE_ENV_NAME" pip install svgpathtools cssutils
     fi
-    # diffvg vendors an old pybind11 (cmake_minimum_required < 3.5); modern
-    # CMake (>=3.31) refuses to configure that outright. CMAKE_POLICY_VERSION_MINIMUM
-    # is CMake's own documented escape hatch for exactly this (old vendored
-    # subdirectory, no local edits to diffvg's checkout needed).
-    (cd "$diffvg_dir" && CMAKE_POLICY_VERSION_MINIMUM=3.5 conda run -n "$BASE_ENV_NAME" python setup.py install)
-    conda run -n "$BASE_ENV_NAME" pip install svgpathtools cssutils
 
     # 3 -- pyproject.toml packaging fix: already committed in this repo's
     # working tree (see [tool.setuptools.packages.find] below); just verify.
@@ -154,8 +172,19 @@ EOF
     (cd "$REPO_ROOT" && conda run -n "$BASE_ENV_NAME" pip install -e .)
 
     log "Verifying base env ..."
-    (cd "$REPO_ROOT" && conda run -n "$BASE_ENV_NAME" python3 scripts/evaluate_boxes_model_sam.py --help >/dev/null) \
-        && log "base env OK" || warn "base env smoke-test failed -- check the log above"
+    # pydiffvg-free analysis pipeline (heatmaps/, refine_box_iou_grad.py, ...) --
+    # always expected to work, regardless of --skip-diffvg.
+    (cd "$REPO_ROOT" && conda run -n "$BASE_ENV_NAME" python3 scripts/refine_box_iou_grad.py --help >/dev/null) \
+        && log "base env OK (analysis pipeline: heatmaps/*, refine_box_iou_grad.py, ...)" \
+        || warn "base env smoke-test failed on refine_box_iou_grad.py -- check the log above"
+
+    if [[ "$SKIP_DIFFVG" == "1" ]]; then
+        log "Skipped evaluate_boxes_model_sam*.py check (needs pydiffvg, --skip-diffvg was set)."
+    else
+        (cd "$REPO_ROOT" && conda run -n "$BASE_ENV_NAME" python3 scripts/evaluate_boxes_model_sam.py --help >/dev/null) \
+            && log "base env OK (optimization pipeline: evaluate_boxes_model_sam*.py)" \
+            || warn "base env smoke-test failed on evaluate_boxes_model_sam.py -- check the log above"
+    fi
 }
 
 # ---------------------------------------------------------------------------
