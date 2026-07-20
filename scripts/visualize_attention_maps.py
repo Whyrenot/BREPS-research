@@ -66,18 +66,67 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from heatmaps.comp_hw_smoothed import load_model
+from heatmaps.comp_hw_smoothed import get_bbox_from_mask, load_model
 from heatmaps.defend_critical_shifts import (
     _find_file,
     _predict_single_box,
     _prepare_image,
     boxes_to_original,
+    original_to_1024,
 )
+from heatmaps.defend_user_study import _load_binary_mask, index_user_masks
 from heatmaps.env_dispatch import maybe_dispatch_to_env
 from heatmaps.predicted_iou_heatmap import _blend, _load_display_image
 
 _TOKEN_NAMES = {0: "iou_token", 1: "mask_token0 (single-output)",
                 2: "mask_token1", 3: "mask_token2", 4: "mask_token3"}
+
+
+# ---------------------------------------------------------------------------
+# dataset loading: critical_shifts JSON (bad_box/best_box already in 1024
+# space) or user_study (root/{images,masks,user_masks}, boxes derived here --
+# mirrors scripts/refine_box_iou_grad.py's load_tasks()/build_user_cases()).
+# ---------------------------------------------------------------------------
+
+def _load_gt(mask_path, predictor) -> torch.Tensor:
+    gt = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+    if gt is None:
+        raise FileNotFoundError(mask_path)
+    gt = (gt > 0).astype(np.uint8)
+    H, W = predictor.original_size
+    if gt.shape != (H, W):
+        gt = cv2.resize(gt, (W, H), interpolation=cv2.INTER_NEAREST)
+    return torch.from_numpy(gt > 0)
+
+
+def _build_user_cases(raw_tasks, predictor, gt_tensor) -> "list[dict]":
+    """user_study: each user annotation -> a case dict with bad_box (tight
+    user bbox, "attacked") and best_box (tight GT bbox, "clean"), both in
+    SAM's 1024-input frame -- same convention as the critical_shifts JSON."""
+    orig_size = predictor.original_size
+    gt_np = gt_tensor.numpy().astype(np.uint8)
+    if gt_np.sum() == 0:
+        return []
+    rmin, rmax, cmin, cmax = get_bbox_from_mask(gt_np)
+    gt_bbox = np.array([cmin, rmin, cmax, rmax], dtype=np.int32)
+    best_box_1024 = original_to_1024(gt_bbox[None], orig_size)[0]
+
+    cases = []
+    for rec in raw_tasks:
+        try:
+            um = _load_binary_mask(rec.path, target_shape=orig_size)
+        except Exception:
+            continue
+        if um.sum() == 0:
+            continue
+        rmin, rmax, cmin, cmax = get_bbox_from_mask(um.astype(np.uint8))
+        ub = np.array([cmin, rmin, cmax, rmax], dtype=np.int32)
+        if ub[2] - ub[0] <= 0 or ub[3] - ub[1] <= 0:
+            continue
+        bad_box_1024 = original_to_1024(ub[None], orig_size)[0]
+        cases.append({"best_box": best_box_1024.tolist(), "bad_box": bad_box_1024.tolist(),
+                      "kind": rec.kind, "user": rec.user, "attempt": rec.attempt})
+    return cases
 
 
 # ---------------------------------------------------------------------------
@@ -301,8 +350,17 @@ def make_case_figure(image_path, best_box_1024, bad_box_1024, predictor, device,
 def parse_args():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--dataset", default="critical_shifts",
+                   choices=["critical_shifts", "user_study"],
+                   help="critical_shifts: best/bad box pairs from JSON; "
+                        "user_study: real user boxes from --root/{images,masks,user_masks}")
     p.add_argument("--critical_shifts", default="critical_shifts_coco.json")
-    p.add_argument("--images_dir", required=True)
+    p.add_argument("--root", default=None,
+                   help="user_study root (images/, masks/, user_masks/); required "
+                        "for --dataset user_study")
+    p.add_argument("--use", default="mp", help="user_study mask kinds: 'm', 'p' or 'mp'")
+    p.add_argument("--images_dir", default=None,
+                   help="critical_shifts: image dir (for user_study derived from --root)")
     p.add_argument("--checkpoint_path", required=True)
     p.add_argument("--model_name", default="SAM",
                    choices=["SAM", "SAM2.1", "SAM-HQ", "SAM-HQ2", "SAM3"],
@@ -329,13 +387,37 @@ def main():
 
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
 
-    with open(args.critical_shifts, "r") as f:
-        shifts = json.load(f)
-    if args.limit > 0:
-        shifts = shifts[: args.limit]
-    print(f"Rendering attention maps for {len(shifts)} critical-shift cases "
-          f"from {args.critical_shifts}")
+    # ---- load cases, grouped by image (so each image is encoded once) ----
+    masks_dir = None
+    if args.dataset == "user_study":
+        if not args.root:
+            raise SystemExit("--root is required for --dataset user_study")
+        root = Path(args.root)
+        use = "".join(sorted(set(args.use.lower())))
+        recs = index_user_masks(root / "user_masks", kinds=tuple(use))
+        if args.limit > 0:
+            recs = recs[: args.limit]
+        by_image = defaultdict(list)
+        for r in recs:
+            by_image[r.stem].append(r)
+        images_dir, masks_dir = str(root / "images"), str(root / "masks")
+        print(f"Rendering attention maps for {len(recs)} user-study annotations "
+              f"over {len(by_image)} images from {root}")
+    else:
+        if not args.images_dir:
+            raise SystemExit("--images_dir is required for --dataset critical_shifts")
+        with open(args.critical_shifts, "r") as f:
+            shifts = json.load(f)
+        if args.limit > 0:
+            shifts = shifts[: args.limit]
+        by_image = defaultdict(list)
+        for c in shifts:
+            by_image[c["image_name"]].append(c)
+        images_dir = args.images_dir
+        print(f"Rendering attention maps for {len(shifts)} critical-shift cases "
+              f"from {args.critical_shifts}")
 
+    total_cases = sum(len(v) for v in by_image.values())
     predictor = load_model(model_name=args.model_name, model_type=args.model_type,
                            checkpoint=args.checkpoint_path, device=device)
 
@@ -344,9 +426,8 @@ def main():
     layer_order: list[str] = []
     n_done = 0
 
-    for i, case in enumerate(shifts):
-        image_name = case["image_name"]
-        image_path = _find_file(args.images_dir, image_name)
+    for image_name, raw_tasks in by_image.items():
+        image_path = _find_file(images_dir, image_name)
         if image_path is None:
             print(f"[warn] image not found: {image_name}, skipping")
             continue
@@ -356,28 +437,41 @@ def main():
             print(f"[warn] encode failed for {image_name}: {e}")
             continue
 
-        stem = Path(image_name).stem
-        case_label = f"{stem}_{i:03d}"
-        out_path = out_dir / f"attn_{case_label}.png"
-        try:
-            tv_by_layer = make_case_figure(
-                image_path, case["best_box"], case["bad_box"], predictor, device,
-                token_idx=args.token_idx, alpha=args.alpha,
-                out_path=out_path, case_label=case_label,
-            )
-        except Exception as e:
-            print(f"[warn] failed on {case_label}: {e}")
-            continue
+        if args.dataset == "user_study":
+            mask_path = _find_file(masks_dir, image_name)
+            if mask_path is None:
+                print(f"[warn] no GT mask for {image_name}, skipping")
+                continue
+            gt_tensor = _load_gt(mask_path, predictor)
+            cases = _build_user_cases(raw_tasks, predictor, gt_tensor)
+        else:
+            cases = raw_tasks
 
-        for layer, tv in tv_by_layer.items():
-            if layer not in layer_order:
-                layer_order.append(layer)
-            tv_acc[layer].append(tv)
-        n_done += 1
-        print(f"  [{n_done}/{len(shifts)}] {case_label} -> {out_path}")
+        stem = Path(image_name).stem
+        for j, case in enumerate(cases):
+            tag = "_".join(str(case[k]) for k in ("kind", "user", "attempt") if case.get(k) != "") \
+                if args.dataset == "user_study" else f"{j:03d}"
+            case_label = f"{stem}_{tag}" if tag else f"{stem}_{n_done:03d}"
+            out_path = out_dir / f"attn_{case_label}.png"
+            try:
+                tv_by_layer = make_case_figure(
+                    image_path, case["best_box"], case["bad_box"], predictor, device,
+                    token_idx=args.token_idx, alpha=args.alpha,
+                    out_path=out_path, case_label=case_label,
+                )
+            except Exception as e:
+                print(f"[warn] failed on {case_label}: {e}")
+                continue
+
+            for layer, tv in tv_by_layer.items():
+                if layer not in layer_order:
+                    layer_order.append(layer)
+                tv_acc[layer].append(tv)
+            n_done += 1
+            print(f"  [{n_done}/{total_cases}] {case_label} -> {out_path}")
 
     if n_done == 0:
-        raise SystemExit("No cases rendered (check --images_dir / JSON paths).")
+        raise SystemExit("No cases rendered (check --images_dir/--root paths).")
 
     # ---- aggregate summary ----
     rows = [{"order": i, "layer": layer, "n": len(tv_acc[layer]),
@@ -406,7 +500,7 @@ def main():
     fig.savefig(summary_plot, dpi=140, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved summary plot -> {summary_plot}")
-    print(f"\nRendered {n_done}/{len(shifts)} case figures -> {out_dir}/")
+    print(f"\nRendered {n_done}/{total_cases} case figures -> {out_dir}/")
 
 
 if __name__ == "__main__":
