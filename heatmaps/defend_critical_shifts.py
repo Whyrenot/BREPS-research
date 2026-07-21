@@ -325,28 +325,47 @@ def _predict_smoothed_box(
     perturbed_boxes = perturbed.cpu()   # save for return
     perturbed_t = perturbed.float().to(rank)
 
-    try:
-        masks_logits, scores, _ = predictor.predict_torch(
-            point_coords=None,
-            point_labels=None,
-            boxes=perturbed_t,
-            multimask_output=False,
-            return_logits=True,
-        )
-    except TypeError:
-        masks_logits, scores, _ = predictor.predict_torch(
-            point_coords=None,
-            point_labels=None,
-            boxes=perturbed_t,
-            multimask_output=False,
-        )
-        out_mask = masks_logits[:, 0].float().mean(dim=0).gt(0.5).cpu()
-        if return_scores:
-            return out_mask, perturbed_boxes, scores.float().cpu(), -1
-        return out_mask, perturbed_boxes
+    if not hasattr(predictor, "predict_torch"):
+        # SAM2ImagePredictor: no predict_torch / no batched-boxes-on-one-image
+        # call, and a different box-scaling convention than SAM1 -- loop its
+        # own .predict() one box at a time, on boxes converted back to
+        # original pixel coordinates (see _predict_single_box's docstring).
+        orig_size = get_original_size(predictor)
+        boxes_np = boxes_to_original(perturbed_t.detach().cpu().numpy(), orig_size)
+        all_logits, all_scores = [], []
+        with torch.no_grad():
+            for box_np in boxes_np:
+                m, s, _ = predictor.predict(
+                    point_coords=None, point_labels=None, box=box_np,
+                    multimask_output=False, return_logits=True,
+                )
+                all_logits.append(torch.from_numpy(m))
+                all_scores.append(torch.from_numpy(s))
+        masks_logits = torch.stack(all_logits).float()  # (Y, 1, H, W)
+        scores = torch.stack(all_scores).float()        # (Y, 1)
+    else:
+        try:
+            masks_logits, scores, _ = predictor.predict_torch(
+                point_coords=None,
+                point_labels=None,
+                boxes=perturbed_t,
+                multimask_output=False,
+                return_logits=True,
+            )
+        except TypeError:
+            masks_logits, scores, _ = predictor.predict_torch(
+                point_coords=None,
+                point_labels=None,
+                boxes=perturbed_t,
+                multimask_output=False,
+            )
+            out_mask = masks_logits[:, 0].float().mean(dim=0).gt(0.5).cpu()
+            if return_scores:
+                return out_mask, perturbed_boxes, scores.float().cpu(), -1
+            return out_mask, perturbed_boxes
 
-    masks_logits = masks_logits.float()  # (Y, 1, H, W)
-    scores = scores.float()              # (Y, 1)
+        masks_logits = masks_logits.float()  # (Y, 1, H, W)
+        scores = scores.float()              # (Y, 1)
 
     thresh = 0.0
     best_idx = -1
