@@ -47,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from heatmaps.comp_hw_smoothed import (
     batch_iou_torch,
     get_bbox_from_mask,
+    get_original_size,
     load_model,
     sample_size_perturbed_boxes,
     sample_size_and_center_perturbed_boxes,
@@ -161,10 +162,37 @@ def _predict_single_box(
 ):
     """Run model on a single box; return binary mask (H, W) bool tensor on CPU.
 
-    boxes_already_transformed: if True, skip apply_boxes_torch (box is already
-        in SAM's internal coordinate space, as stored in the critical_shifts JSON).
+    boxes_already_transformed: if True, `box` is already in SAM's internal
+        1024-frame (as stored in the critical_shifts JSON / derived via
+        original_to_1024) -- for SamPredictor backends (SAM/SAM-HQ) this
+        skips the redundant apply_boxes_torch re-transform.
     return_score: if True, also return SAM's predicted-IoU score for this box.
+
+    SAM2ImagePredictor (SAM2.1, and SAM-HQ2 which reuses the same class) has
+    no `.predict_torch` AND uses a different box-scaling convention (a plain
+    resize to a fixed square, not SAM1's aspect-preserving pad-then-scale) --
+    so for that backend we always convert back to ORIGINAL pixel coordinates
+    and go through its own `.predict()`, which applies the correct
+    backend-native transform internally instead of us replicating SAM1's math
+    on a box that was computed for a different frame.
     """
+    if not hasattr(predictor, "predict_torch"):
+        box_np = box.detach().cpu().numpy()
+        if boxes_already_transformed:
+            box_np = boxes_to_original(box_np[None], get_original_size(predictor))[0]
+        with torch.inference_mode():
+            masks, scores, _ = predictor.predict(
+                point_coords=None,
+                point_labels=None,
+                box=box_np,
+                multimask_output=False,
+                return_logits=False,
+            )
+        mask = torch.from_numpy(masks[0] > 0).bool()
+        if return_score:
+            return mask, float(scores[0])
+        return mask
+
     box_t = box.unsqueeze(0).float()
     if not boxes_already_transformed and hasattr(predictor, "transform"):
         box_t = predictor.transform.apply_boxes_torch(box_t, predictor.original_size)

@@ -74,6 +74,7 @@ from heatmaps.defend_critical_shifts import (
     _predict_single_box,
     _predict_smoothed_box,
     _prepare_image,
+    boxes_to_original,
     original_to_1024,
 )
 from heatmaps.defend_user_study import _load_binary_mask, index_user_masks
@@ -234,6 +235,27 @@ def best_of_n_multimask(bad_box, predictor, device, Y, sigma, sigma_center, pert
 # ---------------------------------------------------------------------------
 
 def _predict_boxes(boxes_t, predictor, multimask):
+    """boxes_t: (N,4), already in SAM's 1024-frame. Returns masks
+    (N, num_heads, H, W) bool and scores (N, num_heads).
+
+    SAM2ImagePredictor has no .predict_torch (no batched-boxes-on-one-image
+    call) and a different box-scaling convention than SAM1 -- loop its
+    .predict() one box at a time, after converting each box back to
+    original pixel coordinates (see _predict_single_box's docstring)."""
+    if not hasattr(predictor, "predict_torch"):
+        orig_size = get_original_size(predictor)
+        boxes_np = boxes_to_original(boxes_t.detach().cpu().numpy(), orig_size)
+        all_masks, all_scores = [], []
+        with torch.no_grad():
+            for box_np in boxes_np:
+                m, s, _ = predictor.predict(
+                    point_coords=None, point_labels=None, box=box_np,
+                    multimask_output=multimask, return_logits=False,
+                )
+                all_masks.append(torch.from_numpy(m > 0))
+                all_scores.append(torch.from_numpy(s))
+        return torch.stack(all_masks).bool(), torch.stack(all_scores).float()
+
     with torch.no_grad():
         try:
             masks, scores, _ = predictor.predict_torch(
