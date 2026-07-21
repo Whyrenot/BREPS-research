@@ -49,7 +49,7 @@ import matplotlib.pyplot as plt
 from matplotlib import cm
 from matplotlib.colors import ListedColormap
 
-from heatmaps.comp_hw_smoothed import batch_iou_torch, get_bbox_from_mask, load_model
+from heatmaps.comp_hw_smoothed import batch_iou_torch, get_bbox_from_mask, get_original_size, load_model
 from heatmaps.defend_critical_shifts import _prepare_image
 
 _HEAD_COLORS = np.array([[31, 119, 180], [255, 127, 14],
@@ -108,7 +108,7 @@ def _load_gt(mask_path, predictor) -> np.ndarray:
     if gt is None:
         raise FileNotFoundError(mask_path)
     gt = (gt > 0).astype(np.uint8)
-    H, W = predictor.original_size
+    H, W = get_original_size(predictor)
     if gt.shape != (H, W):
         gt = cv2.resize(gt, (W, H), interpolation=cv2.INTER_NEAREST)
     return (gt > 0)
@@ -179,8 +179,8 @@ def main():
 
     predictor = load_model(model_name=args.model_name, model_type=args.model_type,
                            checkpoint=args.checkpoint_path, device=device)
-    _prepare_image(str(image_path), predictor)          # sets predictor.original_size
-    H, W = predictor.original_size
+    _prepare_image(str(image_path), predictor)          # sets predictor's original-size state
+    H, W = get_original_size(predictor)
     gt = _load_gt(mask_path, predictor)
     gt_t = torch.from_numpy(gt).to(device)
     if gt.sum() == 0:

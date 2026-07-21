@@ -528,6 +528,29 @@ def load_model(model_name: str, **kwargs):
             raise ValueError(f"Unknown model name: {model_name}")
 
 
+def get_original_size(predictor) -> tuple:
+    """(H, W) of the last image passed to predictor.set_image(), portable
+    across predictor backends.
+
+    segment_anything / segment_anything_hq's SamPredictor exposes a single
+    ``.original_size`` (H, W) tuple. SAM2ImagePredictor (used for both
+    SAM2.1 and SAM-HQ2, which share the sam2 package) has no such attribute
+    -- it keeps ``._orig_hw``, a LIST of (H, W) tuples (one per image, since
+    its API also supports batched set_image_batch()); index 0 is the single
+    image set by set_image().
+    """
+    if hasattr(predictor, "original_size"):
+        return predictor.original_size
+    orig_hw = getattr(predictor, "_orig_hw", None)
+    if orig_hw:
+        return tuple(orig_hw[0])
+    raise AttributeError(
+        f"{type(predictor).__name__} exposes neither .original_size nor "
+        "._orig_hw -- unknown predictor backend, cannot determine the "
+        "original image size"
+    )
+
+
 def prepare_input(
     image_path: str,
     predictor,

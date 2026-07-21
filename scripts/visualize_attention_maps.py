@@ -66,7 +66,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from heatmaps.comp_hw_smoothed import get_bbox_from_mask, load_model
+from heatmaps.comp_hw_smoothed import get_bbox_from_mask, get_original_size, load_model
 from heatmaps.defend_critical_shifts import (
     _find_file,
     _predict_single_box,
@@ -93,7 +93,7 @@ def _load_gt(mask_path, predictor) -> torch.Tensor:
     if gt is None:
         raise FileNotFoundError(mask_path)
     gt = (gt > 0).astype(np.uint8)
-    H, W = predictor.original_size
+    H, W = get_original_size(predictor)
     if gt.shape != (H, W):
         gt = cv2.resize(gt, (W, H), interpolation=cv2.INTER_NEAREST)
     return torch.from_numpy(gt > 0)
@@ -103,7 +103,7 @@ def _build_user_cases(raw_tasks, predictor, gt_tensor) -> "list[dict]":
     """user_study: each user annotation -> a case dict with bad_box (tight
     user bbox, "attacked") and best_box (tight GT bbox, "clean"), both in
     SAM's 1024-input frame -- same convention as the critical_shifts JSON."""
-    orig_size = predictor.original_size
+    orig_size = get_original_size(predictor)
     gt_np = gt_tensor.numpy().astype(np.uint8)
     if gt_np.sum() == 0:
         return []
@@ -284,7 +284,7 @@ def make_case_figure(image_path, best_box_1024, bad_box_1024, predictor, device,
                      case_label: str) -> "dict[str, float]":
     """One PNG: rows = hooked decoder layers, cols = [clean, attacked, diff].
     Returns {layer_name: tv_distance} for the summary aggregation."""
-    H, W = predictor.original_size
+    H, W = get_original_size(predictor)
     disp = _load_display_image(image_path, H, W)
 
     best_orig = boxes_to_original(np.asarray(best_box_1024)[None], (H, W))[0]

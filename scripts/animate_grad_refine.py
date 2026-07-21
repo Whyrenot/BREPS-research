@@ -39,7 +39,7 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
 from matplotlib.patches import Rectangle
 
-from heatmaps.comp_hw_smoothed import batch_iou_torch, get_bbox_from_mask, load_model
+from heatmaps.comp_hw_smoothed import batch_iou_torch, get_bbox_from_mask, get_original_size, load_model
 from heatmaps.defend_critical_shifts import (
     _predict_single_box, _prepare_image, boxes_to_original, original_to_1024,
 )
@@ -118,7 +118,7 @@ def main():
         prm.requires_grad_(False)
 
     _prepare_image(str(image_path), predictor)
-    H, W = predictor.original_size
+    H, W = get_original_size(predictor)
     disp = _load_display_image(image_path, H, W)
     gt = _load_binary_mask(mask_path, target_shape=(H, W))
     gt_t = torch.from_numpy(gt)

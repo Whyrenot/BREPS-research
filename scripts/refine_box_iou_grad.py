@@ -64,6 +64,7 @@ import matplotlib.pyplot as plt
 from heatmaps.comp_hw_smoothed import (
     batch_iou_torch,
     get_bbox_from_mask,
+    get_original_size,
     load_model,
     sample_size_and_center_perturbed_boxes,
     sample_size_perturbed_boxes,
@@ -168,7 +169,7 @@ def _load_gt(mask_path, predictor) -> torch.Tensor:
     if gt is None:
         raise FileNotFoundError(mask_path)
     gt = (gt > 0).astype(np.uint8)
-    H, W = predictor.original_size
+    H, W = get_original_size(predictor)
     if gt.shape != (H, W):
         gt = cv2.resize(gt, (W, H), interpolation=cv2.INTER_NEAREST)
     return torch.from_numpy(gt > 0)
@@ -631,7 +632,7 @@ def load_tasks(args):
 def build_user_cases(raw_tasks, predictor, gt_tensor):
     """user_study: turn each user mask into a case dict with bad_box (tight user
     bbox, 1024 frame) and best_box (tight GT bbox, 1024 frame = the ideal box)."""
-    orig_size = predictor.original_size
+    orig_size = get_original_size(predictor)
     gt_np = gt_tensor.numpy().astype(np.uint8)
     if gt_np.sum() == 0:
         return []
