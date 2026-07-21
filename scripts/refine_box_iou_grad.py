@@ -96,18 +96,61 @@ def refine_box_by_iou_grad(
 ):
     """Ascend SAM's predicted-IoU w.r.t. the box (cx, cy, w, h).
 
-    box_1024 : length-4 (x0,y0,x1,y1) box in SAM's 1024 input frame.
+    box_1024 : length-4 (x0,y0,x1,y1) box in this repo's SAM1-style 1024
+        frame (aspect-preserving ResizeLongestSide scale, no pad offset --
+        see heatmaps.defend_critical_shifts.original_to_1024). This is the
+        frame used throughout critical_shifts.json / user_study derivation.
     gt_tensor: optional GT bool mask (H,W) on CPU -> records true IoU per step.
 
-    Returns (refined_box_1024 tensor, trajectory list[dict]).
-    Trajectory entry: {step, pred_score, [true_iou], [box]}.
+    Returns (refined_box_1024 tensor, trajectory list[dict]), box back in
+    the SAME SAM1-style 1024 frame as the input, regardless of backend.
+    Trajectory entry: {step, pred_score, [true_iou], [box] (also 1024-frame)}.
+
+    Portable across SamPredictor (SAM/SAM-HQ) and SAM2ImagePredictor
+    (SAM2.1/SAM-HQ2, detected via the absence of .predict_torch). SAM2's
+    mask decoder lives at model.sam_mask_decoder (not .mask_decoder), needs
+    the Hiera backbone's high_res_features + a repeat_image flag, encodes a
+    box as two labelled points (label 2/3) rather than via a boxes= kwarg,
+    and scales box coordinates differently (plain independent-axis resize
+    to a square, via its own SAM2Transforms -- no letterbox pad like SAM1)
+    -- confirmed directly from sam2.sam2_image_predictor.SAM2ImagePredictor
+    ._predict and sam2.utils.transforms.SAM2Transforms source, not guessed.
     """
     model = predictor.model
-    image_pe = model.prompt_encoder.get_dense_pe()
-    feats = predictor.features
+    is_sam2 = not hasattr(predictor, "predict_torch")
     thr = model.mask_threshold
 
-    b = torch.as_tensor(box_1024, dtype=torch.float32, device=device)
+    if is_sam2:
+        prompt_encoder = model.sam_prompt_encoder
+        mask_decoder = model.sam_mask_decoder
+        transforms = predictor._transforms
+        orig_hw = get_original_size(predictor)  # (H, W)
+        feats = predictor._features["image_embed"][-1].unsqueeze(0)
+        high_res_features = [
+            feat_level[-1].unsqueeze(0) for feat_level in predictor._features["high_res_feats"]
+        ]
+        # this repo's SAM1-1024 frame -> original pixels -> SAM2's own frame
+        box_orig_np = boxes_to_original(np.asarray(box_1024, dtype=np.float64)[None], orig_hw)[0]
+        box_orig_t = torch.as_tensor(box_orig_np, dtype=torch.float32, device=device)
+        b = transforms.transform_boxes(box_orig_t[None], normalize=True, orig_hw=orig_hw).reshape(4)
+    else:
+        prompt_encoder = model.prompt_encoder
+        mask_decoder = model.mask_decoder
+        feats = predictor.features
+        b = torch.as_tensor(box_1024, dtype=torch.float32, device=device)
+
+    image_pe = prompt_encoder.get_dense_pe()
+
+    def sam2_box_to_1024(box_t: torch.Tensor) -> torch.Tensor:
+        """Inverse of the SAM1-1024 -> SAM2-frame conversion above (for
+        trajectory logging / the returned refined box), SAM2-frame -> 1024."""
+        H, W = orig_hw
+        scale = torch.tensor([W, H, W, H], dtype=torch.float32, device=box_t.device)
+        box_orig = box_t.detach() / transforms.resolution * scale
+        return torch.as_tensor(
+            original_to_1024(box_orig.cpu().numpy()[None], orig_hw)[0], dtype=torch.float32
+        )
+
     cx = (b[0] + b[2]) / 2
     cy = (b[1] + b[3]) / 2
     w = (b[2] - b[0]).clamp(min=2.0)
@@ -120,12 +163,22 @@ def refine_box_by_iou_grad(
         hh = p[3].clamp(min=2.0)
         return torch.stack([p[0] - ww / 2, p[1] - hh / 2, p[0] + ww / 2, p[1] + hh / 2])
 
+    def encode_box(box):
+        if is_sam2:
+            box_coords = box.reshape(1, 2, 2)
+            box_labels = torch.tensor([[2, 3]], dtype=torch.int, device=box.device)
+            return prompt_encoder(points=(box_coords, box_labels), boxes=None, masks=None)
+        return prompt_encoder(points=None, boxes=box[None, :], masks=None)
+
     def true_iou_of(low_res, head):
         with torch.no_grad():
-            full = model.postprocess_masks(
-                low_res[:, head:head + 1].detach(),
-                predictor.input_size, predictor.original_size,
-            )
+            if is_sam2:
+                full = transforms.postprocess_masks(low_res[:, head:head + 1].detach(), orig_hw)
+            else:
+                full = model.postprocess_masks(
+                    low_res[:, head:head + 1].detach(),
+                    predictor.input_size, predictor.original_size,
+                )
             mbin = (full[0, 0] > thr).cpu()
         return batch_iou_torch(
             gt_tensor.unsqueeze(0).unsqueeze(0), mbin.unsqueeze(0).unsqueeze(0)
@@ -135,21 +188,28 @@ def refine_box_by_iou_grad(
     with torch.enable_grad():
         for step in range(steps + 1):
             box = params_to_box(params)
-            sparse, dense = model.prompt_encoder(points=None, boxes=box[None, :], masks=None)
-            low_res, iou_pred = model.mask_decoder(
+            sparse, dense = encode_box(box)
+            decoder_kwargs = dict(
                 image_embeddings=feats,
                 image_pe=image_pe,
                 sparse_prompt_embeddings=sparse,
                 dense_prompt_embeddings=dense,
                 multimask_output=multimask,
             )
+            if is_sam2:
+                low_res, iou_pred, _, _ = mask_decoder(
+                    **decoder_kwargs, repeat_image=False, high_res_features=high_res_features,
+                )
+            else:
+                low_res, iou_pred = mask_decoder(**decoder_kwargs)
             head = int(torch.argmax(iou_pred[0]).item()) if multimask else 0
             score = iou_pred[0, head]
 
             rec = {"step": step, "pred_score": float(score.item()), "head": head}
             if gt_tensor is not None:
                 rec["true_iou"] = true_iou_of(low_res, head)
-                rec["box"] = box.detach().cpu().numpy().tolist()
+                box_1024_now = sam2_box_to_1024(box) if is_sam2 else box.detach()
+                rec["box"] = box_1024_now.cpu().numpy().tolist()
             traj.append(rec)
 
             if step == steps:
@@ -158,7 +218,10 @@ def refine_box_by_iou_grad(
             (-score).backward()
             opt.step()
 
-    return params_to_box(params).detach(), traj
+    final_box = params_to_box(params).detach()
+    if is_sam2:
+        final_box = sam2_box_to_1024(final_box)
+    return final_box, traj
 
 
 # ---------------------------------------------------------------------------
