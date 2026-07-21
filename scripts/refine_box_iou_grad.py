@@ -275,16 +275,31 @@ def best_of_n_multimask(bad_box, predictor, device, Y, sigma, sigma_center, pert
         perturbed = sample_size_perturbed_boxes(base, (sam_h, sam_w), Y, sigma, sigma, seed)
 
     perturbed_t = perturbed.float().to(device)
-    with torch.no_grad():
-        try:
-            masks, scores, _ = predictor.predict_torch(
-                point_coords=None, point_labels=None, boxes=perturbed_t,
-                multimask_output=True, return_logits=False)
-        except TypeError:
-            masks, scores, _ = predictor.predict_torch(
-                point_coords=None, point_labels=None, boxes=perturbed_t,
-                multimask_output=True)
-            masks = masks > predictor.model.mask_threshold
+    if not hasattr(predictor, "predict_torch"):
+        orig_size = get_original_size(predictor)
+        boxes_np = boxes_to_original(perturbed_t.detach().cpu().numpy(), orig_size)
+        all_masks, all_scores = [], []
+        with torch.no_grad():
+            for box_np in boxes_np:
+                m, s, _ = predictor.predict(
+                    point_coords=None, point_labels=None, box=box_np,
+                    multimask_output=True, return_logits=False,
+                )
+                all_masks.append(torch.from_numpy(m > 0))
+                all_scores.append(torch.from_numpy(s))
+        masks = torch.stack(all_masks).bool()
+        scores = torch.stack(all_scores).float()
+    else:
+        with torch.no_grad():
+            try:
+                masks, scores, _ = predictor.predict_torch(
+                    point_coords=None, point_labels=None, boxes=perturbed_t,
+                    multimask_output=True, return_logits=False)
+            except TypeError:
+                masks, scores, _ = predictor.predict_torch(
+                    point_coords=None, point_labels=None, boxes=perturbed_t,
+                    multimask_output=True)
+                masks = masks > predictor.model.mask_threshold
 
     n_heads = scores.shape[1]
     flat = int(torch.argmax(scores.reshape(-1)).item())
