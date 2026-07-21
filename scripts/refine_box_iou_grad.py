@@ -118,7 +118,10 @@ def refine_box_by_iou_grad(
     """
     model = predictor.model
     is_sam2 = not hasattr(predictor, "predict_torch")
-    thr = model.mask_threshold
+    # SAM2ImagePredictor keeps mask_threshold on itself (see _predict:
+    # `masks = masks > self.mask_threshold` where self is the predictor);
+    # SAM1's Sam model class keeps it on the model.
+    thr = predictor.mask_threshold if is_sam2 else model.mask_threshold
 
     if is_sam2:
         prompt_encoder = model.sam_prompt_encoder
