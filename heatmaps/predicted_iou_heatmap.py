@@ -116,7 +116,29 @@ def _load_gt(mask_path, predictor) -> np.ndarray:
 
 def _predict_all_heads(boxes_orig, predictor, device):
     """boxes_orig: (B,4) float in original image coords. Returns
-    masks (B,4,H,W) bool, scores (B,4): token-0 then 3 multimask heads."""
+    masks (B,4,H,W) bool, scores (B,4): token-0 then 3 multimask heads.
+
+    SAM2ImagePredictor has no .predict_torch (no batched-boxes-on-one-image
+    call), so loop its .predict() one box at a time -- boxes_orig are ALREADY
+    in original pixel coordinates here (unlike refine_box_iou_grad.py's SAM1-
+    1024-frame boxes), which is exactly what SAM2's public .predict() expects,
+    so no coordinate conversion is needed for this backend."""
+    if not hasattr(predictor, "predict_torch"):
+        all_masks, all_scores = [], []
+        with torch.no_grad():
+            for box_orig in boxes_orig:
+                m0, s0, _ = predictor.predict(
+                    point_coords=None, point_labels=None, box=box_orig,
+                    multimask_output=False, return_logits=False)
+                mm, sm, _ = predictor.predict(
+                    point_coords=None, point_labels=None, box=box_orig,
+                    multimask_output=True, return_logits=False)
+                all_masks.append(torch.from_numpy(np.concatenate([m0, mm], axis=0) > 0))
+                all_scores.append(torch.from_numpy(np.concatenate([s0, sm], axis=0)))
+        masks = torch.stack(all_masks).bool().to(device)    # (B,4,H,W)
+        scores = torch.stack(all_scores).float().to(device)  # (B,4)
+        return masks, scores
+
     tb = torch.as_tensor(boxes_orig, dtype=torch.float32)
     if hasattr(predictor, "transform"):
         tb = predictor.transform.apply_boxes_torch(tb, predictor.original_size)

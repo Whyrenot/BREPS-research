@@ -55,7 +55,19 @@ def _load_display_image(image_path, H, W):
 
 
 def _mask_for(box_1024, head, multimask, predictor, device):
-    """Binary mask (H,W) for a box (1024 frame) at the given head."""
+    """Binary mask (H,W) for a box (this repo's SAM1-1024 frame) at the given
+    head. SAM2ImagePredictor has no .predict_torch and a different box-
+    scaling convention -- convert to original pixel coords and use its own
+    .predict() instead (same pattern as refine_box_iou_grad.py)."""
+    if not hasattr(predictor, "predict_torch"):
+        box_orig = boxes_to_original(np.asarray(box_1024, dtype=np.float64)[None],
+                                     get_original_size(predictor))[0]
+        with torch.no_grad():
+            masks, _, _ = predictor.predict(
+                point_coords=None, point_labels=None, box=box_orig,
+                multimask_output=multimask, return_logits=False)
+        return masks[head].astype(bool)
+
     box_t = torch.as_tensor(box_1024, dtype=torch.float32).unsqueeze(0).to(device)
     with torch.inference_mode():
         masks, _, _ = predictor.predict_torch(None, None, boxes=box_t,
