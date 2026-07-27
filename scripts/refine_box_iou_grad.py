@@ -810,6 +810,11 @@ def main():
     rows = []
     true_by_step: dict[int, list[float]] = defaultdict(list)
     pred_by_step: dict[int, list[float]] = defaultdict(list)
+    # same buckets as the printed "stratified by undefended quality" table --
+    # the AGGREGATE trajectory mean hides that grad-refine is a big win on
+    # weak boxes and roughly flat/slightly negative on already-good ones.
+    _BUCKETS = ("weak", "mid", "strong")
+    true_by_step_bucket: dict[str, dict[int, list[float]]] = {b: defaultdict(list) for b in _BUCKETS}
 
     n_done = 0
     for image_name, raw_tasks in by_image.items():
@@ -840,6 +845,7 @@ def main():
                 boxes_already_transformed=True, return_score=True,
             )
             undef_iou = _iou(gt_tensor, undef_mask)
+            bucket = "weak" if undef_iou < 0.5 else ("mid" if undef_iou < 0.8 else "strong")
 
             # clean reference: the un-attacked box (best_box), for the
             # clean/attacked/defended calibration comparison
@@ -881,6 +887,7 @@ def main():
             for t in traj:
                 true_by_step[t["step"]].append(t["true_iou"])
                 pred_by_step[t["step"]].append(t["pred_score"])
+                true_by_step_bucket[bucket][t["step"]].append(t["true_iou"])
             grad_final_iou = traj[-1]["true_iou"]
             grad_best_iou = max(t["true_iou"] for t in traj)  # best over trajectory
             grad_box = final_box.cpu().numpy()
@@ -1031,6 +1038,23 @@ def main():
           undef=df["undefended_iou"].mean(), bon=df["best_of_n_iou"].mean(),
           bon_mm=df["bon_mm_iou"].mean(), headsel=df["headsel_iou"].mean(),
           out_path=Path(args.out_plot))
+
+    # same story, split by initial (undefended) box quality -- the aggregate
+    # mean above hides that grad-refine mostly moves the WEAK cases, see
+    # "stratified by undefended quality" below for the same buckets as text
+    q = df["undefended_iou"]
+    bucket_masks = {"weak": q < 0.5, "mid": (q >= 0.5) & (q < 0.8), "strong": q >= 0.8}
+    bucket_steps = {b: sorted(true_by_step_bucket[b]) for b in _BUCKETS}
+    bucket_true_mean = {b: np.array([np.mean(true_by_step_bucket[b][s]) for s in bucket_steps[b]])
+                        for b in _BUCKETS if bucket_steps[b]}
+    bucket_refs = {}
+    for b, m in bucket_masks.items():
+        sub = df[m]
+        if len(sub):
+            bucket_refs[b] = dict(n=len(sub), undef=sub["undefended_iou"].mean(),
+                                  bon=sub["best_of_n_iou"].mean(), bon_mm=sub["bon_mm_iou"].mean())
+    _plot_by_bucket(bucket_steps, bucket_true_mean, bucket_refs,
+                    out_path=Path(args.out_plot).with_name(Path(args.out_plot).stem + "_by_bucket.png"))
 
     # ---- summary ----
     print(f"\nProcessed {n_done} cases over {len(by_image)} images "
@@ -1205,6 +1229,41 @@ def _plot(steps, true_mean, pred_mean, undef, bon, bon_mm, headsel, out_path):
     fig.savefig(out_path, dpi=140, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved plot -> {out_path}")
+
+
+_BUCKET_COLOR = {"weak": "#d62728", "mid": "#ff7f0e", "strong": "#2ca02c"}
+_BUCKET_LABEL = {"weak": "weak (undef<0.5)", "mid": "mid (0.5-0.8)", "strong": "strong (undef>=0.8)"}
+
+
+def _plot_by_bucket(bucket_steps, bucket_true_mean, bucket_refs, out_path):
+    """Same 'true IoU vs gradient step' story as _plot(), split by initial
+    (undefended) box quality -- the AGGREGATE mean in _plot() averages a
+    large win on weak boxes together with a flat/slightly negative effect
+    on already-good ones, which mostly cancel out. One panel per bucket,
+    its own y-scale (the buckets differ by ~0.3-0.9 in absolute IoU, a
+    shared axis would flatten the weak-bucket climb to a sliver)."""
+    buckets = [b for b in ("weak", "mid", "strong") if b in bucket_true_mean and b in bucket_refs]
+    if not buckets:
+        return
+    fig, axes = plt.subplots(1, len(buckets), figsize=(6 * len(buckets), 5))
+    if len(buckets) == 1:
+        axes = [axes]
+    for ax, b in zip(axes, buckets):
+        ref = bucket_refs[b]
+        ax.plot(bucket_steps[b], bucket_true_mean[b], "-o", color=_BUCKET_COLOR[b],
+                label=f"grad-refine (n={ref['n']})")
+        ax.axhline(ref["undef"], color="#7f7f7f", ls="--", label=f"undefended ({ref['undef']:.3f})")
+        ax.axhline(ref["bon"], color="#1f77b4", ls=":", label=f"best_of_n ({ref['bon']:.3f})")
+        ax.axhline(ref["bon_mm"], color="#9467bd", ls="-.", label=f"best_of_n x mm ({ref['bon_mm']:.3f})")
+        ax.set_xlabel("gradient step"); ax.set_ylabel("mean true IoU")
+        ax.set_title(_BUCKET_LABEL[b]); ax.grid(ls=":", alpha=0.4); ax.legend(fontsize=8)
+    fig.suptitle("True IoU vs gradient step, stratified by initial (undefended) box quality",
+                fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved by-quality-bucket plot -> {out_path}")
 
 
 if __name__ == "__main__":
