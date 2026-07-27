@@ -616,6 +616,24 @@ def grad_estop_by_stability(traj, predictor, device, use_mm, estop_every, M, sig
     return best
 
 
+class _Tee:
+    """Duplicate writes to several text streams (e.g. real stdout + a log
+    file), so print() keeps working normally on the console while also
+    landing in the file. Used to save ONLY the post-processing report
+    (--summary_txt), not warnings or the tqdm progress bar."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -675,6 +693,13 @@ def parse_args():
 
     p.add_argument("--out_csv", default="results/grad_refine_percase.csv")
     p.add_argument("--out_plot", default="results/grad_refine.png")
+    p.add_argument("--summary_txt", default=None,
+                   help="save the printed post-processing report (calibration "
+                        "stats + the full '---- summary ----' block: per-method "
+                        "means, gradient trajectory, stratified tables, weakness "
+                        "detector) to this .txt file, in addition to stdout. "
+                        "No warnings/progress-bar noise, just that report. "
+                        "Default: <out_csv> with '_summary.txt' instead of '.csv'.")
     p.add_argument("--steps_csv", default=None,
                    help="optional: per-step aggregate (mean true/pred IoU)")
     p.add_argument("--calib_csv", default="results/gt_vs_pred_iou.csv",
@@ -976,6 +1001,17 @@ def main():
     out_csv = Path(args.out_csv); out_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_csv, index=False)
 
+    # everything printed from here on (calibration stats + the whole
+    # '---- summary ----' report below) also goes to --summary_txt, verbatim,
+    # in addition to stdout -- no warnings/tqdm noise (those already happened
+    # earlier, during the per-case loop, so they never reach this stream).
+    summary_txt_path = (Path(args.summary_txt) if args.summary_txt
+                        else out_csv.with_name(out_csv.stem + "_summary.txt"))
+    summary_txt_path.parent.mkdir(parents=True, exist_ok=True)
+    _orig_stdout = sys.stdout
+    _summary_f = open(summary_txt_path, "w")
+    sys.stdout = _Tee(_orig_stdout, _summary_f)
+
     # full-dataset gt-vs-pred IoU vectors + correlation (Pearson / Spearman)
     calibration_outputs(df, Path(args.calib_plot),
                         Path(args.calib_csv) if args.calib_csv else None,
@@ -1138,6 +1174,10 @@ def main():
               f"{gated.mean():>9.4f} | {gated_v.mean():>9.4f}")
     print(f"  {'(undef baseline)':>22} mean IoU = {undef_arr.mean():.4f}")
     print(f"\nSaved per-case -> {out_csv}")
+
+    sys.stdout = _orig_stdout
+    _summary_f.close()
+    print(f"Saved post-processing report -> {summary_txt_path}")
 
 
 def _plot(steps, true_mean, pred_mean, undef, bon, bon_mm, headsel, out_path):
