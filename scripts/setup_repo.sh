@@ -341,6 +341,16 @@ setup_sam3_env() {
         scipy loguru tqdm pyyaml pillow psutil huggingface_hub \
         "segment-anything>=1.0"
 
+    # SAM3's text encoder wants the gzipped CLIP BPE vocabulary, but the sam3
+    # wheel ships no assets/ directory and facebook/sam3 on HF carries the
+    # tokenizer in HF format (vocab.json + merges.txt) instead -- so the file
+    # has to come from somewhere else. open_clip_torch ships the identical
+    # vocabulary; heatmaps/sam3_adapter.py::find_bpe_path finds it there.
+    # --no-deps is deliberate: an unconstrained install here could re-resolve
+    # the whole graph and move torch off its pin (see the warning at the top
+    # of this file, and session_handoff.txt section 2).
+    conda run -n "$SAM3_ENV_NAME" pip install --no-deps open_clip_torch
+
     log "sam3 env ready."
     log "  conda run -n $SAM3_ENV_NAME python -c \"from sam3.model_builder import build_sam3_image_model; print('sam3 import OK')\""
     log "  # Checkpoints are gated -- authenticate once. NOTE: 'huggingface-cli'"

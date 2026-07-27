@@ -117,7 +117,14 @@ _INTERACTIVE_PREDICTOR_ATTRS = (
 # which would otherwise blow up much later and much less legibly inside the
 # tokenizer.
 _BPE_MIN_BYTES = 100_000
+# Checked on 2026-07-27: facebook/sam3 carries its tokenizer in HF format
+# (vocab.json + merges.txt + tokenizer.json), NOT as this gzip -- so the HF
+# fallback below will normally miss. Kept in case they add it later.
 _BPE_HF_REPOS = ("facebook/sam3",)
+# Installed packages that ship the identical CLIP vocabulary. Borrowing it
+# from one of them avoids guessing a raw-file URL (a wrong one silently
+# saves a 404 body, see _looks_like_bpe).
+_BPE_DONOR_PACKAGES = ("open_clip", "clip", "perception_models")
 
 
 def _looks_like_bpe(path) -> tuple[bool, str]:
@@ -133,6 +140,23 @@ def _looks_like_bpe(path) -> tuple[bool, str]:
         if f.read(2) != b"\x1f\x8b":
             return False, f"not gzip-compressed (bad magic), {size} bytes"
     return True, ""
+
+
+def _bpe_from_installed_packages() -> Optional[str]:
+    """Borrow the CLIP vocabulary from another installed package."""
+    import importlib.util
+
+    for pkg in _BPE_DONOR_PACKAGES:
+        try:
+            spec = importlib.util.find_spec(pkg)
+        except Exception:  # noqa: BLE001 -- a broken package must not stop us
+            continue
+        if spec is None or not spec.origin:
+            continue
+        for hit in sorted(Path(spec.origin).resolve().parent.rglob(_BPE_GLOB)):
+            if _looks_like_bpe(hit)[0]:
+                return str(hit)
+    return None
 
 
 def _bpe_from_hf() -> Optional[str]:
@@ -195,6 +219,10 @@ def find_bpe_path() -> str:
         if _looks_like_bpe(hit)[0]:
             return str(hit)
 
+    donated = _bpe_from_installed_packages()
+    if donated:
+        return donated
+
     from_hf = _bpe_from_hf()
     if from_hf:
         return from_hf
@@ -204,16 +232,19 @@ def find_bpe_path() -> str:
         f"{getattr(sam3, '__version__', '?')} looks for it at "
         f"<package>/../assets/, which for an installed wheel resolves to "
         f"{root.parent / 'assets'} -- and the wheel ships no assets/ at all. "
-        f"It is also not in {', '.join(_BPE_HF_REPOS)} (or you are not "
-        f"authenticated: `hf auth login`).\n\n"
-        f"It is the standard CLIP vocabulary, so any of these works:\n"
-        f"  pip install open_clip_torch   # ships it inside the package\n"
-        f"  curl -L -o /tmp/bpe_simple_vocab_16e6.txt.gz \\\n"
-        f"    https://raw.githubusercontent.com/openai/CLIP/main/clip/"
+        f"It is not in {', '.join(_BPE_HF_REPOS)} either (that repo carries "
+        f"the tokenizer in HF format: vocab.json + merges.txt), nor in any of "
+        f"{', '.join(_BPE_DONOR_PACKAGES)}.\n\n"
+        f"It is the standard CLIP vocabulary. Easiest fix -- install a package "
+        f"that ships it (--no-deps so pip cannot re-resolve this env's pinned "
+        f"torch):\n"
+        f"    pip install --no-deps open_clip_torch\n"
+        f"or download it and point BREPS_SAM3_BPE_PATH at the result:\n"
+        f"    curl -L -o /tmp/bpe_simple_vocab_16e6.txt.gz \\\n"
+        f"      https://raw.githubusercontent.com/openai/CLIP/main/clip/"
         f"bpe_simple_vocab_16e6.txt.gz\n"
-        f"then export BREPS_SAM3_BPE_PATH=<path to it>.\n"
-        f"Verify before use -- the file must be ~1.3 MB and start with the "
-        f"gzip magic bytes; a 14-byte '404: Not Found' body is the usual trap."
+        f"Check what you got: it must be ~1.3 MB and gzip -- a 14-byte "
+        f"'404: Not Found' body is the usual trap."
     )
 
 
