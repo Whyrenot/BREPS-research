@@ -112,36 +112,108 @@ _INTERACTIVE_PREDICTOR_ATTRS = (
 )
 
 
+# The BPE vocabulary is the standard CLIP one (~1.3 MB gzip). Anything much
+# smaller is not it -- most often an HTML/404 body saved by a failed curl,
+# which would otherwise blow up much later and much less legibly inside the
+# tokenizer.
+_BPE_MIN_BYTES = 100_000
+_BPE_HF_REPOS = ("facebook/sam3",)
+
+
+def _looks_like_bpe(path) -> tuple[bool, str]:
+    """(ok, reason) -- is this plausibly the gzipped BPE vocabulary?"""
+    p = Path(path)
+    if not p.is_file():
+        return False, "not a file"
+    size = p.stat().st_size
+    if size < _BPE_MIN_BYTES:
+        head = p.read_bytes()[:60].decode("utf-8", "replace").strip()
+        return False, f"only {size} bytes (expected ~1.3 MB); starts with {head!r}"
+    with open(p, "rb") as f:
+        if f.read(2) != b"\x1f\x8b":
+            return False, f"not gzip-compressed (bad magic), {size} bytes"
+    return True, ""
+
+
+def _bpe_from_hf() -> Optional[str]:
+    """SAM3's checkpoint repo on Hugging Face also carries its tokenizer
+    assets. Downloads into the normal HF cache (no-op once cached)."""
+    from fnmatch import fnmatch
+
+    try:
+        from huggingface_hub import hf_hub_download, list_repo_files
+    except ImportError:
+        return None
+    for repo in _BPE_HF_REPOS:
+        try:
+            files = list_repo_files(repo)
+        except Exception:  # noqa: BLE001 -- gated/offline/not-logged-in
+            continue
+        for name in files:
+            if fnmatch(Path(name).name, _BPE_GLOB):
+                try:
+                    return hf_hub_download(repo, name)
+                except Exception:  # noqa: BLE001
+                    continue
+    return None
+
+
 def find_bpe_path() -> str:
     """Locate SAM3's BPE vocabulary.
 
     sam3 0.1.4's build_sam3_image_model() defaults bpe_path to
         os.path.join(os.path.dirname(__file__), "..", "assets", <bpe>)
-    i.e. dirname(sam3/model_builder.py)/../assets/ -- which is correct in a
-    repo checkout (repo/sam3/ + repo/assets/) but escapes the INSTALLED
+    i.e. dirname(sam3/model_builder.py)/../assets/ -- correct in a repo
+    checkout (repo/sam3/ + repo/assets/) but it escapes the INSTALLED
     package, resolving to site-packages/assets/ and raising FileNotFoundError.
-    Pass bpe_path explicitly to work around it.
+    The wheel does not ship assets/ at all, so the file has to come from
+    somewhere else; try, in order: an explicit override, the package, the
+    Hugging Face repo.
     """
+    import os
+
     import sam3
+
+    override = os.environ.get("BREPS_SAM3_BPE_PATH")
+    if override:
+        ok, why = _looks_like_bpe(override)
+        if not ok:
+            raise FileNotFoundError(
+                f"BREPS_SAM3_BPE_PATH={override} is not the BPE vocabulary: "
+                f"{why}.\nA failed download usually lands here -- check the "
+                f"file, or unset the variable to let SAM3's Hugging Face repo "
+                f"supply it automatically."
+            )
+        return override
 
     root = Path(sam3.__file__).resolve().parent
     for base in (root, root.parent):
-        hits = sorted(base.glob(f"assets/{_BPE_GLOB}")) or sorted(base.glob(_BPE_GLOB))
-        if hits:
-            return str(hits[0])
-    hits = sorted(root.rglob(_BPE_GLOB))
-    if hits:
-        return str(hits[0])
+        for hit in sorted(base.glob(f"assets/{_BPE_GLOB}")) + sorted(base.glob(_BPE_GLOB)):
+            if _looks_like_bpe(hit)[0]:
+                return str(hit)
+    for hit in sorted(root.rglob(_BPE_GLOB)):
+        if _looks_like_bpe(hit)[0]:
+            return str(hit)
+
+    from_hf = _bpe_from_hf()
+    if from_hf:
+        return from_hf
+
     raise FileNotFoundError(
-        f"SAM3: no {_BPE_GLOB} found under {root} or {root.parent}. sam3 "
+        f"SAM3: no usable {_BPE_GLOB} found. sam3 "
         f"{getattr(sam3, '__version__', '?')} looks for it at "
-        f"<package>/../assets/, which does not exist for an installed wheel "
-        f"-- and here it did not ship inside the package either.\n"
-        f"Fetch it from the source repo and pass the path through:\n"
-        f"    curl -L -o /tmp/bpe_simple_vocab_16e6.txt.gz \\\n"
-        f"      https://raw.githubusercontent.com/facebookresearch/sam3/main/"
-        f"assets/bpe_simple_vocab_16e6.txt.gz\n"
-        f"then set the BREPS_SAM3_BPE_PATH environment variable to it."
+        f"<package>/../assets/, which for an installed wheel resolves to "
+        f"{root.parent / 'assets'} -- and the wheel ships no assets/ at all. "
+        f"It is also not in {', '.join(_BPE_HF_REPOS)} (or you are not "
+        f"authenticated: `hf auth login`).\n\n"
+        f"It is the standard CLIP vocabulary, so any of these works:\n"
+        f"  pip install open_clip_torch   # ships it inside the package\n"
+        f"  curl -L -o /tmp/bpe_simple_vocab_16e6.txt.gz \\\n"
+        f"    https://raw.githubusercontent.com/openai/CLIP/main/clip/"
+        f"bpe_simple_vocab_16e6.txt.gz\n"
+        f"then export BREPS_SAM3_BPE_PATH=<path to it>.\n"
+        f"Verify before use -- the file must be ~1.3 MB and start with the "
+        f"gzip magic bytes; a 14-byte '404: Not Found' body is the usual trap."
     )
 
 
