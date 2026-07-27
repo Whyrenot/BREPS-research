@@ -248,10 +248,23 @@ def find_bpe_path() -> str:
     )
 
 
+SAM3_HF_REPO_URL = "https://huggingface.co/facebook/sam3"
+
+
+def _is_gated_repo_error(e: BaseException) -> bool:
+    """Hugging Face refused the download because access is not granted --
+    distinct from 'not logged in' and from a network failure."""
+    if type(e).__name__ in ("GatedRepoError", "RepositoryNotFoundError"):
+        return True
+    text = str(e)
+    return ("gated repo" in text.lower()
+            or "not in the authorized list" in text.lower())
+
+
 def build_sam3_model(checkpoint: str | None = None, device="cuda",
                      enable_inst_interactivity: bool = True, **extra):
-    """Call sam3.model_builder.build_sam3_image_model with the two settings
-    this repo needs.
+    """Call sam3.model_builder.build_sam3_image_model with the settings this
+    repo needs.
 
     enable_inst_interactivity=True is REQUIRED and is NOT the default: it is
     what makes the builder construct
@@ -259,8 +272,11 @@ def build_sam3_model(checkpoint: str | None = None, device="cuda",
     and attach it to the model. Without it SAM3 exposes only the concept
     (text / exemplar) path and there is no box-promptable predictor at all.
 
-    checkpoint=None is fine -- the builder's load_from_HF default pulls the
-    gated checkpoint from Hugging Face (needs `hf auth login`).
+    checkpoint=None pulls the weights from Hugging Face, which requires an
+    approved access request for the gated facebook/sam3 repo (being logged
+    in is not enough -- see the error message below). Passing a local
+    checkpoint ALSO turns off load_from_HF, so a machine with the weights on
+    disk never touches the network.
     """
     import os
 
@@ -268,10 +284,33 @@ def build_sam3_model(checkpoint: str | None = None, device="cuda",
 
     bpe_path = os.environ.get("BREPS_SAM3_BPE_PATH") or find_bpe_path()
     kwargs = dict(bpe_path=bpe_path, device=str(device),
-                  enable_inst_interactivity=enable_inst_interactivity, **extra)
+                  enable_inst_interactivity=enable_inst_interactivity)
     if checkpoint:
         kwargs["checkpoint_path"] = checkpoint
-    return build_sam3_image_model(**kwargs)
+        # The builder fetches its config from HF whenever load_from_HF is on,
+        # even with an explicit checkpoint_path -- which fails on a gated or
+        # offline repo for no reason when the weights are already local.
+        kwargs.setdefault("load_from_HF", False)
+    kwargs.update(extra)
+
+    try:
+        return build_sam3_image_model(**kwargs)
+    except Exception as e:  # noqa: BLE001 -- re-raised below, annotated
+        if not _is_gated_repo_error(e):
+            raise
+        raise RuntimeError(
+            f"SAM3's weights are on Hugging Face behind an access gate, and "
+            f"this account has not been granted access:\n    {e}\n\n"
+            f"Being authenticated is NOT enough -- `hf auth login` succeeds "
+            f"and even `list_repo_files` works (gated repos expose metadata), "
+            f"but downloads return 403 until the request is approved.\n"
+            f"  1. Open {SAM3_HF_REPO_URL} while signed in as the same account "
+            f"(`hf auth whoami`) and submit the access request.\n"
+            f"  2. Wait for approval, then re-run.\n"
+            f"Alternatively, if sam3.pt is already on disk somewhere, pass it "
+            f"as --checkpoint_path: that sets load_from_HF=False and skips "
+            f"Hugging Face entirely."
+        ) from e
 
 
 def get_interactive_predictor(model):

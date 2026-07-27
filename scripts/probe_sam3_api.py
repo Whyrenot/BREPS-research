@@ -256,6 +256,17 @@ def build_model(builder_path: str | None, checkpoint: str | None, device: str):
             print(f"  [FAIL] {type(e).__name__}: {e}")
             for line in traceback.format_exc(limit=4).splitlines()[-6:]:
                 print(f"         {line}")
+            try:
+                from heatmaps.sam3_adapter import _is_gated_repo_error
+                gated = _is_gated_repo_error(e)
+            except Exception:  # noqa: BLE001
+                gated = False
+            if gated:
+                # Every other spelling downloads from the same gated repo and
+                # fails identically; repeating it only buries the real cause.
+                print("  -> BLOCKED on Hugging Face access, not on the API. "
+                      "Nothing below would tell you more; stopping here.")
+                return None
             print("  -> falling back to raw builder calls below")
 
     candidates = [builder_path] if builder_path else [
@@ -273,6 +284,19 @@ def build_model(builder_path: str | None, checkpoint: str | None, device: str):
         show_source(path, fn, max_lines=60)
         params = inspect.signature(fn).parameters
 
+        # sam3 0.1.4's bpe_path default resolves outside the installed
+        # package; supply it here too, or this fallback fails on that instead
+        # of on whatever we are actually trying to learn about.
+        base_kwargs: dict = {}
+        if "bpe_path" in params:
+            try:
+                from heatmaps.sam3_adapter import find_bpe_path
+                base_kwargs["bpe_path"] = find_bpe_path()
+            except Exception as e:  # noqa: BLE001
+                print(f"  [warn] no bpe_path: {e}")
+        if "enable_inst_interactivity" in params:
+            base_kwargs["enable_inst_interactivity"] = True
+
         # Try the kwarg spellings a checkpoint could plausibly have, then no-arg
         # (SAM3 may pull the gated checkpoint straight from Hugging Face).
         attempts: list[dict] = []
@@ -288,6 +312,7 @@ def build_model(builder_path: str | None, checkpoint: str | None, device: str):
             pos = kwargs.pop("__positional__", None)
             label = f"{fn_name}({pos or ''}{', ' if pos and kwargs else ''}" \
                     f"{', '.join(f'{k}=...' for k in kwargs)})"
+            kwargs = {**base_kwargs, **kwargs}
             if "device" in params:
                 kwargs.setdefault("device", device)
             ok, model = safe(label, lambda: fn(pos, **kwargs) if pos else fn(**kwargs))
