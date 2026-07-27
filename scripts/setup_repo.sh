@@ -235,9 +235,13 @@ setup_samhq_env() {
     # isegm package -- deliberately no `pip install -e .` on this repo here,
     # that would try to pull the OFFICIAL segment-anything back in and
     # re-shadow this env's segment_anything with itself).
+    # timm: sam-hq's modeling/__init__.py unconditionally imports TinyViT
+    # (needs timm) regardless of --model_type, even for vit_l/vit_h.
+    # numpy<2: torch==1.13.1-era compiled extensions (torchvision) crash /
+    # warn under numpy 2.x ("compiled using NumPy 1.x").
     conda run -n "$HQ_ENV_NAME" pip install \
-        numpy pandas "opencv-python-headless>=4.8.1.78" "matplotlib>=3.10.7" \
-        scipy loguru tqdm pyyaml
+        "numpy<2" pandas "opencv-python-headless>=4.8.1.78" "matplotlib>=3.10.7" \
+        scipy loguru tqdm pyyaml timm
 
     log "sam_hq env ready. Smoke-test once you have a checkpoint:"
     log "  conda run -n $HQ_ENV_NAME python -c \"from segment_anything import sam_model_registry; print('segment_anything (HQ) import OK')\""
