@@ -257,20 +257,46 @@ _build_sam3_raw перебирает известные написания би�
 segment-anything, которые нужны нашему коду ВНУТРИ этого env),
 scripts/refine_box_iou_grad.py (только докстринги/help).
 
-ЧТО В АДАПТЕРЕ УГАДАНО И ОБЯЗАТЕЛЬНО СВЕРИТЬ С probe (реального SAM3 под рукой
-не было — тот же принцип «не по памяти», что и в разделе 2):
-  1. КАКИЕ модули — prompt encoder / mask decoder (ищутся по имени класса +
-     duck typing). -> probe Q3.
-  2. КАК получить image embedding (сначала пробуем нативный predictor SAM3 и
-     снимаем его кэш, иначе зовём forward_image/encode_image/...). -> probe Q2.
-  3. Входное РАЗРЕШЕНИЕ и нормализация пикселей (сейчас image_size + ImageNet
-     mean/std). -> probe Q3 «public non-module attributes».
-Если discovery не сработает — адаптер падает с точным указанием, какую секцию
-probe-отчёта смотреть; он НИКОГДА не подставляет догадку молча (молча неверная
-система координат даёт правдоподобные, но бессмысленные IoU — та же категория
-бага, что torch 1.13.1 на H100 из раздела 2).
+ЧТО ПОДТВЕРЖДЕНО ПРОБНИКОМ (27.07.2026; sam3 0.1.4, H100, torch 2.10.0+cu128).
+Догадок в адаптере больше НЕТ — всё ниже прочитано из установленного исходника:
+  * У SAM3 УЖЕ ЕСТЬ SAM2-образный предиктор:
+    sam3.model.sam1_task_predictor.SAM3InteractiveImagePredictor — с _orig_hw,
+    _features={"image_embed","high_res_feats"}, _transforms (НАСТОЯЩИЙ
+    SAM2Transforms, resolution=1008), predict() нашей сигнатуры и БЕЗ
+    predict_torch/interm_features, т.е. is_sam2-ветка выбирается верно.
+    Синтетический SAM3ImagePredictor остался только запасным путём.
+  * predictor.model = Sam3TrackerPredictor: sam_prompt_encoder (PromptEncoder)
+    и sam_mask_decoder (MaskDecoder) с ТОЧНО SAM2-шной сигнатурой
+    forward(..., multimask_output, repeat_image, high_res_features) -> 4-tuple.
+    Бокс кодируется как 2 угла с метками [2,3].
+  * enable_inst_interactivity=True ОБЯЗАТЕЛЕН и НЕ дефолт — без него
+    интерактивный предиктор не создаётся вовсе.
+  * bpe_path надо передавать явно: дефолт в 0.1.4 указывает на
+    <package>/../assets/, т.е. site-packages/assets/, а в колесе assets/ нет.
+    Берём тот же CLIP-словарь из open_clip (setup_repo ставит --no-deps).
+  * Трекер строится через build_tracker(...) с with_backbone=False: своего
+    vision-энкодера у него НЕТ, SAM3 держит ОДИН общий backbone. Поэтому родной
+    set_image() падает на self.model.forward_image(). Наш
+    install_shared_backbone_set_image повторяет его, но берёт backbone_out из
+    Sam3Image.backbone + conv_s0/conv_s1 (как Sam3Processor.set_image).
+  * Препроцессинг: mean=std=0.5, НЕ ImageNet. Берём transform у Sam3Processor.
+  * Sam3Processor.set_image помечен @torch.inference_mode(), его выход НЕЛЬЗЯ
+    класть в autograd ("Inference tensors cannot be saved for backward"), поэтому
+    зовём backbone напрямую под torch.no_grad().
+  * _setup_device_and_mode НЕ переносит модель целиком: без явного .to(device)
+    остаются CPU-модули, и общий backbone (CUDA bfloat16) встречается с fp32 на
+    CPU. adopt_native_predictor двигает всю Sam3Image, а фичи приводит к dtype
+    трекера (fp32), чтобы градиент не зависел от autocast.
+  * Q4 = GO: d(pred_iou)/d(cx,cy,w,h) конечная и ненулевая (max|grad| ~1.7e-3).
+    Малая величина не мешает — Adam нормирует шаг, lr остаётся «в пикселях».
 
-ПОРЯДОК ЗАПУСКА НА СЕРВЕРЕ (ничего из этого ещё не делалось):
+ДИАГНОСТИКА НА БУДУЩЕЕ: probe печатает describe_devices (секция Q2c) — где лежит
+каждый модуль и какие остались на CPU. Это важно: device/dtype-ошибка от torch
+называет ТОЛЬКО свои внутренности (_call_impl -> _conv_forward -> conv2d) и не
+отличает сбой в общем backbone от сбоя в свёртках трекера. На этом потеряли
+несколько итераций.
+
+ПОРЯДОК ЗАПУСКА НА СЕРВЕРЕ (шаги 0-4 ПРОЙДЕНЫ, следующий — 6):
   0. git pull
   1. ./scripts/setup_repo.sh --envs sam3 --skip-diffvg
   2. Аутентификация на HF (чекпоинты гейтованы). ВНИМАНИЕ: `huggingface-cli`
@@ -281,14 +307,21 @@ probe-отчёта смотреть; он НИКОГДА не подставля
        conda run -n sam3 hf auth login --token $HF_TOKEN
        conda run -n sam3 hf auth whoami    # проверка
   3. conda run -n sam3 python scripts/test_sam3_adapter.py   (быстрый sanity)
-  4. python scripts/probe_sam3_api.py --checkpoint_path <ckpt> \
+     ВАЖНО: логин проходит и list_repo_files работает даже БЕЗ выданного
+     доступа (у gated-репо метаданные открыты всем), а скачивание даёт 403.
+     Доступ надо отдельно запросить на https://huggingface.co/facebook/sam3
+     и дождаться одобрения.
+  4. python scripts/probe_sam3_api.py \
        --image <FOR_TEST/images/*.png> --out results/sam3_api_probe.txt
-     -> ЧИТАТЬ Q4. Нет градиента — дальше идти нельзя.
-  5. Свести probe-отчёт с тремя пунктами выше, поправить sam3_adapter.py.
+     -> ЧИТАТЬ Q4. Нет градиента — дальше идти нельзя.   [ПРОЙДЕНО: Q4 = GO]
+  5. (снято: сводить нечего, адаптер уже сверен с исходником — см. выше)
   6. Смоук: scripts/animate_grad_refine.py --model_name SAM3 --steps 10
      на одной картинке (самый дешёвый end-to-end: одна картинка, один бокс).
   7. heatmaps/predicted_iou_heatmap.py --grid_step 64 (грубая сетка сначала).
   8. scripts/refine_box_iou_grad.py --limit 3 --grad_only, потом полный прогон.
+  ВЕЗДЕ: --checkpoint_path "" (пустая строка = «не передавать checkpoint_path»,
+  билдер берёт веса из HF-кэша). С явным путём к sam3.pt адаптер выставляет
+  load_from_HF=False, и сеть не нужна вовсе.
 
 
 8. МЕЛКИЕ ХВОСТЫ / НЕ ЗАБЫТЬ
