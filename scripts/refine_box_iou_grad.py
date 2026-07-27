@@ -106,18 +106,32 @@ def refine_box_by_iou_grad(
     the SAME SAM1-style 1024 frame as the input, regardless of backend.
     Trajectory entry: {step, pred_score, [true_iou], [box] (also 1024-frame)}.
 
-    Portable across SamPredictor (SAM/SAM-HQ) and SAM2ImagePredictor
-    (SAM2.1/SAM-HQ2, detected via the absence of .predict_torch). SAM2's
-    mask decoder lives at model.sam_mask_decoder (not .mask_decoder), needs
-    the Hiera backbone's high_res_features + a repeat_image flag, encodes a
-    box as two labelled points (label 2/3) rather than via a boxes= kwarg,
-    and scales box coordinates differently (plain independent-axis resize
-    to a square, via its own SAM2Transforms -- no letterbox pad like SAM1)
-    -- confirmed directly from sam2.sam2_image_predictor.SAM2ImagePredictor
-    ._predict and sam2.utils.transforms.SAM2Transforms source, not guessed.
+    Portable across three predictor families:
+      * SamPredictor (SAM) -- vanilla, as documented above.
+      * SysCV/sam-hq's SamPredictor (SAM-HQ, detected via the presence of
+        .interm_features): a superset of vanilla SamPredictor, but its
+        MaskDecoderHQ.forward ALSO requires hq_token_only (bool) and
+        interm_embeddings (cached intermediate ViT-encoder features) --
+        confirmed from that fork's SamPredictor.predict_torch source, which
+        passes interm_embeddings=self.interm_features, hq_token_only=<arg>.
+      * SAM2ImagePredictor (SAM2.1/SAM-HQ2, detected via the absence of
+        .predict_torch). SAM2's mask decoder lives at model.sam_mask_decoder
+        (not .mask_decoder), needs the Hiera backbone's high_res_features +
+        a repeat_image flag, encodes a box as two labelled points (label
+        2/3) rather than via a boxes= kwarg, and scales box coordinates
+        differently (plain independent-axis resize to a square, via its own
+        SAM2Transforms -- no letterbox pad like SAM1) -- confirmed directly
+        from sam2.sam2_image_predictor.SAM2ImagePredictor._predict and
+        sam2.utils.transforms.SAM2Transforms source, not guessed.
     """
     model = predictor.model
     is_sam2 = not hasattr(predictor, "predict_torch")
+    # SysCV/sam-hq's SamPredictor (SAM-HQ) is a superset of vanilla
+    # SamPredictor: after set_image() it ALSO caches interm_features
+    # (intermediate ViT-encoder layers), which its MaskDecoderHQ requires --
+    # confirmed from SamPredictor.predict_torch's own mask_decoder(...) call
+    # (interm_embeddings=self.interm_features, hq_token_only=<arg>).
+    is_samhq = hasattr(predictor, "interm_features")
     # SAM2ImagePredictor keeps mask_threshold on itself (see _predict:
     # `masks = masks > self.mask_threshold` where self is the predictor);
     # SAM1's Sam model class keeps it on the model.
@@ -202,6 +216,11 @@ def refine_box_by_iou_grad(
             if is_sam2:
                 low_res, iou_pred, _, _ = mask_decoder(
                     **decoder_kwargs, repeat_image=False, high_res_features=high_res_features,
+                )
+            elif is_samhq:
+                low_res, iou_pred = mask_decoder(
+                    **decoder_kwargs, hq_token_only=False,
+                    interm_embeddings=predictor.interm_features,
                 )
             else:
                 low_res, iou_pred = mask_decoder(**decoder_kwargs)
