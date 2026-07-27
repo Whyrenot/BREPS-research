@@ -885,6 +885,14 @@ def main():
                 if patched:
                     print("       (the tracker has no vision backbone of its own, "
                           "so features\n        come from Sam3Image.backbone -- see Q2b)")
+                sub("module placement after adoption (device / dtype)")
+                ok2, placement = safe(
+                    "describe_devices",
+                    lambda: __import__("heatmaps.sam3_adapter", fromlist=["x"])
+                    .describe_devices(predictor, model))
+                if ok2:
+                    for k, v in placement.items():
+                        print(f"  {k:32s} {v}")
         live_smoke(model, predictor, args.image, device)
     finally:
         sys.stdout = real_stdout

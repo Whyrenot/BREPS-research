@@ -428,10 +428,63 @@ def adopt_native_predictor(predictor, image_model=None, device=None):
         )
 
     if device is not None:
+        # The WHOLE image model, not just the predictor: _setup_device_and_mode
+        # leaves parts behind, and a stray CPU module anywhere inside
+        # backbone.forward_image fails with the same dtype/device error as a
+        # stray conv_s0 would, from an indistinguishable traceback.
+        if image_model is not None:
+            image_model.to(torch.device(device))
         align_predictor_device(predictor, device)
     if image_model is not None and _tracker_lacks_backbone(predictor.model):
         install_shared_backbone_set_image(predictor, image_model, device)
     return predictor
+
+
+def describe_devices(predictor, image_model=None) -> dict[str, str]:
+    """Where every module involved in set_image actually lives.
+
+    Worth printing whenever a device/dtype mismatch shows up: the traceback
+    for one only names torch internals, so it cannot distinguish a stray
+    module inside the shared backbone from a stray one in the tracker.
+    """
+    def describe(mod) -> str:
+        if mod is None:
+            return "<none>"
+        try:
+            p = next(mod.parameters())
+        except (AttributeError, StopIteration):
+            return "<no parameters>"
+        return f"{p.device} {p.dtype}"
+
+    tracker = getattr(predictor, "model", None)
+    decoder = getattr(tracker, "sam_mask_decoder", None)
+    out = {
+        "predictor.model (tracker)": describe(tracker),
+        "tracker.sam_prompt_encoder": describe(getattr(tracker, "sam_prompt_encoder", None)),
+        "tracker.sam_mask_decoder": describe(decoder),
+        "predictor.device (reported)": str(getattr(predictor, "device", "<none>")),
+    }
+    for name in ("conv_s0", "conv_s1"):
+        conv = getattr(decoder, name, None)
+        w = getattr(conv, "weight", None)
+        out[f"sam_mask_decoder.{name}.weight"] = (
+            f"{w.device} {w.dtype}" if w is not None else "<none>")
+    if image_model is not None:
+        out["image_model"] = describe(image_model)
+        out["image_model.backbone"] = describe(getattr(image_model, "backbone", None))
+        vb = getattr(getattr(image_model, "backbone", None), "vision_backbone", None)
+        out["backbone.vision_backbone"] = describe(vb)
+        # a single stray CPU submodule is what we are hunting
+        if isinstance(image_model, torch.nn.Module):
+            strays = sorted({
+                n.rsplit(".", 1)[0] or "<root>"
+                for n, p in image_model.named_parameters()
+                if p.device.type == "cpu"
+            })
+            out["submodules still on CPU"] = (
+                ", ".join(strays[:8]) + (f" (+{len(strays) - 8} more)" if len(strays) > 8 else "")
+                if strays else "none")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -535,7 +588,17 @@ def install_shared_backbone_set_image(predictor, image_model, device=None) -> No
         batch = transform(img).unsqueeze(0)
 
         with torch.no_grad():          # NOT inference_mode -- see docstring
-            backbone_out = image_model.backbone.forward_image(batch)
+            try:
+                backbone_out = image_model.backbone.forward_image(batch)
+            except RuntimeError as e:
+                # A device/dtype mismatch in here looks identical to one in
+                # the tracker: the traceback names only torch internals.
+                raise RuntimeError(
+                    f"SAM3: the SHARED BACKBONE failed on a {batch.dtype} "
+                    f"{batch.device} input -- {e}\nModule placement:\n  "
+                    + "\n  ".join(f"{k:32s} {v}" for k, v in
+                                  describe_devices(predictor, image_model).items())
+                ) from e
             if "sam2_backbone_out" not in backbone_out:
                 raise NotImplementedError(
                     "SAM3's shared backbone returned no 'sam2_backbone_out' "
@@ -547,8 +610,17 @@ def install_shared_backbone_set_image(predictor, image_model, device=None) -> No
             sam2_out = _cast_tree(dict(backbone_out["sam2_backbone_out"]),
                                   device=ref.device, dtype=ref.dtype)
             fpn = list(sam2_out["backbone_fpn"])
-            fpn[0] = tracker.sam_mask_decoder.conv_s0(fpn[0])
-            fpn[1] = tracker.sam_mask_decoder.conv_s1(fpn[1])
+            try:
+                fpn[0] = tracker.sam_mask_decoder.conv_s0(fpn[0])
+                fpn[1] = tracker.sam_mask_decoder.conv_s1(fpn[1])
+            except RuntimeError as e:
+                raise RuntimeError(
+                    f"SAM3: the TRACKER's conv_s0/conv_s1 failed on "
+                    f"{fpn[0].dtype} {fpn[0].device} features -- {e}\n"
+                    "Module placement:\n  "
+                    + "\n  ".join(f"{k:32s} {v}" for k, v in
+                                  describe_devices(predictor, image_model).items())
+                ) from e
             sam2_out["backbone_fpn"] = fpn
 
             _, vision_feats, _, _ = tracker._prepare_backbone_features(sam2_out)
