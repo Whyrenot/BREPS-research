@@ -102,6 +102,9 @@ def show_signature(label: str, obj) -> None:
 
 def show_source(label: str, obj, max_lines: int = 90) -> None:
     """Print the real source -- the whole point of this probe."""
+    if obj is None:
+        print(f"\n--- source: {label} --- (absent)")
+        return
     sub(f"source: {label}")
     ok, src = safe(f"getsource({label})", lambda: inspect.getsource(obj))
     if not ok:
@@ -398,6 +401,88 @@ def dump_module_tree(model, max_depth: int = 2) -> None:
         show_source(f"{name}.forward", type(child).forward, max_lines=110)
         if hasattr(child, "get_dense_pe"):
             show_signature(f"{name}.get_dense_pe", type(child).get_dense_pe)
+
+
+def deep_dive_interactive(model, predictor) -> None:
+    """Q2b -- how SAM3 wires its interactive predictor to the vision backbone.
+
+    Raised by the first real run: the predictor IS attached to the model, but
+    `predictor.model` is None, so its set_image() dies on
+    `self.model.forward_image(...)`. SAM3 evidently shares ONE vision backbone
+    across the concept path and the box path -- Sam3Processor.set_image()
+    computes `backbone_out = self.model.backbone.forward_image(image)` and
+    then reaches into `inst_interactive_predictor.model.sam_mask_decoder`, so
+    the features are meant to be injected, not recomputed.
+
+    This dumps everything needed to decide how to drive that: the predictor's
+    __init__, the FULL builder (its tail was truncated before and is what
+    actually wires inst_predictor), the image model's own structure, and
+    Sam3Processor's inference path.
+    """
+    section("Q2b  how the interactive predictor gets its image features")
+
+    inner = getattr(predictor, "model", "<no attribute>")
+    print(f"  predictor.model = {type(inner).__name__ if inner is not None else 'None'}")
+    if inner is None:
+        print("  -> THIS is why set_image() fails: SAM3InteractiveImagePredictor."
+              "set_image()\n"
+              "     calls self.model.forward_image(), and self.model is None. The "
+              "predictor\n"
+              "     cannot encode an image by itself; the features have to come "
+              "from the\n"
+              "     shared backbone. Read the builder tail + Sam3Processor below "
+              "to see how.")
+
+    sub("predictor's own state")
+    for attr in ("_bb_feat_sizes", "mask_threshold", "device", "_is_image_set",
+                 "_orig_hw", "_features"):
+        if hasattr(predictor, attr):
+            val = getattr(predictor, attr)
+            print(f"  {attr:20s} = {str(val)[:100] if not hasattr(val, 'shape') else val.shape}")
+
+    show_source("SAM3InteractiveImagePredictor.__init__", type(predictor).__init__)
+    show_source("SAM3InteractiveImagePredictor._predict",
+                getattr(type(predictor), "_predict", None), max_lines=120)
+    show_source("SAM3InteractiveImagePredictor._prep_prompts",
+                getattr(type(predictor), "_prep_prompts", None), max_lines=60)
+
+    # The tail of this is what actually attaches inst_predictor -- it was cut
+    # off at 60 lines in the Q1 dump, and it is the missing piece.
+    sub("the FULL builder (its tail wires inst_predictor and loads the checkpoint)")
+    try:
+        from sam3.model_builder import build_sam3_image_model
+        show_source("build_sam3_image_model", build_sam3_image_model, max_lines=400)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [FAIL] {type(e).__name__}: {e}")
+
+    sub("the image model that owns the shared backbone")
+    print(f"  type(model) = {type(model).__module__}.{type(model).__name__}")
+    for name, child in model.named_children():
+        print(f"    {name:34s} {type(child).__name__}")
+    for attr in ("backbone", "inst_interactive_predictor"):
+        got = getattr(model, attr, None)
+        print(f"  model.{attr} = {type(got).__name__ if got is not None else None}")
+    if getattr(model, "backbone", None) is not None:
+        show_signature("  model.backbone.forward_image",
+                       type(model.backbone).forward_image)
+    show_source(f"{type(model).__name__}.__init__", type(model).__init__, max_lines=120)
+
+    sub("Sam3Processor: the supported way to run this model")
+    try:
+        from sam3.model.sam3_image_processor import Sam3Processor
+        show_signature("Sam3Processor.__init__", Sam3Processor.__init__)
+        show_source("Sam3Processor.__init__", Sam3Processor.__init__, max_lines=60)
+        for meth in sorted(m for m in dir(Sam3Processor) if not m.startswith("__")):
+            fn = getattr(Sam3Processor, meth, None)
+            if callable(fn) and meth not in ("set_image",):
+                show_signature(f"  .{meth}", fn)
+        for meth in ("predict", "inference", "set_boxes", "set_visual_prompt",
+                     "set_geometry_prompt", "predict_boxes"):
+            fn = getattr(Sam3Processor, meth, None)
+            if fn is not None:
+                show_source(f"Sam3Processor.{meth}", fn, max_lines=90)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [FAIL] {type(e).__name__}: {e}")
 
 
 def check_sam2_surface(model, predictor=None) -> None:
@@ -777,6 +862,8 @@ def main():
         else:
             predictor = _instantiate_predictor(model, args.predictor_class)
         check_sam2_surface(model, predictor)
+        if predictor is not None:
+            deep_dive_interactive(model, predictor)
         live_smoke(model, predictor, args.image, device)
     finally:
         sys.stdout = real_stdout
