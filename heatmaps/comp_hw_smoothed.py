@@ -396,7 +396,17 @@ def load_samhq_model(
     device: torch.device,
     model_type: str = "vit_b",
 ):
-    from segment_anything_hq import SamPredictor, sam_model_registry
+    """SysCV/sam-hq (the original, SAM1-based fork -- NOT the sam-hq2
+    subproject). Its package is ALSO literally named ``segment_anything``,
+    the same import name as the official facebookresearch/segment-anything
+    package this repo's base env already depends on for --model_name SAM --
+    the two cannot coexist on one interpreter's sys.path, so this only works
+    when actually running inside the ``sam_hq`` conda env created by
+    scripts/setup_repo.sh. Callers should route through
+    heatmaps.env_dispatch.maybe_dispatch_to_env("SAM-HQ", ...) first (all
+    scripts in this repo that accept --model_name already do).
+    """
+    from segment_anything import SamPredictor, sam_model_registry
 
     sam = sam_model_registry[model_type](checkpoint=checkpoint)
     sam.to(device)

@@ -2,13 +2,19 @@
 # setup_repo.sh
 # =============
 # Full setup of BREPS on a fresh GPU box: the base environment (SAM1 /
-# SAM2.1 / SAM-HQ / MobileSAM / ... -- torch 1.13.1, pydiffvg from source,
-# per INSTALL_FIXES.md) plus two extra conda envs for backends that CANNOT
+# SAM2.1 / MobileSAM / ... -- torch 1.13.1, pydiffvg from source,
+# per INSTALL_FIXES.md) plus extra conda envs for backends that CANNOT
 # share the base env:
 #
 #   base    torch==1.13.1 (pinned -- newer torch trips "CUDA driver is too
 #           old" on these boxes, see INSTALL_FIXES.md). Everything this repo
-#           already supports lives here.
+#           already supports lives here EXCEPT SAM-HQ/SAM-HQ2 (see below).
+#   sam_hq  SysCV/sam-hq (the ORIGINAL, SAM1-based fork -- not sam-hq2). Its
+#           package is ALSO literally named `segment_anything`, the same
+#           import name as the official facebookresearch/segment-anything
+#           package `base` already depends on for --model_name SAM --
+#           installing one uninstalls/shadows the other. Same torch pin as
+#           `base` (it's SAM1-based, no newer-torch requirement of its own).
 #   sam_hq2 SysCV/sam-hq (sam-hq2 subproject). Its package is ALSO literally
 #           named `sam2`, colliding with the official facebookresearch/sam2
 #           package installed in `base` for SAM2.1 -- needs torch>=2.3.1.
@@ -20,13 +26,13 @@
 #           SAM3's model exposes a prompt_encoder/mask_decoder pair usable
 #           for autograd through the box prompt).
 #
-# scripts/*.py that accept --model_name auto-detect SAM-HQ2/SAM3 and
+# scripts/*.py that accept --model_name auto-detect SAM-HQ/SAM-HQ2/SAM3 and
 # re-exec themselves into the right env via `conda run` (see
 # heatmaps/env_dispatch.py) -- you do not need to activate envs by hand,
 # just make sure this script has created them.
 #
 # Usage:
-#   ./scripts/setup_repo.sh                    # all three envs
+#   ./scripts/setup_repo.sh                    # all envs
 #   ./scripts/setup_repo.sh --envs base         # only the base env
 #   ./scripts/setup_repo.sh --envs base,sam_hq2 # base + SAM-HQ2
 #   ./scripts/setup_repo.sh --vendor-dir ../vendor --cuda-tag cu121
@@ -35,6 +41,12 @@
 #       (only needed by scripts/evaluate_boxes_model_sam*.py; everything
 #        under heatmaps/ and scripts/refine_box_iou_grad.py etc. works
 #        without it)
+#
+# IMPORTANT: never `pip install` SysCV/sam-hq's repo ROOT (or sam-hq2's
+# subfolder) into an env that also needs the official SAM/SAM2.1 packages --
+# it silently uninstalls/replaces them (same package name). If that already
+# happened, restore with:
+#   pip install --force-reinstall "segment-anything==1.0"   # for SAM-HQ's root
 #
 # Idempotent: re-running skips a conda env that already exists (use
 # --recreate to force-recreate) and steps that already succeeded (pydiffvg
@@ -48,16 +60,19 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENDOR_DIR="$(cd "$REPO_ROOT/.." && pwd)"   # sibling dir, matches ../MODEL_CHECKPOINTS convention
 
-ENVS="base,sam_hq2,sam3"
+ENVS="base,sam_hq,sam_hq2,sam3"
 BASE_ENV_NAME="breps"
+HQ_ENV_NAME="sam_hq"
 HQ2_ENV_NAME="sam_hq2"
 SAM3_ENV_NAME="sam3"
 
 BASE_PY="3.10"
+HQ_PY="3.10"
 HQ2_PY="3.10"
 SAM3_PY="3.12"
 
 BASE_CUDA_TAG="cu117"          # torch 1.13.1 wheel index
+HQ_CUDA_TAG="cu117"            # same pin as base -- sam_hq is SAM1-based
 HQ2_CUDA_TAG="cu121"           # torch>=2.3.1 wheel index
 SAM3_CUDA_TAG="cu128"          # matches facebookresearch/sam3 README
 
@@ -74,9 +89,10 @@ while [[ $# -gt 0 ]]; do
         --envs) ENVS="$2"; shift 2 ;;
         --vendor-dir) VENDOR_DIR="$2"; shift 2 ;;
         --base-env-name) BASE_ENV_NAME="$2"; shift 2 ;;
+        --hq-env-name) HQ_ENV_NAME="$2"; shift 2 ;;
         --hq2-env-name) HQ2_ENV_NAME="$2"; shift 2 ;;
         --sam3-env-name) SAM3_ENV_NAME="$2"; shift 2 ;;
-        --cuda-tag) BASE_CUDA_TAG="$2"; HQ2_CUDA_TAG="$2"; SAM3_CUDA_TAG="$2"; shift 2 ;;
+        --cuda-tag) BASE_CUDA_TAG="$2"; HQ_CUDA_TAG="$2"; HQ2_CUDA_TAG="$2"; SAM3_CUDA_TAG="$2"; shift 2 ;;
         --recreate) RECREATE=1; shift ;;
         --skip-diffvg) SKIP_DIFFVG=1; shift ;;
         -h|--help) usage ;;
@@ -188,6 +204,46 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# sam_hq env: SysCV/sam-hq (the ORIGINAL, SAM1-based fork -- repo root, not
+# the sam-hq2 subfolder). Its package is named `segment_anything`, so it
+# must NOT share an env with the base SAM1 install. Same torch pin as base
+# (this fork has no newer-torch requirement of its own).
+# ---------------------------------------------------------------------------
+setup_samhq_env() {
+    log "=== SAM-HQ env '$HQ_ENV_NAME' (torch 1.13.1, isolated from base's segment_anything) ==="
+
+    if maybe_recreate "$HQ_ENV_NAME"; then
+        log "conda env '$HQ_ENV_NAME' already exists, reusing (use --recreate to rebuild)"
+    else
+        conda create -n "$HQ_ENV_NAME" "python=$HQ_PY" -y
+    fi
+
+    conda run -n "$HQ_ENV_NAME" pip install torch==1.13.1 torchvision torchaudio \
+        --index-url "https://download.pytorch.org/whl/${HQ_CUDA_TAG}"
+
+    local samhq_dir="$VENDOR_DIR/sam-hq"
+    if [[ ! -d "$samhq_dir" ]]; then
+        log "Cloning SysCV/sam-hq -> $samhq_dir"
+        git clone https://github.com/SysCV/sam-hq.git "$samhq_dir"
+    else
+        log "sam-hq already present at $samhq_dir, skipping clone"
+    fi
+    # repo ROOT (not sam-hq2/) -- this is the package that shadows segment_anything
+    (cd "$samhq_dir" && conda run -n "$HQ_ENV_NAME" pip install -e .)
+
+    # Minimal runtime deps for heatmaps/*.py + scripts/*.py (NOT the full
+    # isegm package -- deliberately no `pip install -e .` on this repo here,
+    # that would try to pull the OFFICIAL segment-anything back in and
+    # re-shadow this env's segment_anything with itself).
+    conda run -n "$HQ_ENV_NAME" pip install \
+        numpy pandas "opencv-python-headless>=4.8.1.78" "matplotlib>=3.10.7" \
+        scipy loguru tqdm pyyaml
+
+    log "sam_hq env ready. Smoke-test once you have a checkpoint:"
+    log "  conda run -n $HQ_ENV_NAME python -c \"from segment_anything import sam_model_registry; print('segment_anything (HQ) import OK')\""
+}
+
+# ---------------------------------------------------------------------------
 # sam_hq2 env: SysCV/sam-hq (sam-hq2 subproject), torch>=2.3.1.
 # Its package is named `sam2`, so it must NOT share an env with the base
 # SAM2.1 install. Also needs this repo's `heatmaps`/`scripts` runtime deps
@@ -267,13 +323,15 @@ IFS=',' read -ra WANTED <<< "$ENVS"
 for env_key in "${WANTED[@]}"; do
     case "$env_key" in
         base)    setup_base_env ;;
+        sam_hq)  setup_samhq_env ;;
         sam_hq2) setup_samhq2_env ;;
         sam3)    setup_sam3_env ;;
-        *) echo "Unknown --envs entry: $env_key (expected base,sam_hq2,sam3)" >&2; exit 1 ;;
+        *) echo "Unknown --envs entry: $env_key (expected base,sam_hq,sam_hq2,sam3)" >&2; exit 1 ;;
     esac
 done
 
 log "Done. Envs created: $ENVS"
 log "Run e.g.:"
 log "  conda run -n $BASE_ENV_NAME python scripts/refine_box_iou_grad.py --model_name SAM ..."
+log "  conda run -n $BASE_ENV_NAME python scripts/refine_box_iou_grad.py --model_name SAM-HQ ...    # auto re-execs into '$HQ_ENV_NAME'"
 log "  conda run -n $BASE_ENV_NAME python scripts/refine_box_iou_grad.py --model_name SAM-HQ2 ...   # auto re-execs into '$HQ2_ENV_NAME'"

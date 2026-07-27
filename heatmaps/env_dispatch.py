@@ -4,6 +4,11 @@ env_dispatch.py
 Some model backends cannot live in the same Python environment as the rest
 of the repo:
 
+    * SAM-HQ (SysCV/sam-hq, the original SAM1-based fork) installs a
+      top-level package literally named ``segment_anything`` -- the same
+      import name as the official facebookresearch/segment-anything package
+      this repo already depends on for --model_name SAM. Installing one
+      uninstalls/shadows the other; they cannot coexist in one interpreter.
     * SAM-HQ2 (SysCV/sam-hq/sam-hq2) installs a top-level package literally
       named ``sam2`` -- the same import name as the official SAM2.1 package
       (facebookresearch/sam2) this repo already depends on. Two different
@@ -32,8 +37,9 @@ import subprocess
 import sys
 
 # model_name -> conda env name created by scripts/setup_repo.sh.
-# Models not listed here (SAM, SAM2.1, SAM-HQ, ...) run in the current env.
+# Models not listed here (SAM, SAM2.1, ...) run in the current env.
 MODEL_ENV: dict[str, str] = {
+    "SAM-HQ": "sam_hq",
     "SAM-HQ2": "sam_hq2",
     "SAM3": "sam3",
 }
