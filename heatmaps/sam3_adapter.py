@@ -357,12 +357,18 @@ def get_interactive_predictor(model):
     return None
 
 
-def adopt_native_predictor(predictor):
+def adopt_native_predictor(predictor, image_model=None, device=None):
     """Make SAM3's own predictor satisfy this repo's contract, in place.
 
     Only fills gaps -- it never overrides anything SAM3 already provides.
     Raises (rather than papering over) when something load-bearing is
     missing, naming the probe section that shows the truth.
+
+    image_model: the Sam3Image the predictor hangs off. Required in practice,
+        because SAM3 builds the tracker WITHOUT its own vision backbone and
+        the predictor therefore cannot encode an image by itself -- see
+        install_shared_backbone_set_image. Omit it only when the tracker was
+        built with with_backbone=True.
     """
     problems: list[str] = []
 
@@ -420,7 +426,105 @@ def adopt_native_predictor(predictor):
             "heatmaps.sam3_adapter.SAM3ImagePredictor, which synthesises the "
             "missing pieces."
         )
+
+    if image_model is not None and _tracker_lacks_backbone(predictor.model):
+        install_shared_backbone_set_image(predictor, image_model, device)
     return predictor
+
+
+# ---------------------------------------------------------------------------
+# the shared vision backbone
+# ---------------------------------------------------------------------------
+
+def _tracker_lacks_backbone(tracker) -> bool:
+    """build_sam3_image_model creates the interactive predictor with
+        build_tracker(apply_temporal_disambiguation=False)
+    i.e. with_backbone=False (the default) -- SAM3 runs ONE vision backbone
+    and shares it. So the tracker has no image encoder of its own and
+    SAM3InteractiveImagePredictor.set_image(), which calls
+    self.model.forward_image(), dies with
+        AttributeError: 'NoneType' object has no attribute 'forward_image'
+    """
+    for attr in ("image_encoder", "vision_backbone", "backbone", "trunk"):
+        if getattr(tracker, attr, None) is not None:
+            return False
+    return True
+
+
+def _sam3_transform(image_model, resolution: int, device):
+    """SAM3's own preprocessing, borrowed rather than re-derived.
+
+    Sam3Processor normalises with mean=std=0.5 -- NOT the ImageNet statistics
+    SAM1/SAM2 use. Since the image goes through SAM3's SHARED backbone, its
+    normalisation is the one that matters, and getting it wrong degrades masks
+    quietly instead of raising.
+    """
+    from sam3.model.sam3_image_processor import Sam3Processor
+
+    processor = Sam3Processor(image_model, resolution=resolution, device=str(device))
+    return processor.transform
+
+
+def install_shared_backbone_set_image(predictor, image_model, device=None) -> None:
+    """Give SAM3's interactive predictor a working set_image().
+
+    Replicates SAM3InteractiveImagePredictor.set_image() exactly, except that
+    the backbone output comes from the SHARED vision backbone
+    (Sam3Image.backbone) instead of the tracker's absent one -- which is what
+    Sam3Processor.set_image() does, including running fpn levels 0 and 1
+    through the mask decoder's conv_s0 / conv_s1.
+
+    Deliberately NOT calling Sam3Processor.set_image() itself: it is decorated
+    @torch.inference_mode(), and inference tensors cannot be used in an
+    autograd graph -- refine_box_by_iou_grad feeds the cached image embedding
+    straight into the mask decoder and backpropagates to the box, so that
+    would fail with "Inference tensors cannot be saved for backward". The
+    predictor's own set_image() uses @torch.no_grad() for the same reason.
+    """
+    tracker = predictor.model
+    resolution = int(predictor._transforms.resolution)
+    device = device or next(tracker.parameters()).device
+    transform = _sam3_transform(image_model, resolution, device)
+
+    def set_image(image_rgb: np.ndarray) -> None:
+        from torchvision.transforms import v2
+
+        h, w = image_rgb.shape[:2]
+        img = v2.functional.to_image(image_rgb).to(device)
+        batch = transform(img).unsqueeze(0)
+
+        with torch.no_grad():          # NOT inference_mode -- see docstring
+            backbone_out = image_model.backbone.forward_image(batch)
+            if "sam2_backbone_out" not in backbone_out:
+                raise NotImplementedError(
+                    "SAM3's shared backbone returned no 'sam2_backbone_out' "
+                    f"(keys: {sorted(backbone_out)}). That key is what feeds "
+                    "the interactive/box path; the model was probably built "
+                    "with enable_inst_interactivity=False, which also changes "
+                    "_create_vision_backbone. See probe section Q2b."
+                )
+            sam2_out = dict(backbone_out["sam2_backbone_out"])
+            fpn = list(sam2_out["backbone_fpn"])
+            fpn[0] = tracker.sam_mask_decoder.conv_s0(fpn[0])
+            fpn[1] = tracker.sam_mask_decoder.conv_s1(fpn[1])
+            sam2_out["backbone_fpn"] = fpn
+
+            _, vision_feats, _, _ = tracker._prepare_backbone_features(sam2_out)
+            vision_feats[-1] = vision_feats[-1] + tracker.no_mem_embed
+            feats = [
+                feat.permute(1, 2, 0).view(1, -1, *feat_size)
+                for feat, feat_size in zip(vision_feats[::-1],
+                                           predictor._bb_feat_sizes[::-1])
+            ][::-1]
+
+        predictor._features = {"image_embed": feats[-1], "high_res_feats": feats[:-1]}
+        predictor._orig_hw = [(h, w)]
+        predictor._is_image_set = True
+        predictor._is_batch = False
+
+    # Plain attribute on an nn.Module: not a Parameter/Module/Tensor, so it
+    # lands in __dict__ and shadows the class method.
+    predictor.set_image = set_image
 
 
 # ---------------------------------------------------------------------------

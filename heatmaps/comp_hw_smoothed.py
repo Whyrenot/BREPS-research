@@ -540,7 +540,7 @@ def load_sam3_model(
     predictor = get_interactive_predictor(model)
     if predictor is not None:
         logger.info(f"SAM3: using its own {type(predictor).__name__}")
-        return adopt_native_predictor(predictor)
+        return adopt_native_predictor(predictor, image_model=model, device=device)
 
     # Fallback: SAM3 stopped shipping the interactive predictor, or renamed
     # where it hangs off the model. Synthesise the surface instead (this path

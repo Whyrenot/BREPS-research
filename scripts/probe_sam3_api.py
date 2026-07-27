@@ -83,13 +83,19 @@ def sub(title: str) -> None:
     print(f"\n--- {title} ---")
 
 
-def safe(label: str, fn, *, limit_tb: int = 3):
-    """Run fn(), print+swallow any exception. Returns (ok, value)."""
+def safe(label: str, fn, *, limit_tb: int = 4):
+    """Run fn(), print+swallow any exception. Returns (ok, value).
+
+    Negative limit = keep the INNERMOST frames. A positive limit keeps the
+    outermost ones, which for a failure deep inside a library shows only the
+    call wrappers -- exactly what hid `self.image_encoder is None` behind
+    torch's @no_grad decorator frame on the first real SAM3 run.
+    """
     try:
         return True, fn()
     except Exception as e:  # noqa: BLE001 -- a probe must survive everything
         print(f"  [FAIL] {label}: {type(e).__name__}: {e}")
-        for line in traceback.format_exc(limit=limit_tb).splitlines()[-limit_tb - 1:]:
+        for line in traceback.format_exc(limit=-limit_tb).splitlines():
             print(f"         {line}")
         return False, None
 
@@ -864,6 +870,21 @@ def main():
         check_sam2_surface(model, predictor)
         if predictor is not None:
             deep_dive_interactive(model, predictor)
+            # Adopt exactly as load_sam3_model does, so the smoke test below
+            # exercises the real path (this is also what installs a working
+            # set_image over the shared backbone).
+            section("Q2c  adopt_native_predictor (what load_sam3_model returns)")
+            ok, adopted = safe(
+                "adopt_native_predictor(predictor, image_model=model)",
+                lambda: __import__("heatmaps.sam3_adapter", fromlist=["x"])
+                .adopt_native_predictor(predictor, image_model=model, device=device))
+            if ok and adopted is not None:
+                predictor = adopted
+                patched = "set_image" in vars(predictor)
+                print(f"  [OK] adopted; set_image patched onto the instance: {patched}")
+                if patched:
+                    print("       (the tracker has no vision backbone of its own, "
+                          "so features\n        come from Sam3Image.backbone -- see Q2b)")
         live_smoke(model, predictor, args.image, device)
     finally:
         sys.stdout = real_stdout
