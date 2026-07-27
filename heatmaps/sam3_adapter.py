@@ -313,6 +313,40 @@ def build_sam3_model(checkpoint: str | None = None, device="cuda",
         ) from e
 
 
+def build_sam3_interactive_untrained(device="cuda", with_backbone: bool = True):
+    """SAM3's interactive predictor with RANDOM weights -- no checkpoint, no
+    Hugging Face, no text encoder, no BPE.
+
+    build_sam3_image_model() assembles the whole concept model (text encoder,
+    VL backbone, DETR transformer) and downloads the gated checkpoint. But
+    the box-prompt path this repo uses is just
+        SAM3InteractiveImagePredictor(build_tracker(...))
+    -- exactly what that builder does under enable_inst_interactivity -- and
+    build_tracker() constructs the architecture without any weights.
+
+    That is enough to settle the questions that decide whether the gradient
+    defence is portable at all, because they are properties of the
+    ARCHITECTURE, not of the weights:
+      * does the predictor expose this repo's contract?
+      * does autograd reach the box coordinates from the predicted IoU?
+    It is NOT enough for a single reported number: predicted IoU from random
+    weights is noise. Never let a run built this way reach results/.
+    """
+    from sam3.model.sam1_task_predictor import SAM3InteractiveImagePredictor
+    from sam3.model_builder import build_tracker
+
+    # with_backbone=True: the image model normally shares its vision backbone
+    # with the tracker, and set_image() calls model.forward_image(), so a
+    # standalone tracker needs its own.
+    tracker = build_tracker(apply_temporal_disambiguation=False,
+                            with_backbone=with_backbone)
+    tracker.to(device)
+    tracker.eval()
+    for p in tracker.parameters():
+        p.requires_grad_(False)
+    return SAM3InteractiveImagePredictor(tracker)
+
+
 def get_interactive_predictor(model):
     """SAM3's own SAM2-shaped predictor, or None if the model was built
     without enable_inst_interactivity."""

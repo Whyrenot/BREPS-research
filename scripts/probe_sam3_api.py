@@ -229,7 +229,28 @@ def survey_builders(pkg_name: str = "sam3") -> None:
 # Q3: the built model's module tree
 # ---------------------------------------------------------------------------
 
-def build_model(builder_path: str | None, checkpoint: str | None, device: str):
+def _build_untrained(device: str):
+    """Architecture-only fallback: SAM3's interactive predictor with random
+    weights. Returns (model, predictor) or (None, None)."""
+    sub("building the interactive predictor WITHOUT weights (build_tracker)")
+    try:
+        from heatmaps.sam3_adapter import build_sam3_interactive_untrained
+        pred = build_sam3_interactive_untrained(device=device)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [FAIL] {type(e).__name__}: {e}")
+        for line in traceback.format_exc(limit=4).splitlines()[-6:]:
+            print(f"         {line}")
+        return None, None
+    print(f"  [OK] {type(pred).__module__}.{type(pred).__name__} "
+          f"over {type(pred.model).__name__}")
+    print("  !! RANDOM WEIGHTS. Q3 (contract) and Q4 (autograd) are properties\n"
+          "     of the architecture and stay valid; every NUMBER below is noise.\n"
+          "     Nothing built this way may reach results/.")
+    return pred.model, pred
+
+
+def build_model(builder_path: str | None, checkpoint: str | None, device: str,
+                untrained: bool = False):
     """Build SAM3's image model.
 
     Primary path goes through heatmaps.sam3_adapter.build_sam3_model, which
@@ -238,9 +259,16 @@ def build_model(builder_path: str | None, checkpoint: str | None, device: str):
     sam3 0.1.4's broken default) -- so probing exercises the same call
     load_sam3_model makes, rather than a lookalike that could diverge.
     Falls back to raw signature-adaptive calls if that import fails.
+
+    Returns (model, native_predictor_or_None) -- the untrained path builds the
+    predictor directly, so it has no image model to re-derive one from.
     """
     section("Q1  build the image model")
     import torch  # noqa: F401 -- confirms torch is importable in this env
+
+    if untrained:
+        print("  --untrained requested: skipping the checkpoint entirely.")
+        return _build_untrained(device)
 
     if builder_path is None:
         sub("via heatmaps.sam3_adapter.build_sam3_model (what load_sam3_model uses)")
@@ -251,7 +279,7 @@ def build_model(builder_path: str | None, checkpoint: str | None, device: str):
                                      enable_inst_interactivity=True)
             if model is not None:
                 print(f"  [OK] built: {type(model).__name__}")
-                return model
+                return model, None
         except Exception as e:  # noqa: BLE001
             print(f"  [FAIL] {type(e).__name__}: {e}")
             for line in traceback.format_exc(limit=4).splitlines()[-6:]:
@@ -262,11 +290,11 @@ def build_model(builder_path: str | None, checkpoint: str | None, device: str):
             except Exception:  # noqa: BLE001
                 gated = False
             if gated:
-                # Every other spelling downloads from the same gated repo and
-                # fails identically; repeating it only buries the real cause.
-                print("  -> BLOCKED on Hugging Face access, not on the API. "
-                      "Nothing below would tell you more; stopping here.")
-                return None
+                # Every other builder spelling downloads from the same gated
+                # repo and fails identically. The architecture-only path does
+                # not need weights at all, and Q3/Q4 do not depend on them.
+                print("  -> BLOCKED on Hugging Face access, not on the API.")
+                return _build_untrained(device)
             print("  -> falling back to raw builder calls below")
 
     candidates = [builder_path] if builder_path else [
@@ -318,9 +346,10 @@ def build_model(builder_path: str | None, checkpoint: str | None, device: str):
             ok, model = safe(label, lambda: fn(pos, **kwargs) if pos else fn(**kwargs))
             if ok and model is not None:
                 print(f"  [OK] built via {label}")
-                return model
-    print("  -> could not build a model; Q3/Q4 below will be skipped.")
-    return None
+                return model, None
+    print("  -> no builder worked; trying the architecture-only path so Q3/Q4\n"
+          "     are still answered.")
+    return _build_untrained(device)
 
 
 def dump_module_tree(model, max_depth: int = 2) -> None:
@@ -629,6 +658,13 @@ def parse_args():
     p.add_argument("--image", default=None,
                    help="image for the live smoke test (default: synthetic)")
     p.add_argument("--gpu", type=int, default=0)
+    p.add_argument("--untrained", action="store_true", default=False,
+                   help="build the interactive predictor with RANDOM weights "
+                        "via build_tracker(), skipping the checkpoint, Hugging "
+                        "Face and the text encoder entirely. Q3 (contract) and "
+                        "Q4 (autograd) are properties of the architecture, so "
+                        "they are still answered; no number is meaningful. "
+                        "Used automatically when the gated repo refuses.")
     p.add_argument("--out", default="results/sam3_api_probe.txt")
     p.add_argument("--no_dispatch", action="store_true",
                    help="do not re-exec into the `sam3` conda env (use when "
@@ -725,14 +761,21 @@ def main():
         survey_package("sam3")
         survey_builders("sam3")
 
-        model = build_model(args.builder, args.checkpoint_path, device)
+        model, native = build_model(args.builder, args.checkpoint_path, device,
+                                    untrained=args.untrained)
         if model is None:
             print("\n[probe] stopping after the static survey (no model built).")
             return
 
         safe("model.eval()", lambda: model.eval())
         dump_module_tree(model)
-        predictor = _instantiate_predictor(model, args.predictor_class)
+        if native is not None:
+            section("Q2  instantiate the predictor / processor")
+            print(f"  using the predictor built alongside the model: "
+                  f"{type(native).__module__}.{type(native).__name__}")
+            predictor = native
+        else:
+            predictor = _instantiate_predictor(model, args.predictor_class)
         check_sam2_surface(model, predictor)
         live_smoke(model, predictor, args.image, device)
     finally:
