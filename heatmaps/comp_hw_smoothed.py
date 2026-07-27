@@ -492,34 +492,130 @@ def load_samhq2_model(
     return predictor
 
 
+SAM3_BUILDERS = (
+    "sam3.model_builder.build_sam3_image_model",
+    "sam3.build_sam3.build_sam3_image_model",
+    "sam3.build_sam.build_sam3_image_model",
+)
+
+# SAM3's own predictor/processor, if importable: its set_image() does the
+# image encoding (SAM3's preprocessing is not re-derived by hand) while
+# SAM3ImagePredictor supplies the box-prompt surface the repo calls.
+SAM3_NATIVE_PREDICTORS = (
+    "sam3.processor.Sam3Processor",
+    "sam3.sam3_image_predictor.SAM3ImagePredictor",
+    "sam3.model_builder.Sam3Processor",
+)
+
+
+def _import_attr(path: str):
+    """'pkg.mod.attr' -> the attribute, or None if anything is missing."""
+    import importlib
+
+    mod_name, _, attr = path.rpartition(".")
+    try:
+        return getattr(importlib.import_module(mod_name), attr)
+    except Exception:  # noqa: BLE001 -- probing optional spellings
+        return None
+
+
+def _build_sam3_raw(checkpoint: str, device: torch.device):
+    """Call SAM3's image-model builder, adapting to its actual signature.
+
+    SAM3 is young and its builder spelling is not pinned by this repo; try
+    the known module paths, and for each try the checkpoint kwarg names it
+    might use before falling back to a no-arg call (SAM3 can pull its gated
+    checkpoint from Hugging Face itself, given `huggingface-cli login`).
+    """
+    import inspect
+
+    tried = []
+    for path in SAM3_BUILDERS:
+        fn = _import_attr(path)
+        if fn is None:
+            tried.append(f"{path} (not importable)")
+            continue
+        params = inspect.signature(fn).parameters
+        attempts = []
+        if checkpoint:
+            for key in ("checkpoint_path", "ckpt_path", "checkpoint", "ckpt", "model_path"):
+                if key in params:
+                    attempts.append(({key: checkpoint}, None))
+            if not attempts:
+                attempts.append(({}, checkpoint))
+        attempts.append(({}, None))
+
+        for kwargs, positional in attempts:
+            if "device" in params:
+                kwargs = {**kwargs, "device": device}
+            try:
+                model = fn(positional, **kwargs) if positional else fn(**kwargs)
+            except Exception as e:  # noqa: BLE001
+                tried.append(f"{path}({positional or ''}{', '.join(kwargs)}): "
+                             f"{type(e).__name__}: {e}")
+                continue
+            if model is not None:
+                logger.info(f"SAM3 built via {path}")
+                return model
+
+    raise NotImplementedError(
+        "SAM3: could not build an image model. Attempts:\n  "
+        + "\n  ".join(tried)
+        + "\n\nRun `python scripts/probe_sam3_api.py --checkpoint_path <ckpt>` "
+        "in the `sam3` conda env -- its section 'Q1 builders' prints every "
+        "build_* function the installed sam3 package actually has, with "
+        "signatures. Add the right one to SAM3_BUILDERS above.\n"
+        "If the failure is a gated-checkpoint / 401 error instead, request "
+        "access at https://github.com/facebookresearch/sam3 and run "
+        "`huggingface-cli login` inside the sam3 env."
+    )
+
+
 def load_sam3_model(
     checkpoint: str,
     device: torch.device,
     model_type: str = "vit_b",
 ):
-    """NOT YET WIRED IN.
+    """facebookresearch/sam3, presented as a SAM2ImagePredictor look-alike.
 
-    SAM3 (facebookresearch/sam3) uses a different predictor
-    (``Sam3Processor`` / ``build_sam3_image_model()``), not the
-    SamPredictor/SAM2ImagePredictor box-prompt API the rest of this repo
-    assumes. It is UNCONFIRMED whether SAM3 exposes ``model.prompt_encoder``
-    / ``model.mask_decoder`` the way scripts/refine_box_iou_grad.py's
-    gradient-ascent path (refine_box_by_iou_grad) needs for autograd through
-    the box prompt.
+    SAM3 is a concept-segmentation model (text / exemplar prompts, DETR-style
+    decoder) whose public entry point is a processor, not SamPredictor -- so
+    unlike the other backends it is not reached by adding another branch to
+    every call site, but by wrapping it in heatmaps.sam3_adapter.
+    SAM3ImagePredictor, which exposes the exact surface the existing
+    SAM2.1/SAM-HQ2 code path already speaks. See that module's docstring for
+    the full list, and for which parts are discovered at runtime rather than
+    hardcoded.
 
-    Before wiring this up: in the ``sam3`` conda env (scripts/setup_repo.sh),
-    inspect build_sam3_image_model()'s returned model for a
-    prompt_encoder/mask_decoder pair with the same forward signature as
-    SAM1/SAM2, or adapt the gradient path to Sam3Processor's actual API.
+    Requires the `sam3` conda env (Python>=3.12, torch>=2.7 -- see
+    scripts/setup_repo.sh); callers route there automatically via
+    heatmaps.env_dispatch.maybe_dispatch_to_env("SAM3", ...).
+
+    model_type is accepted for signature compatibility with the other
+    loaders and ignored: SAM3 ships a single image model.
     """
-    raise NotImplementedError(
-        "SAM3 is not wired into load_model() yet -- its predictor API "
-        "(Sam3Processor / build_sam3_image_model) differs from SAM1/SAM2's "
-        "SamPredictor/SAM2ImagePredictor, and it's unconfirmed whether the "
-        "differentiable box->mask_decoder path refine_box_iou_grad.py needs "
-        "exists for SAM3. Verify on the `sam3` conda env first, then "
-        "implement load_sam3_model() here."
-    )
+    from heatmaps.sam3_adapter import SAM3ImagePredictor
+
+    model = _build_sam3_raw(checkpoint, device)
+
+    for _, p in model.named_parameters():
+        p.requires_grad = False
+    model.to(device)
+    model.eval()
+
+    native = None
+    for path in SAM3_NATIVE_PREDICTORS:
+        cls = _import_attr(path)
+        if cls is None:
+            continue
+        try:
+            native = cls(model)
+            logger.info(f"SAM3 native predictor: {path}")
+            break
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"SAM3 native predictor {path} rejected model: {e}")
+
+    return SAM3ImagePredictor(model, native=native, device=device)
 
 
 def load_model(model_name: str, **kwargs):

@@ -19,12 +19,15 @@
 #           named `sam2`, colliding with the official facebookresearch/sam2
 #           package installed in `base` for SAM2.1 -- needs torch>=2.3.1.
 #   sam3    facebookresearch/sam3. Needs Python>=3.12, torch>=2.7 -- hard
-#           incompatible with `base`'s torch 1.13.1 pin. NOTE: SAM3 is only
-#           INSTALLED here, not wired into the gradient-refine pipeline yet
-#           (heatmaps/comp_hw_smoothed.load_sam3_model raises
-#           NotImplementedError until someone confirms, on this env, that
-#           SAM3's model exposes a prompt_encoder/mask_decoder pair usable
-#           for autograd through the box prompt).
+#           incompatible with `base`'s torch 1.13.1 pin. Its checkpoints are
+#           GATED on Hugging Face: request access at
+#           https://github.com/facebookresearch/sam3, then run
+#           `conda run -n sam3 huggingface-cli login` before first use.
+#           SAM3 reaches the pipeline through heatmaps/sam3_adapter.py (it is
+#           presented as a SAM2-style predictor, so no call site changed).
+#           That adapter discovers a few things at runtime; confirm them once
+#           with `python scripts/probe_sam3_api.py --checkpoint_path <ckpt>`
+#           before trusting any SAM3 number.
 #
 # scripts/*.py that accept --model_name auto-detect SAM-HQ/SAM-HQ2/SAM3 and
 # re-exec themselves into the right env via `conda run` (see
@@ -298,15 +301,15 @@ setup_samhq2_env() {
 
 # ---------------------------------------------------------------------------
 # sam3 env: facebookresearch/sam3, Python>=3.12, torch>=2.7.
-# NOT wired into the gradient-refine pipeline yet -- installed for later use
-# once someone verifies SAM3's box-prompt / autograd API on this env (see
-# heatmaps/comp_hw_smoothed.load_sam3_model).
+# Wired into the pipeline via heatmaps/sam3_adapter.py (SAM2-shaped view over
+# SAM3), loaded by heatmaps/comp_hw_smoothed.load_sam3_model.
 # ---------------------------------------------------------------------------
 setup_sam3_env() {
     log "=== SAM3 env '$SAM3_ENV_NAME' (Python $SAM3_PY, torch>=2.7) ==="
-    log "NOTE: install-only. load_sam3_model() in heatmaps/comp_hw_smoothed.py"
-    log "      still raises NotImplementedError -- see that docstring before"
-    log "      trying to run refine_box_iou_grad.py --model_name SAM3."
+    log "NOTE: run scripts/probe_sam3_api.py once after this finishes --"
+    log "      heatmaps/sam3_adapter.py discovers SAM3's prompt encoder /"
+    log "      mask decoder / input resolution at runtime, and the probe is"
+    log "      what confirms it discovered the right ones."
 
     if maybe_recreate "$SAM3_ENV_NAME"; then
         log "conda env '$SAM3_ENV_NAME' already exists, reusing (use --recreate to rebuild)"
@@ -322,12 +325,21 @@ setup_sam3_env() {
     # `huggingface-cli login` in this env before downloading checkpoints.
     conda run -n "$SAM3_ENV_NAME" pip install sam3
 
+    # Deps of the repo code that runs INSIDE this env once env_dispatch
+    # re-execs into it: heatmaps/comp_hw_smoothed.py needs loguru + tqdm +
+    # torchvision.ops, heatmaps/defend_critical_shifts.py imports
+    # ResizeLongestSide from the OFFICIAL segment_anything (never the SysCV
+    # fork -- same package name, see the warning at the top of this file),
+    # and animate_grad_refine.py writes GIFs through matplotlib/Pillow.
     conda run -n "$SAM3_ENV_NAME" pip install \
         numpy pandas "opencv-python-headless>=4.8.1.78" "matplotlib>=3.10.7" \
-        scipy loguru tqdm pyyaml "segment-anything>=1.0"
+        scipy loguru tqdm pyyaml pillow huggingface_hub "segment-anything>=1.0"
 
-    log "sam3 env ready (install-only)."
+    log "sam3 env ready."
     log "  conda run -n $SAM3_ENV_NAME python -c \"from sam3.model_builder import build_sam3_image_model; print('sam3 import OK')\""
+    log "  # checkpoints are gated -- authenticate once, then probe the API:"
+    log "  conda run -n $SAM3_ENV_NAME huggingface-cli login"
+    log "  python scripts/probe_sam3_api.py --checkpoint_path <ckpt> --out results/sam3_api_probe.txt"
 }
 
 # ---------------------------------------------------------------------------

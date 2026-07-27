@@ -123,6 +123,13 @@ def refine_box_by_iou_grad(
         SAM2Transforms -- no letterbox pad like SAM1) -- confirmed directly
         from sam2.sam2_image_predictor.SAM2ImagePredictor._predict and
         sam2.utils.transforms.SAM2Transforms source, not guessed.
+
+    SAM3 needs no branch of its own: heatmaps.sam3_adapter.SAM3ImagePredictor
+    wraps it to expose exactly the surface the is_sam2 branch above uses
+    (no .predict_torch, model.sam_prompt_encoder/.sam_mask_decoder,
+    _features["image_embed"]/["high_res_feats"], _orig_hw, _transforms with
+    the same resize-to-square convention). SAM3's own decoder kwargs are
+    matched by signature there, not hardcoded here.
     """
     model = predictor.model
     is_sam2 = not hasattr(predictor, "predict_torch")
@@ -672,11 +679,12 @@ def parse_args():
     p.add_argument("--checkpoint_path", required=True)
     p.add_argument("--model_name", default="SAM",
                    choices=["SAM", "SAM2.1", "SAM-HQ", "SAM-HQ2", "SAM3"],
-                   help="SAM-HQ2/SAM3 run in a separate conda env (see "
+                   help="SAM-HQ/SAM-HQ2/SAM3 run in a separate conda env (see "
                         "scripts/setup_repo.sh + heatmaps/env_dispatch.py); "
                         "this script re-launches itself there automatically. "
-                        "SAM3 is not yet wired into the gradient path (see "
-                        "heatmaps/comp_hw_smoothed.load_sam3_model).")
+                        "SAM3 goes through heatmaps/sam3_adapter.py, which "
+                        "presents it as a SAM2-style predictor -- verify the "
+                        "backend once with scripts/probe_sam3_api.py.")
     p.add_argument("--model_type", default="vit_b")
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--limit", type=int, default=100, help="0 = all cases")

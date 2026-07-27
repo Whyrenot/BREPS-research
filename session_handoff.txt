@@ -1,0 +1,293 @@
+BREPS — ИТОГИ СЕССИИ / ПЕРЕДАЧА КОНТЕКСТА
+==========================================
+(писано перед тем, как пользователь очищает контекст и переходит к SAM3)
+
+Репозиторий: https://github.com/Whyrenot/BREPS-research (публичный, origin)
+Апстрим (оригинал авторов):     https://github.com/emb-ai/BREPS.git (remote "upstream")
+Ветка: main. Всё, что описано ниже, закоммичено и запушено (working tree чистый).
+
+
+1. СЕРВЕР / ОКРУЖЕНИЯ — РЕАЛЬНЫЕ ПУТИ
+--------------------------------------
+Репозиторий на сервере:     /home/jovyan/shares/SR006.nfs2/pishugin/new/BREPS
+Чекпоинты:                  /home/jovyan/shares/SR006.nfs2/pishugin/temp/rclicks/MODEL_CHECKPOINTS/
+  SAM/sam_vit_b_01ec64.pth, sam_vit_l_0b3195.pth, sam_vit_h_4b8939.pth
+  SAM2.1/sam2.1_hiera_tiny.pt, sam2.1_hiera_base_plus.pt, sam2.1_hiera_large.pt
+  SAM-HQ/sam_hq_vit_l.pth (и др. размеры по аналогии)
+  SAM2-HQ/sam2.1_hq_hiera_large.pt   (это и есть "SAM-HQ2" в терминах --model_name)
+user_study root:            /home/jovyan/shares/SR006.nfs2/pishugin/user_study/FOR_TEST
+  (внутри images/, masks/, user_masks/; --use m = мобильная разметка, --use p = второй тип, --use mp = оба)
+COCO_MVal (critical_shifts): /home/jovyan/shares/SR006.nfs2/pishugin/rclicks/datasets/COCO_MVal/{img,gt}
+Клон SysCV/sam-hq:          /home/jovyan/shares/SR006.nfs2/pishugin/new/sam-hq
+  (корень репо = пакет "SAM-HQ", подпапка sam-hq2/ = пакет "SAM-HQ2")
+Клон facebookresearch/sam2: /home/jovyan/shares/SR006.nfs2/pishugin/segment-anything-2
+  (уже стоял ДО этой сессии, доставили его в pishugin-breps через --no-deps)
+
+Conda-окружения:
+  pishugin-breps   — ОСНОВНОЙ рабочий env. torch 2.1.2+cu118. Уже содержит официальные
+                      segment_anything и sam2 (facebookresearch). Именно из него запускаются
+                      все команды (env_dispatch сам перекидывает в нужный env при необходимости).
+  sam_hq           — НОВЫЙ, создан в этой сессии. torch 2.1.2+cu118 (ВАЖНО: не 1.13.1!).
+                      Пакет SysCV/sam-hq (корень репо), даёт "segment_anything" (HQ-версия).
+  sam_hq2          — env для SAM-HQ2 (sam-hq/sam-hq2 подпапка), даёт пакет "sam2" (HQ-версия).
+  sam3             — НЕ создавался/не тестировался в этой сессии. Это следующая задача.
+  base/breps (дефолт из setup_repo.sh) — НЕ используется, работаем только в pishugin-breps.
+
+scripts/*.py с флагом --model_name САМИ определяют нужный env и перезапускаются туда через
+`conda run` (heatmaps/env_dispatch.py, словарь MODEL_ENV):
+  "SAM-HQ": "sam_hq", "SAM-HQ2": "sam_hq2", "SAM3": "sam3"
+  (SAM, SAM2.1 работают прямо в текущем env, обычно pishugin-breps)
+
+
+2. КРИТИЧНЫЕ ГРАБЛИ — НЕ ПОВТОРЯТЬ
+------------------------------------
+- НИКОГДА не `pip install -e .` из корня SysCV/sam-hq (или его sam-hq2/) в env, где уже стоит
+  официальный segment_anything/sam2 — у них ОДИНАКОВЫЕ имена пакетов, установка тихо
+  удаляет/подменяет официальный. Именно так один раз сломался pishugin-breps (расследовали,
+  восстановили: `pip install --force-reinstall "segment-anything==1.0"` — точная версия
+  подтверждена из pyproject.toml/uv.lock этого репо).
+- НЕ использовать `pip install --force-reinstall` с неспиненными пакетами в этих env —
+  однажды это привело к тому, что pip тихо переразрешил весь граф и поставил torch 2.13.0
+  вместо закреплённого 1.13.1 (в sam_hq). Если нужно поправить пакет — переустанавливать
+  env целиком (`--recreate`) безопаснее, чем force-reinstall на живом окружении.
+- Сервер — H100 (sm_90). torch==1.13.1+cu117 (пин из INSTALL_FIXES.md для "base" env) НЕ
+  ИМЕЕТ ядер под sm_90 и ТИХО ПОРТИТ данные (не падает с понятной ошибкой!) — поймали как
+  бессмысленный огромный отрицательный int в torch.repeat_interleave внутри MaskDecoderHQ.
+  Поэтому sam_hq/sam_hq2 закреплены на новых torch (2.1.2+cu118 / 2.3.1+cu121). Если
+  когда-нибудь будете поднимать дефолтный "base" env (torch 1.13.1) с нуля на этой машине —
+  вероятно, столкнётесь с тем же самым.
+- diffvg/pydiffvg НЕ нужен для всего, чем занимались в этой сессии (heatmaps/*, scripts/
+  refine_box_iou_grad.py, visualize_attention_maps.py, probe_decoder_activations.py).
+  Нужен только старому scripts/evaluate_boxes_model_sam*.py + runbboxparallel.sh.
+  `./scripts/setup_repo.sh --skip-diffvg` чтобы не тратить время на его сборку.
+
+
+3. ЧТО СДЕЛАНО (весь код запушен в main)
+-------------------------------------------
+Задачи 1-3 плана (порог по predicted-IoU / кластеры децилей G1-G5-G10 / clean-attacked-
+defended график) — были реализованы ДО начала этой сессии, в scripts/refine_box_iou_grad.py
+(функция calibration_outputs): фигура 2x3, флаги --pred_iou_thresh, --n_deciles,
+--highlight_deciles.
+
+Задача 4 (attention-карты по слоям декодера) — НОВЫЙ скрипт scripts/visualize_attention_maps.py.
+Монки-патчит cross_attn_token_to_image в mask decoder'е, чтобы вытащить softmax-веса
+внимания (сам SAM их не возвращает), рисует clean vs attacked vs diff по слоям + сводный
+график TV-distance по слоям. Поддерживает --dataset critical_shifts И --dataset user_study
+--root. ЕЩЁ НИ РАЗУ НЕ ЗАПУСКАЛСЯ на сервере — надо сделать смоук-тест в первую очередь.
+
+Задача 5 (SAM1/SAM2/SAM3/SAM-HQ/SAM-HQ2 в режиме максимизации) — основная часть работы.
+Весь пайплайн (scripts/refine_box_iou_grad.py, scripts/animate_grad_refine.py,
+heatmaps/predicted_iou_heatmap.py, heatmaps/defend_critical_shifts.py) был написан под API
+segment_anything (SAM1) и пришлось портировать на два принципиально других бэкенда:
+
+  SAM2ImagePredictor (SAM2.1, SAM-HQ2 — один и тот же класс):
+    - нет .predict_torch (только .predict() по одному боксу за раз — батч-циклом)
+    - .original_size -> ._orig_hw
+    - .features -> ._features["image_embed"] / ._features["high_res_feats"]
+    - model.prompt_encoder/.mask_decoder -> model.sam_prompt_encoder/.sam_mask_decoder
+    - mask_decoder(..., repeat_image=bool, high_res_features=[...]) — доп. обязательные каргс
+    - бокс кодируется как 2 точки-угла с метками [2,3], а не через kwarg boxes=
+    - mask_threshold лежит на predictor, не на model
+    - СВОЯ схема масштабирования бокса (просто ресайз в квадрат, БЕЗ letterbox-паддинга
+      как у SAM1's ResizeLongestSide) — box_1024 (наша конвенция) конвертируется в SAM2-
+      фрейм через predictor._transforms.transform_boxes(...) на входе и обратно через
+      original_to_1024(...) на выходе/логировании траектории.
+    Все детали подтверждены РЕАЛЬНЫМ исходником (inspect.getsource на сервере), не по памяти
+    — один раз чуть не ошибся с именами атрибутов, поэтому дальше всегда сверялись с кодом.
+
+  SamPredictor (SysCV/sam-hq, оригинальный SAM1-based форк, "SAM-HQ"):
+    - ЕСТЬ .predict_torch, НО mask_decoder — это MaskDecoderHQ с доп. обязательными
+      аргументами hq_token_only (bool) и interm_embeddings (кэш промежуточных слоёв ViT-
+      энкодера, лежит в predictor.interm_features после set_image()).
+    - Детектируется через hasattr(predictor, "interm_features").
+
+Итог: scripts/refine_box_iou_grad.py::refine_box_by_iou_grad теперь работает across три
+семейства предикторов (SAM/SAM-HQ через .predict_torch-ветку с доп. HQ-каргс; SAM2.1/SAM-HQ2
+через отдельную ветку). Также починены _predict_single_box, _predict_boxes,
+best_of_n_multimask, _predict_smoothed_box (heatmaps/defend_critical_shifts.py) — везде
+одна и та же идея: если нет .predict_torch, конвертируем бокс в исходные пиксельные
+координаты и идём через .predict() в цикле.
+
+Дополнительно в scripts/refine_box_iou_grad.py:
+  --dataset user_study --root <path> --use m|p|mp   (боксы берутся из реальной разметки
+     пользователей вместо critical_shifts.json; best_box = tight GT bbox, bad_box = tight
+     bbox пользовательской маски)
+  --summary_txt <path.txt>   сохраняет весь текстовый отчёт (калибровка + summary block +
+     stratified-таблицы + weakness detector) В ФАЙЛ, без варнингов/tqdm — только сам отчёт.
+  По умолчанию график true-IoU-vs-step ТЕПЕРЬ ТАКЖЕ сохраняется с разбивкой по бакетам
+     начального качества (weak undef<0.5 / mid 0.5-0.8 / strong >=0.8) — файл
+     "<out_plot без .png>_by_bucket.png", автоматически, без доп. флага. Причина: общий
+     (агрегатный) mean по шагам скрывает, что градиент — это большой выигрыш на слабых
+     боксах и почти нейтрален/чуть вреден на уже хороших (см. находки ниже).
+
+scripts/setup_repo.sh: --skip-diffvg, --base-env-name/--hq-env-name/--hq2-env-name/
+--sam3-env-name, --hq-torch-ver, новая setup_samhq_env() (torch 2.1.2+cu118).
+SAM3: setup_sam3_env() существует, но это install-only — python -m sam3 ставится, но
+comp_hw_smoothed.load_sam3_model() кидает NotImplementedError (см. раздел 5).
+
+
+4. ЧТО ПОДТВЕРЖДЕНО РАБОЧИМ (реально прогонялось на сервере)
+---------------------------------------------------------------
+- SAM2.1 (tiny) — refine_box_iou_grad.py и animate_grad_refine.py, оба --dataset (critical_
+  shifts и user_study), полный пайплайн (undefended/best_of_n/bon_mm/stability-select/
+  gate/grad-refine/grad-estop) — числа получены, см. раздел 5.
+- SAM-HQ (vit_l) — animate_grad_refine.py прошёл успешно после починки env + кода.
+- SAM-HQ2 — animate_grad_refine.py прошёл успешно.
+- SAM1 — использовался как референс в сравнениях (5000 cases / 200 images прогон), код не
+  менялся (изначально написан под него).
+- SAM2.1 base_plus/large — чекпоинты скачаны, tmux-прогон на large запускался
+  (сессия sam2_large_us) под --use m (мобильная разметка) — РЕЗУЛЬТАТ В ЭТОЙ СЕССИИ НЕ
+  ПРОВЕРЕН/не увиден, нужно посмотреть `tmux attach -t sam2_large_us` или файлы
+  results/grad_sam2_large_us_mobile.csv / calib_sam2_large_us_mobile.png.
+
+
+5. КЛЮЧЕВЫЕ НАХОДКИ (пока что)
+----------------------------------
+- SAM2.1-tiny: градиентный ascent ХУЖЕ undefended в среднем (0.58 vs 0.74 true IoU),
+  калибровка predicted-vs-true разваливается по мере оптимизации (Pearson r: 1.00 clean ->
+  0.58 attacked -> 0.30 после градиента). Гипотеза: слишком слабо обученная predicted-IoU
+  голова у tiny-модели, недостаточно надёжный ландшафт для навигации градиентом.
+  ПРОВЕРКА ГИПОТЕЗЫ (в процессе): те же прогоны на base_plus и large — должны показать
+  более чистый/однопиковый ландшафт predicted-IoU (heatmaps/predicted_iou_heatmap.py) и
+  меньшую просадку градиента, если гипотеза верна.
+- Сравнение смещения бокса SAM1 vs SAM2.1 (tiny) подтверждает гипотезу косвенно: у SAM1
+  градиент и best_of_n сходятся к похожему масштабу смещения (corner_L2 34/29,
+  center_shift 19/14 — коэффициент ~1.1-1.4x). У SAM2.1 градиент уезжает НАМНОГО дальше,
+  чем best_of_n вообще видит (center_shift 19.7 против best_of_n'а 0.15!) — похоже на
+  эксплуатацию "далёкого" ложного максимума predicted-IoU, а не реальное улучшение.
+- Полный прогон SAM1 (5000 cases/200 images, steps=50 lr=1.0): агрегатный true IoU
+  градиента (0.7603) едва обгоняет undefended (0.7163), НО это средневзвешенное скрывает
+  сильную неоднородность: weak-бакет (undef<0.5, 17.6% выборки) 0.304->0.520 (огромный
+  выигрыш), strong-бакет (undef>=0.8, 47%) 0.901->0.893 (градиент слегка ВРЕДИТ). Отсюда и
+  добавленный by-bucket график (см. раздел 3).
+  Среди БЕЗ-GT методов (реально применимых в деплое) агрегатно лучший — best_of_n x
+  multimask (0.7667), выше любого варианта градиента. НО по бакетам: на самых сломанных
+  боксах (bon<0.2) выигрывает именно [C] grad early-stop (0.348 vs 0.345 у bon_mm), а на
+  уже хороших — лучше вообще не трогать бокс. Единая метрика "какой метод лучше" вводит в
+  заблуждение так же, как единый график без разбивки на бакеты.
+- Критерии остановки градиента, которые реально есть в коде:
+    grad (final)      — фиксированные N шагов, БЕЗ критерия остановки вообще.
+    grad (best/traj)  — оракул (нужен GT, недостижим в деплое): максимум true IoU по ВСЕМ
+                        шагам без ограничений.
+    [C] grad early-stop (stability) — ЕДИНСТВЕННЫЙ реальный (без GT) критерий: SAIF-style
+                        стабильность (mean IoU под M случайными пертурбациями бокса)
+                        проверяется только КАЖДЫЕ --estop_every шагов (по умолч. 10, т.е.
+                        всего ~6 точек при --steps 50), выбирается шаг с макс. стабильностью.
+    [A] stability-gate — НЕ критерий остановки, а бинарный гейт "доверять ли best_of_n
+                        (token-0) целиком, судя по его стабильности, или подменить на
+                        best_of_n x multimask". Это и есть метод "сравнение с token 0".
+    [A+grad] gated grad-rescue / [A+grad VERIFIED] (g-gradV) — тот же гейт, но применяется
+                        к undefended-боксу: если нестабилен — спасаем через [C]. VERIFIED-
+                        версия дополнительно требует, чтобы спасённый результат был
+                        стабильнее исходного, иначе откат к undefended.
+
+
+6. СЛЕДУЮЩАЯ ЗАДАЧА (заявлена явно) — SAM3
+----------------------------------------------
+СЕЙЧАС НЕ РАБОТАЕТ И НЕ ПРОВЕРЯЛОСЬ. Статус на момент написания:
+- heatmaps/comp_hw_smoothed.py::load_sam3_model() — заглушка, кидает NotImplementedError.
+  Причина: SAM3 (facebookresearch/sam3) использует другой предиктор (Sam3Processor /
+  build_sam3_image_model()), НЕ SamPredictor/SAM2ImagePredictor API, на который рассчитан
+  весь остальной код. НЕ ПОДТВЕРЖДЕНО, есть ли у модели SAM3 доступный
+  prompt_encoder/mask_decoder пара с тем же смыслом, нужная для автограда через box-промпт
+  (то, на чём стоит вся идея refine_box_by_iou_grad).
+- scripts/setup_repo.sh имеет setup_sam3_env() (Python 3.12, torch>=2.7, `pip install sam3`)
+  — но это install-only, НИКОГДА не запускался на этом сервере в этой сессии.
+- heatmaps/env_dispatch.py уже готов маршрутизировать "SAM3" -> env "sam3", как только
+  load_sam3_model будет реализован.
+- Чекпоинты SAM3 гейтованы на Hugging Face (нужен `huggingface-cli login` в env sam3,
+  см. комментарий в setup_sam3_env()) — доступ и чекпоинты ещё НЕ получены/не проверены.
+
+ПЛАН ДЕЙСТВИЙ ДЛЯ SAM3 (по аналогии с тем, как чинили SAM2/SAM-HQ в этой сессии):
+  1. `./scripts/setup_repo.sh --envs sam3` — поднять env.
+  2. Получить доступ к чекпоинтам SAM3 на HF, `huggingface-cli login` в env sam3.
+  3. НЕ гадать по памяти — сразу смотреть реальный исходник на сервере:
+       conda run -n sam3 python -c "from sam3.model_builder import build_sam3_image_model; ..."
+     и через inspect.signature/getsource выяснить: как называется predictor, есть ли у
+     модели что-то вроде prompt_encoder/mask_decoder (или их аналоги), как энкодятся боксы,
+     как масштабируются координаты, есть ли метод типа predict_torch или только batched-
+     на-несколько-картинок API.
+  4. По результатам — реализовать load_sam3_model() в comp_hw_smoothed.py и (если у SAM3
+     действительно другая архитектура decoder'а, как у SAM2) третью ветку в
+     refine_box_by_iou_grad() + в остальных backend-специфичных местах
+     (_predict_single_box, _predict_boxes, best_of_n_multimask, _predict_smoothed_box).
+  5. Смоук-тест: --limit 3 --grad_only на маленьком датасете, прежде чем гнать полный прогон.
+
+
+7. SAM3 — СТАТУС ПОСЛЕ СЛЕДУЮЩЕЙ СЕССИИ (код написан, на сервере НЕ прогонялся)
+--------------------------------------------------------------------------------
+Раздел 6 выше — это ПЛАН. Вот что из него уже сделано в коде (всё в main).
+
+ГЛАВНОЕ АРХИТЕКТУРНОЕ РЕШЕНИЕ: для SAM3 НЕ добавлялась четвёртая ветка в
+refine_box_by_iou_grad и в остальные 6 backend-специфичных мест. Вместо этого
+новый heatmaps/sam3_adapter.py::SAM3ImagePredictor ОБОРАЧИВАЕТ SAM3 и выдаёт
+ровно ту поверхность, которую уже понимает существующая SAM2-ветка:
+  нет .predict_torch (по этому и выбирается ветка is_sam2), нет .interm_features,
+  есть model.sam_prompt_encoder/.sam_mask_decoder (алиасы, если у SAM3 другие
+  имена), _features["image_embed"]/["high_res_feats"], _orig_hw, _transforms
+  (.resolution/.transform_boxes/.postprocess_masks — SAM2-конвенция: простой
+  ресайз в квадрат, без letterbox).
+Причина: иначе пришлось бы синхронно править refine_box_by_iou_grad,
+_predict_single_box, _predict_boxes, best_of_n_multimask, _predict_smoothed_box,
+_predict_all_heads и animate_grad_refine._mask_for. Ни один из них не тронут.
+
+predict() в адаптере СПЕЦИАЛЬНО реализован через тот же prompt_encoder ->
+mask_decoder вызов, что и градиентный путь, а не делегирован в SAM3's predict():
+так undefended/best_of_n-бейзлайны и градиент меряются одним и тем же кодом
+(иначе сравнение методов бессмысленно), и мы не зависим от сигнатуры публичного
+SAM3 API.
+
+Новые файлы:
+  heatmaps/sam3_adapter.py          — адаптер (discovery + SAM3Transforms)
+  scripts/probe_sam3_api.py         — ДИАГНОСТИКА. Один прогон отвечает на 4
+      вопроса: Q1 чем строится image-модель, Q2 есть ли predictor с set_image/
+      predict, Q3 есть ли пара prompt_encoder/mask_decoder с IoU-головой,
+      Q4 ТЕЧЁТ ЛИ ГРАДИЕНТ от predicted IoU к координатам бокса. Q4 — это
+      go/no-go: если нет, вся идея refine_box_by_iou_grad на SAM3 неприменима
+      и остаются только best_of_n/stability-бейзлайны.
+  scripts/test_sam3_adapter.py      — оффлайн-тест контракта на ФЕЙКОВОЙ
+      SAM3-образной модели (CPU, без чекпоинта, секунды). Гоняет через адаптер
+      НАСТОЯЩИЕ refine_box_by_iou_grad/_predict_single_box/_predict_boxes/
+      best_of_n_multimask/stability_score. ПРОЙДЕН локально.
+
+Изменены: heatmaps/comp_hw_smoothed.py (load_sam3_model реализован,
+_build_sam3_raw перебирает известные написания билдера), scripts/setup_repo.sh
+(sam3 больше не install-only; доставлены loguru/tqdm/pillow/huggingface_hub/
+segment-anything, которые нужны нашему коду ВНУТРИ этого env),
+scripts/refine_box_iou_grad.py (только докстринги/help).
+
+ЧТО В АДАПТЕРЕ УГАДАНО И ОБЯЗАТЕЛЬНО СВЕРИТЬ С probe (реального SAM3 под рукой
+не было — тот же принцип «не по памяти», что и в разделе 2):
+  1. КАКИЕ модули — prompt encoder / mask decoder (ищутся по имени класса +
+     duck typing). -> probe Q3.
+  2. КАК получить image embedding (сначала пробуем нативный predictor SAM3 и
+     снимаем его кэш, иначе зовём forward_image/encode_image/...). -> probe Q2.
+  3. Входное РАЗРЕШЕНИЕ и нормализация пикселей (сейчас image_size + ImageNet
+     mean/std). -> probe Q3 «public non-module attributes».
+Если discovery не сработает — адаптер падает с точным указанием, какую секцию
+probe-отчёта смотреть; он НИКОГДА не подставляет догадку молча (молча неверная
+система координат даёт правдоподобные, но бессмысленные IoU — та же категория
+бага, что torch 1.13.1 на H100 из раздела 2).
+
+ПОРЯДОК ЗАПУСКА НА СЕРВЕРЕ (ничего из этого ещё не делалось):
+  0. git pull
+  1. ./scripts/setup_repo.sh --envs sam3 --skip-diffvg
+  2. conda run -n sam3 huggingface-cli login   (чекпоинты гейтованы на HF)
+  3. conda run -n sam3 python scripts/test_sam3_adapter.py   (быстрый sanity)
+  4. python scripts/probe_sam3_api.py --checkpoint_path <ckpt> \
+       --image <FOR_TEST/images/*.png> --out results/sam3_api_probe.txt
+     -> ЧИТАТЬ Q4. Нет градиента — дальше идти нельзя.
+  5. Свести probe-отчёт с тремя пунктами выше, поправить sam3_adapter.py.
+  6. Смоук: scripts/animate_grad_refine.py --model_name SAM3 --steps 10
+     на одной картинке (самый дешёвый end-to-end: одна картинка, один бокс).
+  7. heatmaps/predicted_iou_heatmap.py --grid_step 64 (грубая сетка сначала).
+  8. scripts/refine_box_iou_grad.py --limit 3 --grad_only, потом полный прогон.
+
+
+8. МЕЛКИЕ ХВОСТЫ / НЕ ЗАБЫТЬ
+--------------------------------
+- scripts/visualize_attention_maps.py — ни разу не прогонялся на сервере, нужен смоук-тест.
+- Результат tmux-сессии sam2_large_us (SAM2.1 large, user_study, --use m) не был просмотрен
+  в этой сессии — проверить results/grad_sam2_large_us_mobile.* и calib_*.
+- Полные (--limit 0) прогоны на critical_shifts_coco.json для SAM-HQ/SAM-HQ2/SAM1 (не только
+  SAM2.1) — команды даны в чате, но не все подтверждённо доведены до конца.
