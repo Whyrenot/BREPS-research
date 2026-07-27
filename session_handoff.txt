@@ -195,12 +195,13 @@ comp_hw_smoothed.load_sam3_model() кидает NotImplementedError (см. ра�
   — но это install-only, НИКОГДА не запускался на этом сервере в этой сессии.
 - heatmaps/env_dispatch.py уже готов маршрутизировать "SAM3" -> env "sam3", как только
   load_sam3_model будет реализован.
-- Чекпоинты SAM3 гейтованы на Hugging Face (нужен `huggingface-cli login` в env sam3,
+- Чекпоинты SAM3 гейтованы на Hugging Face (нужен `hf auth login` в env sam3 —
+  команда `huggingface-cli` удалена в huggingface_hub v1.0,
   см. комментарий в setup_sam3_env()) — доступ и чекпоинты ещё НЕ получены/не проверены.
 
 ПЛАН ДЕЙСТВИЙ ДЛЯ SAM3 (по аналогии с тем, как чинили SAM2/SAM-HQ в этой сессии):
   1. `./scripts/setup_repo.sh --envs sam3` — поднять env.
-  2. Получить доступ к чекпоинтам SAM3 на HF, `huggingface-cli login` в env sam3.
+  2. Получить доступ к чекпоинтам SAM3 на HF, `hf auth login` в env sam3.
   3. НЕ гадать по памяти — сразу смотреть реальный исходник на сервере:
        conda run -n sam3 python -c "from sam3.model_builder import build_sam3_image_model; ..."
      и через inspect.signature/getsource выяснить: как называется predictor, есть ли у
@@ -272,7 +273,13 @@ probe-отчёта смотреть; он НИКОГДА не подставля
 ПОРЯДОК ЗАПУСКА НА СЕРВЕРЕ (ничего из этого ещё не делалось):
   0. git pull
   1. ./scripts/setup_repo.sh --envs sam3 --skip-diffvg
-  2. conda run -n sam3 huggingface-cli login   (чекпоинты гейтованы на HF)
+  2. Аутентификация на HF (чекпоинты гейтованы). ВНИМАНИЕ: `huggingface-cli`
+     УДАЛЁН в huggingface_hub v1.0, CLI теперь называется `hf`. И промпт логина
+     требует TTY, которого `conda run` не даёт:
+       conda activate sam3 && hf auth login
+     либо полностью неинтерактивно (токен с hf.co/settings/tokens):
+       conda run -n sam3 hf auth login --token $HF_TOKEN
+       conda run -n sam3 hf auth whoami    # проверка
   3. conda run -n sam3 python scripts/test_sam3_adapter.py   (быстрый sanity)
   4. python scripts/probe_sam3_api.py --checkpoint_path <ckpt> \
        --image <FOR_TEST/images/*.png> --out results/sam3_api_probe.txt

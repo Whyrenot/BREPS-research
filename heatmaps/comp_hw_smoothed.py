@@ -525,7 +525,7 @@ def _build_sam3_raw(checkpoint: str, device: torch.device):
     SAM3 is young and its builder spelling is not pinned by this repo; try
     the known module paths, and for each try the checkpoint kwarg names it
     might use before falling back to a no-arg call (SAM3 can pull its gated
-    checkpoint from Hugging Face itself, given `huggingface-cli login`).
+    checkpoint from Hugging Face itself, given `hf auth login`).
     """
     import inspect
 
@@ -566,8 +566,9 @@ def _build_sam3_raw(checkpoint: str, device: torch.device):
         "build_* function the installed sam3 package actually has, with "
         "signatures. Add the right one to SAM3_BUILDERS above.\n"
         "If the failure is a gated-checkpoint / 401 error instead, request "
-        "access at https://github.com/facebookresearch/sam3 and run "
-        "`huggingface-cli login` inside the sam3 env."
+        "access at https://github.com/facebookresearch/sam3 and authenticate "
+        "inside the sam3 env with `hf auth login` (the old `huggingface-cli` "
+        "entry point was removed in huggingface_hub v1.0)."
     )
 
 

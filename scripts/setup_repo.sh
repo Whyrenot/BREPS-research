@@ -21,8 +21,10 @@
 #   sam3    facebookresearch/sam3. Needs Python>=3.12, torch>=2.7 -- hard
 #           incompatible with `base`'s torch 1.13.1 pin. Its checkpoints are
 #           GATED on Hugging Face: request access at
-#           https://github.com/facebookresearch/sam3, then run
-#           `conda run -n sam3 huggingface-cli login` before first use.
+#           https://github.com/facebookresearch/sam3, then authenticate --
+#           `conda activate sam3 && hf auth login` (NOT `huggingface-cli`,
+#           removed in huggingface_hub v1.0; and NOT via `conda run`, which
+#           gives the prompt no TTY -- see setup_sam3_env).
 #           SAM3 reaches the pipeline through heatmaps/sam3_adapter.py (it is
 #           presented as a SAM2-style predictor, so no call site changed).
 #           That adapter discovers a few things at runtime; confirm them once
@@ -321,8 +323,8 @@ setup_sam3_env() {
         --index-url "https://download.pytorch.org/whl/${SAM3_CUDA_TAG}"
 
     # facebookresearch/sam3 checkpoints are gated on Hugging Face -- request
-    # access first (see https://github.com/facebookresearch/sam3) and run
-    # `huggingface-cli login` in this env before downloading checkpoints.
+    # access first (see https://github.com/facebookresearch/sam3), then
+    # authenticate (see the log lines at the end of this function).
     conda run -n "$SAM3_ENV_NAME" pip install sam3
 
     # Deps of the repo code that runs INSIDE this env once env_dispatch
@@ -337,8 +339,14 @@ setup_sam3_env() {
 
     log "sam3 env ready."
     log "  conda run -n $SAM3_ENV_NAME python -c \"from sam3.model_builder import build_sam3_image_model; print('sam3 import OK')\""
-    log "  # checkpoints are gated -- authenticate once, then probe the API:"
-    log "  conda run -n $SAM3_ENV_NAME huggingface-cli login"
+    log "  # Checkpoints are gated -- authenticate once. NOTE: 'huggingface-cli'"
+    log "  # was REMOVED in huggingface_hub v1.0; the CLI is now 'hf'. And the"
+    log "  # login prompt needs a TTY, which 'conda run' does not give it:"
+    log "  conda activate $SAM3_ENV_NAME && hf auth login"
+    log "  # ...or fully non-interactive, with a token from hf.co/settings/tokens:"
+    log "  conda run -n $SAM3_ENV_NAME hf auth login --token \$HF_TOKEN"
+    log "  conda run -n $SAM3_ENV_NAME hf auth whoami   # verify"
+    log "  # then probe the API before trusting any SAM3 number:"
     log "  python scripts/probe_sam3_api.py --checkpoint_path <ckpt> --out results/sam3_api_probe.txt"
 }
 
