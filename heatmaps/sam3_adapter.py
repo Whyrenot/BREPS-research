@@ -427,6 +427,8 @@ def adopt_native_predictor(predictor, image_model=None, device=None):
             "missing pieces."
         )
 
+    if device is not None:
+        align_predictor_device(predictor, device)
     if image_model is not None and _tracker_lacks_backbone(predictor.model):
         install_shared_backbone_set_image(predictor, image_model, device)
     return predictor
@@ -449,6 +451,41 @@ def _tracker_lacks_backbone(tracker) -> bool:
         if getattr(tracker, attr, None) is not None:
             return False
     return True
+
+
+def _cast_tree(obj, *, device, dtype):
+    """Move every tensor in a nested dict/list to (device, dtype).
+
+    Float tensors get the dtype too; integer/bool ones only move, since
+    casting an index tensor to bfloat16 would corrupt it.
+    """
+    if torch.is_tensor(obj):
+        if obj.is_floating_point():
+            return obj.to(device=device, dtype=dtype)
+        return obj.to(device=device)
+    if isinstance(obj, dict):
+        return {k: _cast_tree(v, device=device, dtype=dtype) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_cast_tree(v, device=device, dtype=dtype) for v in obj)
+    return obj
+
+
+def align_predictor_device(predictor, device=None) -> torch.device:
+    """Put SAM3's interactive predictor on *device* and report where it is.
+
+    build_sam3_image_model's _setup_device_and_mode does NOT move it, even
+    though Sam3Image registers it as a child module -- confirmed the hard
+    way: the shared backbone returns CUDA bfloat16 while the tracker's
+    conv_s0 weights are still a CPU torch.FloatTensor, giving
+        RuntimeError: Input type (CUDABFloat16Type) and weight type
+        (torch.FloatTensor) should be the same
+    """
+    if device is not None:
+        predictor.to(torch.device(device))
+    try:
+        return next(predictor.model.parameters()).device
+    except StopIteration:  # pragma: no cover -- a parameterless tracker
+        return torch.device(device) if device is not None else torch.device("cpu")
 
 
 def _sam3_transform(image_model, resolution: int, device):
@@ -483,7 +520,11 @@ def install_shared_backbone_set_image(predictor, image_model, device=None) -> No
     """
     tracker = predictor.model
     resolution = int(predictor._transforms.resolution)
-    device = device or next(tracker.parameters()).device
+    device = align_predictor_device(predictor, device)
+    # The shared backbone runs in bfloat16 while the tracker's own weights are
+    # float32; harvest into the tracker's dtype so predict() and the gradient
+    # path stay in plain fp32 rather than depending on an autocast region.
+    ref = next(tracker.parameters())
     transform = _sam3_transform(image_model, resolution, device)
 
     def set_image(image_rgb: np.ndarray) -> None:
@@ -503,7 +544,8 @@ def install_shared_backbone_set_image(predictor, image_model, device=None) -> No
                     "with enable_inst_interactivity=False, which also changes "
                     "_create_vision_backbone. See probe section Q2b."
                 )
-            sam2_out = dict(backbone_out["sam2_backbone_out"])
+            sam2_out = _cast_tree(dict(backbone_out["sam2_backbone_out"]),
+                                  device=ref.device, dtype=ref.dtype)
             fpn = list(sam2_out["backbone_fpn"])
             fpn[0] = tracker.sam_mask_decoder.conv_s0(fpn[0])
             fpn[1] = tracker.sam_mask_decoder.conv_s1(fpn[1])
