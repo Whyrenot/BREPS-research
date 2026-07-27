@@ -156,6 +156,66 @@ class Sam3ImageModel(nn.Module):
                                  torch.randn(b, EMB, LOW, LOW)]}
 
 
+class FakeNativePredictor:
+    """Stand-in for sam3.model.sam1_task_predictor.SAM3InteractiveImagePredictor:
+    already SAM2-shaped, but (here) with the components under non-SAM2 names,
+    so adopt_native_predictor has to alias them."""
+
+    mask_threshold = 0.0
+
+    def __init__(self, model):
+        self.model = model
+        self._orig_hw = []
+        self._features = None
+        self._transforms = types.SimpleNamespace(
+            resolution=RES, transform_boxes=lambda *a, **k: None,
+            postprocess_masks=lambda *a, **k: None)
+
+    def set_image(self, image):
+        ...
+
+    def predict(self, **kw):
+        ...
+
+
+def check_adopt_native() -> None:
+    """The PREFERRED path: SAM3's own predictor, adopted rather than wrapped."""
+    from heatmaps.sam3_adapter import adopt_native_predictor
+
+    print("\n== adopt_native_predictor (SAM3's own predictor) ==")
+    model = Sam3ImageModel().eval()
+    assert not hasattr(model, "sam_prompt_encoder"), "fixture must start unaliased"
+    native = adopt_native_predictor(FakeNativePredictor(model))
+    assert isinstance(native.model.sam_prompt_encoder, Sam3PromptEncoder)
+    assert isinstance(native.model.sam_mask_decoder, Sam3MaskDecoder)
+    assert native.mask_threshold == 0.0
+    print("  aliased model.sam_prompt_encoder / .sam_mask_decoder, kept "
+          "mask_threshold")
+
+    # A predictor exposing predict_torch would silently take the SAM1 branch
+    # in refine_box_by_iou_grad and decode boxes in the wrong frame -- that
+    # must be caught loudly, not adopted.
+    bad = FakeNativePredictor(Sam3ImageModel().eval())
+    bad.predict_torch = lambda *a, **k: None
+    try:
+        adopt_native_predictor(bad)
+    except NotImplementedError as e:
+        assert "predict_torch" in str(e)
+        print("  rejects a predictor with .predict_torch (wrong branch) as expected")
+    else:
+        raise AssertionError("adopt_native_predictor accepted a .predict_torch predictor")
+
+    missing = FakeNativePredictor(Sam3ImageModel().eval())
+    del missing._transforms
+    try:
+        adopt_native_predictor(missing)
+    except NotImplementedError as e:
+        assert "_transforms" in str(e)
+        print("  rejects a predictor without ._transforms as expected")
+    else:
+        raise AssertionError("adopt_native_predictor accepted a predictor with no _transforms")
+
+
 # ---------------------------------------------------------------------------
 
 def main() -> int:
@@ -268,6 +328,8 @@ def main() -> int:
                               M=3, sigma_s=0.04, seed=1)
     assert 0.0 <= stab <= 1.0
     print(f"  stability_score         -> {stab:.4f}")
+
+    check_adopt_native()
 
     print("\nALL CHECKS PASSED")
     print("NOTE: this proves the adapter satisfies the repo's contract, NOT that\n"

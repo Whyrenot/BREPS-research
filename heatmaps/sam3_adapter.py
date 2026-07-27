@@ -62,6 +62,7 @@ of bug as the torch-1.13.1-on-H100 trap in session_handoff.txt section 2).
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
@@ -78,6 +79,172 @@ _DEFAULT_STD = (0.229, 0.224, 0.225)
 _RESOLUTION_ATTRS = ("image_size", "img_size", "input_size", "image_resolution")
 _PROMPT_ENCODER_ATTRS = ("sam_prompt_encoder", "prompt_encoder")
 _MASK_DECODER_ATTRS = ("sam_mask_decoder", "mask_decoder")
+
+
+# ---------------------------------------------------------------------------
+# building SAM3, and reaching its OWN SAM2-shaped predictor
+#
+# Confirmed on sam3 0.1.4 by scripts/probe_sam3_api.py (results/
+# sam3_api_probe.txt), reading the installed source -- not from memory:
+#
+#   sam3.model.sam1_task_predictor.SAM3InteractiveImagePredictor is a port of
+#   SAM2ImagePredictor. Its set_image() sets EXACTLY the state this repo's
+#   SAM2 code path reads:
+#       self._orig_hw   = [image.shape[:2]]
+#       self._features  = {"image_embed": feats[-1], "high_res_feats": feats[:-1]}
+#   and its predict() has this repo's exact signature
+#       (point_coords, point_labels, box, mask_input, multimask_output,
+#        return_logits, normalize_coords) -> 3 numpy arrays.
+#   Sam3Processor.set_image() dereferences
+#       model.inst_interactive_predictor.model.sam_mask_decoder.conv_s0
+#   which is what proves the inner model carries the SAM2 attribute names.
+#
+# So for SAM3 the SAM3ImagePredictor class further down is the FALLBACK; the
+# preferred path is SAM3's own predictor, which needs no guessed
+# preprocessing, resolution or normalisation at all.
+# ---------------------------------------------------------------------------
+
+_BPE_GLOB = "bpe_simple_vocab*.txt.gz"
+
+# The interactive predictor hangs off the image model under one of these.
+_INTERACTIVE_PREDICTOR_ATTRS = (
+    "inst_interactive_predictor", "inst_predictor", "interactive_predictor",
+)
+
+
+def find_bpe_path() -> str:
+    """Locate SAM3's BPE vocabulary.
+
+    sam3 0.1.4's build_sam3_image_model() defaults bpe_path to
+        os.path.join(os.path.dirname(__file__), "..", "assets", <bpe>)
+    i.e. dirname(sam3/model_builder.py)/../assets/ -- which is correct in a
+    repo checkout (repo/sam3/ + repo/assets/) but escapes the INSTALLED
+    package, resolving to site-packages/assets/ and raising FileNotFoundError.
+    Pass bpe_path explicitly to work around it.
+    """
+    import sam3
+
+    root = Path(sam3.__file__).resolve().parent
+    for base in (root, root.parent):
+        hits = sorted(base.glob(f"assets/{_BPE_GLOB}")) or sorted(base.glob(_BPE_GLOB))
+        if hits:
+            return str(hits[0])
+    hits = sorted(root.rglob(_BPE_GLOB))
+    if hits:
+        return str(hits[0])
+    raise FileNotFoundError(
+        f"SAM3: no {_BPE_GLOB} found under {root} or {root.parent}. sam3 "
+        f"{getattr(sam3, '__version__', '?')} looks for it at "
+        f"<package>/../assets/, which does not exist for an installed wheel "
+        f"-- and here it did not ship inside the package either.\n"
+        f"Fetch it from the source repo and pass the path through:\n"
+        f"    curl -L -o /tmp/bpe_simple_vocab_16e6.txt.gz \\\n"
+        f"      https://raw.githubusercontent.com/facebookresearch/sam3/main/"
+        f"assets/bpe_simple_vocab_16e6.txt.gz\n"
+        f"then set the BREPS_SAM3_BPE_PATH environment variable to it."
+    )
+
+
+def build_sam3_model(checkpoint: str | None = None, device="cuda",
+                     enable_inst_interactivity: bool = True, **extra):
+    """Call sam3.model_builder.build_sam3_image_model with the two settings
+    this repo needs.
+
+    enable_inst_interactivity=True is REQUIRED and is NOT the default: it is
+    what makes the builder construct
+        SAM3InteractiveImagePredictor(build_tracker(...))
+    and attach it to the model. Without it SAM3 exposes only the concept
+    (text / exemplar) path and there is no box-promptable predictor at all.
+
+    checkpoint=None is fine -- the builder's load_from_HF default pulls the
+    gated checkpoint from Hugging Face (needs `hf auth login`).
+    """
+    import os
+
+    from sam3.model_builder import build_sam3_image_model
+
+    bpe_path = os.environ.get("BREPS_SAM3_BPE_PATH") or find_bpe_path()
+    kwargs = dict(bpe_path=bpe_path, device=str(device),
+                  enable_inst_interactivity=enable_inst_interactivity, **extra)
+    if checkpoint:
+        kwargs["checkpoint_path"] = checkpoint
+    return build_sam3_image_model(**kwargs)
+
+
+def get_interactive_predictor(model):
+    """SAM3's own SAM2-shaped predictor, or None if the model was built
+    without enable_inst_interactivity."""
+    for attr in _INTERACTIVE_PREDICTOR_ATTRS:
+        pred = getattr(model, attr, None)
+        if pred is not None and hasattr(pred, "set_image") and hasattr(pred, "predict"):
+            return pred
+    return None
+
+
+def adopt_native_predictor(predictor):
+    """Make SAM3's own predictor satisfy this repo's contract, in place.
+
+    Only fills gaps -- it never overrides anything SAM3 already provides.
+    Raises (rather than papering over) when something load-bearing is
+    missing, naming the probe section that shows the truth.
+    """
+    problems: list[str] = []
+
+    # Branch selection in refine_box_by_iou_grad is by ABSENCE of these.
+    for forbidden, branch in (("predict_torch", "SAM1"), ("interm_features", "SAM-HQ")):
+        if hasattr(predictor, forbidden):
+            problems.append(
+                f"predictor has .{forbidden}, which would make "
+                f"refine_box_by_iou_grad take its {branch} branch instead of "
+                f"the SAM2-style one SAM3 needs"
+            )
+
+    tr = getattr(predictor, "_transforms", None)
+    if tr is None:
+        problems.append("predictor has no ._transforms")
+    else:
+        for attr in ("resolution", "transform_boxes", "postprocess_masks"):
+            if not hasattr(tr, attr):
+                problems.append(f"predictor._transforms has no .{attr}")
+
+    model = getattr(predictor, "model", None)
+    if model is None:
+        problems.append("predictor has no .model")
+    else:
+        # SAM2 spelling is what refine_box_by_iou_grad reads; alias if needed.
+        if not hasattr(model, "sam_prompt_encoder"):
+            _, pe = _named_attr(model, _PROMPT_ENCODER_ATTRS)
+            if pe is None:
+                _, pe = _find_module(model, "promptencoder", required=("get_dense_pe",))
+            if pe is None:
+                problems.append("predictor.model has no prompt encoder")
+            else:
+                model.sam_prompt_encoder = pe
+        if not hasattr(model, "sam_mask_decoder"):
+            _, md = _named_attr(model, _MASK_DECODER_ATTRS)
+            if md is None:
+                _, md = _find_module(model, "maskdecoder")
+            if md is None:
+                problems.append("predictor.model has no mask decoder")
+            else:
+                model.sam_mask_decoder = md
+
+    if not hasattr(predictor, "mask_threshold"):
+        # SAM2ImagePredictor keeps it on the predictor and defaults to 0.0
+        # (masks are logits). Only set it if SAM3 dropped the attribute.
+        predictor.mask_threshold = 0.0
+
+    if problems:
+        raise NotImplementedError(
+            "SAM3's own predictor does not satisfy this repo's contract:\n  - "
+            + "\n  - ".join(problems)
+            + "\n\nRun `python scripts/probe_sam3_api.py --checkpoint_path <ckpt>` "
+            "and read 'Q3 SAM2-branch compatibility checklist'. If SAM3 has "
+            "genuinely diverged, fall back to wrapping it in "
+            "heatmaps.sam3_adapter.SAM3ImagePredictor, which synthesises the "
+            "missing pieces."
+        )
+    return predictor
 
 
 # ---------------------------------------------------------------------------

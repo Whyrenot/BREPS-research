@@ -492,131 +492,66 @@ def load_samhq2_model(
     return predictor
 
 
-SAM3_BUILDERS = (
-    "sam3.model_builder.build_sam3_image_model",
-    "sam3.build_sam3.build_sam3_image_model",
-    "sam3.build_sam.build_sam3_image_model",
-)
-
-# SAM3's own predictor/processor, if importable: its set_image() does the
-# image encoding (SAM3's preprocessing is not re-derived by hand) while
-# SAM3ImagePredictor supplies the box-prompt surface the repo calls.
-SAM3_NATIVE_PREDICTORS = (
-    "sam3.processor.Sam3Processor",
-    "sam3.sam3_image_predictor.SAM3ImagePredictor",
-    "sam3.model_builder.Sam3Processor",
-)
-
-
-def _import_attr(path: str):
-    """'pkg.mod.attr' -> the attribute, or None if anything is missing."""
-    import importlib
-
-    mod_name, _, attr = path.rpartition(".")
-    try:
-        return getattr(importlib.import_module(mod_name), attr)
-    except Exception:  # noqa: BLE001 -- probing optional spellings
-        return None
-
-
-def _build_sam3_raw(checkpoint: str, device: torch.device):
-    """Call SAM3's image-model builder, adapting to its actual signature.
-
-    SAM3 is young and its builder spelling is not pinned by this repo; try
-    the known module paths, and for each try the checkpoint kwarg names it
-    might use before falling back to a no-arg call (SAM3 can pull its gated
-    checkpoint from Hugging Face itself, given `hf auth login`).
-    """
-    import inspect
-
-    tried = []
-    for path in SAM3_BUILDERS:
-        fn = _import_attr(path)
-        if fn is None:
-            tried.append(f"{path} (not importable)")
-            continue
-        params = inspect.signature(fn).parameters
-        attempts = []
-        if checkpoint:
-            for key in ("checkpoint_path", "ckpt_path", "checkpoint", "ckpt", "model_path"):
-                if key in params:
-                    attempts.append(({key: checkpoint}, None))
-            if not attempts:
-                attempts.append(({}, checkpoint))
-        attempts.append(({}, None))
-
-        for kwargs, positional in attempts:
-            if "device" in params:
-                kwargs = {**kwargs, "device": device}
-            try:
-                model = fn(positional, **kwargs) if positional else fn(**kwargs)
-            except Exception as e:  # noqa: BLE001
-                tried.append(f"{path}({positional or ''}{', '.join(kwargs)}): "
-                             f"{type(e).__name__}: {e}")
-                continue
-            if model is not None:
-                logger.info(f"SAM3 built via {path}")
-                return model
-
-    raise NotImplementedError(
-        "SAM3: could not build an image model. Attempts:\n  "
-        + "\n  ".join(tried)
-        + "\n\nRun `python scripts/probe_sam3_api.py --checkpoint_path <ckpt>` "
-        "in the `sam3` conda env -- its section 'Q1 builders' prints every "
-        "build_* function the installed sam3 package actually has, with "
-        "signatures. Add the right one to SAM3_BUILDERS above.\n"
-        "If the failure is a gated-checkpoint / 401 error instead, request "
-        "access at https://github.com/facebookresearch/sam3 and authenticate "
-        "inside the sam3 env with `hf auth login` (the old `huggingface-cli` "
-        "entry point was removed in huggingface_hub v1.0)."
-    )
-
-
 def load_sam3_model(
     checkpoint: str,
     device: torch.device,
     model_type: str = "vit_b",
 ):
-    """facebookresearch/sam3, presented as a SAM2ImagePredictor look-alike.
+    """facebookresearch/sam3, as a SAM2ImagePredictor-compatible predictor.
 
-    SAM3 is a concept-segmentation model (text / exemplar prompts, DETR-style
-    decoder) whose public entry point is a processor, not SamPredictor -- so
-    unlike the other backends it is not reached by adding another branch to
-    every call site, but by wrapping it in heatmaps.sam3_adapter.
-    SAM3ImagePredictor, which exposes the exact surface the existing
-    SAM2.1/SAM-HQ2 code path already speaks. See that module's docstring for
-    the full list, and for which parts are discovered at runtime rather than
-    hardcoded.
+    SAM3 is primarily a concept-segmentation model (text / exemplar prompts,
+    DETR-style decoder), but it also ships a port of SAM2ImagePredictor for
+    the "SAM 1 task" (interactive point/box segmentation):
+    sam3.model.sam1_task_predictor.SAM3InteractiveImagePredictor. That is
+    what this repo's box-prompt pipeline needs, and it already exposes the
+    exact surface the existing SAM2.1/SAM-HQ2 code path speaks -- so nothing
+    downstream of here changes, and none of SAM3's preprocessing has to be
+    re-derived by hand.
+
+    Two non-obvious build settings, both confirmed from the installed source
+    by scripts/probe_sam3_api.py:
+      * enable_inst_interactivity=True -- NOT the default. It is what makes
+        the builder construct the interactive predictor at all.
+      * bpe_path passed explicitly -- sam3 0.1.4's default resolves outside
+        the installed package (see sam3_adapter.find_bpe_path).
 
     Requires the `sam3` conda env (Python>=3.12, torch>=2.7 -- see
     scripts/setup_repo.sh); callers route there automatically via
-    heatmaps.env_dispatch.maybe_dispatch_to_env("SAM3", ...).
+    heatmaps.env_dispatch.maybe_dispatch_to_env("SAM3", ...). The checkpoint
+    is gated on Hugging Face: `hf auth login` in that env first. Passing
+    checkpoint='' is fine -- the builder then pulls it from HF itself.
 
     model_type is accepted for signature compatibility with the other
     loaders and ignored: SAM3 ships a single image model.
     """
-    from heatmaps.sam3_adapter import SAM3ImagePredictor
+    from heatmaps.sam3_adapter import (
+        SAM3ImagePredictor, adopt_native_predictor, build_sam3_model,
+        get_interactive_predictor,
+    )
 
-    model = _build_sam3_raw(checkpoint, device)
+    model = build_sam3_model(checkpoint=checkpoint, device=device,
+                             enable_inst_interactivity=True)
 
     for _, p in model.named_parameters():
         p.requires_grad = False
     model.to(device)
     model.eval()
 
-    native = None
-    for path in SAM3_NATIVE_PREDICTORS:
-        cls = _import_attr(path)
-        if cls is None:
-            continue
-        try:
-            native = cls(model)
-            logger.info(f"SAM3 native predictor: {path}")
-            break
-        except Exception as e:  # noqa: BLE001
-            logger.debug(f"SAM3 native predictor {path} rejected model: {e}")
+    predictor = get_interactive_predictor(model)
+    if predictor is not None:
+        logger.info(f"SAM3: using its own {type(predictor).__name__}")
+        return adopt_native_predictor(predictor)
 
-    return SAM3ImagePredictor(model, native=native, device=device)
+    # Fallback: SAM3 stopped shipping the interactive predictor, or renamed
+    # where it hangs off the model. Synthesise the surface instead (this path
+    # guesses the input resolution / normalisation -- see sam3_adapter).
+    logger.warning(
+        "SAM3: no interactive predictor found on the built model (tried "
+        "enable_inst_interactivity=True); falling back to the synthetic "
+        "adapter. Re-run scripts/probe_sam3_api.py -- section Q2 -- to see "
+        "what the builder actually attached."
+    )
+    return SAM3ImagePredictor(model, native=None, device=device)
 
 
 def load_model(model_name: str, **kwargs):

@@ -230,14 +230,36 @@ def survey_builders(pkg_name: str = "sam3") -> None:
 # ---------------------------------------------------------------------------
 
 def build_model(builder_path: str | None, checkpoint: str | None, device: str):
-    """Call the image-model builder, adapting to whatever signature it has."""
+    """Build SAM3's image model.
+
+    Primary path goes through heatmaps.sam3_adapter.build_sam3_model, which
+    encodes the two settings this repo needs and which are NOT the builder's
+    defaults (enable_inst_interactivity=True, and an explicit bpe_path around
+    sam3 0.1.4's broken default) -- so probing exercises the same call
+    load_sam3_model makes, rather than a lookalike that could diverge.
+    Falls back to raw signature-adaptive calls if that import fails.
+    """
     section("Q1  build the image model")
     import torch  # noqa: F401 -- confirms torch is importable in this env
 
+    if builder_path is None:
+        sub("via heatmaps.sam3_adapter.build_sam3_model (what load_sam3_model uses)")
+        try:
+            from heatmaps.sam3_adapter import build_sam3_model, find_bpe_path
+            print(f"  bpe_path = {find_bpe_path()}")
+            model = build_sam3_model(checkpoint=checkpoint, device=device,
+                                     enable_inst_interactivity=True)
+            if model is not None:
+                print(f"  [OK] built: {type(model).__name__}")
+                return model
+        except Exception as e:  # noqa: BLE001
+            print(f"  [FAIL] {type(e).__name__}: {e}")
+            for line in traceback.format_exc(limit=4).splitlines()[-6:]:
+                print(f"         {line}")
+            print("  -> falling back to raw builder calls below")
+
     candidates = [builder_path] if builder_path else [
         "sam3.model_builder.build_sam3_image_model",
-        "sam3.build_sam3.build_sam3_image_model",
-        "sam3.build_sam.build_sam3_image_model",
     ]
     for path in candidates:
         mod_name, _, fn_name = path.rpartition(".")
@@ -590,8 +612,31 @@ def parse_args():
 
 
 def _instantiate_predictor(model, class_path: str | None):
-    """Wrap the model in SAM3's own predictor/processor, if it has one."""
+    """Get SAM3's own predictor.
+
+    Preferred: the SAM3InteractiveImagePredictor the builder already attached
+    to the model when enable_inst_interactivity=True -- constructing a fresh
+    one from the image model would be wrong anyway (it wraps the TRACKER, not
+    the image model). Only if that is absent do we scan for classes with
+    set_image and try instantiating them.
+    """
     section("Q2  instantiate the predictor / processor")
+    if class_path is None:
+        try:
+            from heatmaps.sam3_adapter import get_interactive_predictor
+            attached = get_interactive_predictor(model)
+            if attached is not None:
+                print(f"  [OK] model already carries "
+                      f"{type(attached).__module__}.{type(attached).__name__}")
+                for meth in ("set_image", "predict", "predict_torch", "_predict"):
+                    if hasattr(attached, meth):
+                        show_signature(f"  .{meth}", getattr(attached, meth))
+                return attached
+            print("  model carries no interactive predictor "
+                  "(built without enable_inst_interactivity?)")
+        except Exception as e:  # noqa: BLE001
+            print(f"  [FAIL] get_interactive_predictor: {type(e).__name__}: {e}")
+
     candidates: list[str] = [class_path] if class_path else []
     if not candidates:
         try:
