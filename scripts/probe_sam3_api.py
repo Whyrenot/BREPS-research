@@ -127,11 +127,28 @@ _COMPONENT_HINTS = ("promptencoder", "maskdecoder", "tracker", "sam2", "sammask"
 
 def survey_package(pkg_name: str = "sam3") -> "object | None":
     section(f"Q1  package layout: {pkg_name}")
-    ok, pkg = safe(f"import {pkg_name}", lambda: importlib.import_module(pkg_name))
-    if not ok:
-        print(f"  -> `{pkg_name}` is not importable in this interpreter "
-              f"({sys.executable}). Create/activate the env first: "
-              f"./scripts/setup_repo.sh --envs sam3")
+    try:
+        pkg = importlib.import_module(pkg_name)
+    except ModuleNotFoundError as e:
+        print(f"  [FAIL] import {pkg_name}: {e}")
+        if e.name and e.name.split(".")[0] != pkg_name:
+            # `sam3` IS installed, one of ITS imports is what failed. Do not
+            # send the reader off to re-create the env for a missing leaf dep.
+            print(f"\n  -> `{pkg_name}` is installed, but importing it needs "
+                  f"`{e.name}`, which is absent.\n"
+                  f"     sam3 does not declare every dependency it imports. Fix:\n"
+                  f"         conda run -n sam3 pip install {e.name}\n"
+                  f"     and add it to setup_sam3_env() in scripts/setup_repo.sh "
+                  f"so the next\n     env build does not hit this again.")
+        else:
+            print(f"\n  -> `{pkg_name}` is not installed in this interpreter "
+                  f"({sys.executable}).\n"
+                  f"     Create the env first: ./scripts/setup_repo.sh --envs sam3")
+        return None
+    except Exception as e:  # noqa: BLE001
+        print(f"  [FAIL] import {pkg_name}: {type(e).__name__}: {e}")
+        for line in traceback.format_exc(limit=4).splitlines()[-5:]:
+            print(f"         {line}")
         return None
 
     print(f"  {pkg_name}.__file__    = {getattr(pkg, '__file__', None)}")

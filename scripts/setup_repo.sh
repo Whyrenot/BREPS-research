@@ -333,9 +333,13 @@ setup_sam3_env() {
     # ResizeLongestSide from the OFFICIAL segment_anything (never the SysCV
     # fork -- same package name, see the warning at the top of this file),
     # and animate_grad_refine.py writes GIFs through matplotlib/Pillow.
+    # psutil is imported by sam3 itself but missing from its dependency
+    # metadata -- without it `import sam3` dies with ModuleNotFoundError:
+    # No module named 'psutil', which looks like sam3 was never installed.
     conda run -n "$SAM3_ENV_NAME" pip install \
         numpy pandas "opencv-python-headless>=4.8.1.78" "matplotlib>=3.10.7" \
-        scipy loguru tqdm pyyaml pillow huggingface_hub "segment-anything>=1.0"
+        scipy loguru tqdm pyyaml pillow psutil huggingface_hub \
+        "segment-anything>=1.0"
 
     log "sam3 env ready."
     log "  conda run -n $SAM3_ENV_NAME python -c \"from sam3.model_builder import build_sam3_image_model; print('sam3 import OK')\""
