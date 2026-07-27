@@ -72,7 +72,11 @@ HQ2_PY="3.10"
 SAM3_PY="3.12"
 
 BASE_CUDA_TAG="cu117"          # torch 1.13.1 wheel index
-HQ_CUDA_TAG="cu117"            # same pin as base -- sam_hq is SAM1-based
+HQ_TORCH_VER="2.1.2"           # sam_hq has no torch pin of its own; NOT 1.13.1+cu117
+                                # like `base` -- that build has no sm_90 (H100) kernels
+                                # and silently corrupts tensors on H100 boxes (see
+                                # setup_samhq_env). Match pishugin-breps's known-good pin.
+HQ_CUDA_TAG="cu118"
 HQ2_CUDA_TAG="cu121"           # torch>=2.3.1 wheel index
 SAM3_CUDA_TAG="cu128"          # matches facebookresearch/sam3 README
 
@@ -90,6 +94,7 @@ while [[ $# -gt 0 ]]; do
         --vendor-dir) VENDOR_DIR="$2"; shift 2 ;;
         --base-env-name) BASE_ENV_NAME="$2"; shift 2 ;;
         --hq-env-name) HQ_ENV_NAME="$2"; shift 2 ;;
+        --hq-torch-ver) HQ_TORCH_VER="$2"; shift 2 ;;
         --hq2-env-name) HQ2_ENV_NAME="$2"; shift 2 ;;
         --sam3-env-name) SAM3_ENV_NAME="$2"; shift 2 ;;
         --cuda-tag) BASE_CUDA_TAG="$2"; HQ_CUDA_TAG="$2"; HQ2_CUDA_TAG="$2"; SAM3_CUDA_TAG="$2"; shift 2 ;;
@@ -206,11 +211,16 @@ EOF
 # ---------------------------------------------------------------------------
 # sam_hq env: SysCV/sam-hq (the ORIGINAL, SAM1-based fork -- repo root, not
 # the sam-hq2 subfolder). Its package is named `segment_anything`, so it
-# must NOT share an env with the base SAM1 install. Same torch pin as base
-# (this fork has no newer-torch requirement of its own).
+# must NOT share an env with the base SAM1 install. Deliberately NOT the
+# same torch pin as `base` (1.13.1+cu117): that build has no compiled
+# kernels for sm_90 (H100) and silently corrupts tensors on H100 GPUs
+# instead of erroring cleanly (seen as bogus huge ints in
+# torch.repeat_interleave inside MaskDecoderHQ). sam-hq itself has no torch
+# pin of its own, so we use $HQ_TORCH_VER -- match whatever's already
+# working on your hardware if you hit the same issue elsewhere.
 # ---------------------------------------------------------------------------
 setup_samhq_env() {
-    log "=== SAM-HQ env '$HQ_ENV_NAME' (torch 1.13.1, isolated from base's segment_anything) ==="
+    log "=== SAM-HQ env '$HQ_ENV_NAME' (torch $HQ_TORCH_VER, isolated from base's segment_anything) ==="
 
     if maybe_recreate "$HQ_ENV_NAME"; then
         log "conda env '$HQ_ENV_NAME' already exists, reusing (use --recreate to rebuild)"
@@ -218,7 +228,7 @@ setup_samhq_env() {
         conda create -n "$HQ_ENV_NAME" "python=$HQ_PY" -y
     fi
 
-    conda run -n "$HQ_ENV_NAME" pip install torch==1.13.1 torchvision torchaudio \
+    conda run -n "$HQ_ENV_NAME" pip install "torch==${HQ_TORCH_VER}" torchvision torchaudio \
         --index-url "https://download.pytorch.org/whl/${HQ_CUDA_TAG}"
 
     local samhq_dir="$VENDOR_DIR/sam-hq"
