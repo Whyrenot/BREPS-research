@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -52,6 +53,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import torch
+from tqdm import tqdm
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -642,6 +644,38 @@ def grad_estop_by_stability(traj, predictor, device, use_mm, estop_every, M, sig
     return best
 
 
+# ---------------------------------------------------------------------------
+# graceful stop: keep the cases already computed
+# ---------------------------------------------------------------------------
+
+_STOP_REQUESTED = False
+
+
+def _install_stop_handlers() -> None:
+    """Ctrl+C / SIGTERM finish the current case, then fall through to the
+    normal post-processing so everything computed so far is written.
+
+    Without this a long run that has to be cut short yields NOTHING: the CSV
+    and the report are only written after the whole loop completes. On a
+    12500-case dataset that is hours of compute thrown away.
+
+    A second signal aborts immediately, so a wedged run is still killable.
+    """
+    def handler(signum, frame):  # noqa: ARG001
+        global _STOP_REQUESTED
+        if _STOP_REQUESTED:
+            raise KeyboardInterrupt("second signal -- aborting without saving")
+        _STOP_REQUESTED = True
+        print(
+            f"\n[stop] signal {signum} received. Finishing the current case, then "
+            f"writing the partial results. Send it again to abort immediately.",
+            file=sys.stderr, flush=True,
+        )
+
+    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGTERM, handler)
+
+
 class _Tee:
     """Duplicate writes to several text streams (e.g. real stdout + a log
     file), so print() keeps working normally on the console while also
@@ -843,24 +877,39 @@ def main():
     _BUCKETS = ("weak", "mid", "strong")
     true_by_step_bucket: dict[str, dict[int, list[float]]] = {b: defaultdict(list) for b in _BUCKETS}
 
+    _install_stop_handlers()
     n_done = 0
+    run_undef = run_grad = 0.0
+    stopped_early = False
+    pbar = tqdm(total=sum(len(v) for v in by_image.values()),
+                desc=f"{args.model_name} cases", unit="case", dynamic_ncols=True)
     for image_name, raw_tasks in by_image.items():
+        if _STOP_REQUESTED:
+            stopped_early = True
+            break
         image_path = _find_file(images_dir, image_name)
         mask_path = _find_file(masks_dir, image_name)
         if image_path is None or mask_path is None:
-            print(f"[warn] missing image/mask for {image_name}, skipping")
+            pbar.write(f"[warn] missing image/mask for {image_name}, skipping")
+            pbar.update(len(raw_tasks))
             continue
         try:
             _prepare_image(str(image_path), predictor)
             gt_tensor = _load_gt(mask_path, predictor)
         except Exception as e:
-            print(f"[warn] setup failed for {image_name}: {e}")
+            pbar.write(f"[warn] setup failed for {image_name}: {e}")
+            pbar.update(len(raw_tasks))
             continue
 
         cases = (build_user_cases(raw_tasks, predictor, gt_tensor)
                  if dataset_kind == "user_study" else raw_tasks)
+        # build_user_cases drops empty/degenerate user masks -- keep the bar honest
+        pbar.update(max(0, len(raw_tasks) - len(cases)))
 
         for case in cases:
+            if _STOP_REQUESTED:
+                stopped_early = True
+                break
             bad_box = torch.tensor(case["bad_box"], dtype=torch.float32)
 
             bad_box_np = np.asarray(case["bad_box"], dtype=np.float64)
@@ -1027,6 +1076,21 @@ def main():
                 "grad_dist_best": _box_metrics(grad_box, best_box_np)["corner_l2"],
             })
             n_done += 1
+            # running sums, not a mean over `rows` -- recomputing that per case
+            # would make the loop quadratic (12500 cases is enough for it to show)
+            run_undef += undef_iou
+            run_grad += grad_final_iou
+            pbar.update(1)
+            pbar.set_postfix(undef=f"{run_undef / n_done:.3f}",
+                             grad=f"{run_grad / n_done:.3f}", refresh=False)
+
+        if stopped_early:
+            break
+
+    pbar.close()
+    if stopped_early:
+        print(f"[stop] interrupted after {n_done} cases -- writing PARTIAL results "
+              f"to {args.out_csv} and the report below.", file=sys.stderr, flush=True)
 
     if n_done == 0:
         raise SystemExit("No cases processed (check paths).")
@@ -1084,6 +1148,10 @@ def main():
                     out_path=Path(args.out_plot).with_name(Path(args.out_plot).stem + "_by_bucket.png"))
 
     # ---- summary ----
+    if stopped_early:
+        print(f"\n*** PARTIAL RUN: stopped by signal after {n_done} of "
+              f"{sum(len(v) for v in by_image.values())} requested cases. "
+              f"Every number below is computed on that prefix only. ***")
     print(f"\nProcessed {n_done} cases over {len(by_image)} images "
           f"(multimask={args.multimask}, steps={args.steps}, lr={args.lr})")
     print("=" * 64)
