@@ -291,6 +291,31 @@ def _box_metrics(box_new, box_ref) -> dict:
     }
 
 
+def best_of_n_batched(bad_box, predictor, device, Y, sigma, sigma_center,
+                      perturb_mode, seed):
+    """best_of_n (token-0) in one batched call instead of Y looped .predict()s.
+
+    Numerically the same defence as heatmaps.defend_critical_shifts.
+    _predict_smoothed_box(averaging_mode='best_of_n', include_base_box=False):
+    the SAME perturbation sampler with the SAME seed, so the candidate boxes
+    are identical, then argmax over the predicted IoU of the single-output
+    token. Only the number of forward passes differs.
+
+    Returns (mask bool (H,W), pred_score, chosen_box_1024 np).
+    """
+    sam_h, sam_w = getattr(predictor, "input_size", (1024, 1024))
+    base = torch.as_tensor(bad_box, dtype=torch.float32)
+    if perturb_mode == "size_center":
+        perturbed = sample_size_and_center_perturbed_boxes(
+            base, (sam_h, sam_w), Y, sigma, sigma, sigma_center, sigma_center, seed)
+    else:
+        perturbed = sample_size_perturbed_boxes(base, (sam_h, sam_w), Y, sigma, sigma, seed)
+
+    masks, scores = _predict_boxes(perturbed.float().to(device), predictor, multimask=False)
+    best = int(torch.argmax(scores[:, 0]).item())
+    return masks[best, 0].cpu(), float(scores[best, 0].item()), perturbed[best].cpu().numpy()
+
+
 def best_of_n_multimask(bad_box, predictor, device, Y, sigma, sigma_center, perturb_mode, seed):
     """best_of_n that searches over BOTH perturbed boxes AND the 3 multimask
     heads: pick the (box, head) with the highest predicted IoU.
@@ -343,6 +368,36 @@ def best_of_n_multimask(bad_box, predictor, device, Y, sigma, sigma_center, pert
 # SAIF-style stability  (methods A / B / C)
 # ---------------------------------------------------------------------------
 
+def _predict_boxes_batched(boxes_t, predictor, multimask):
+    """All boxes in ONE decoder call, or None if this backend cannot do it.
+
+    SAM2ImagePredictor / SAM3InteractiveImagePredictor have no public
+    .predict_torch, so the rest of this file falls back to looping .predict()
+    one box at a time -- which is what makes SAM2.1/SAM-HQ2/SAM3 slow (~67
+    predict calls per case). Their PRIVATE ._predict does accept a batch: it
+    reshapes boxes to (-1, 2, 2), repeats the [2, 3] corner labels per box and
+    passes repeat_image=True so the single cached image embedding is expanded
+    across the batch -- confirmed from that method's source (probe Q2b).
+
+    Boxes arrive in this repo's SAM1-1024 frame and ._predict expects the
+    model's own frame, so they go 1024 -> original px -> transform_boxes,
+    exactly as _predict_single_box does for the one-box case.
+    """
+    pred_fn = getattr(predictor, "_predict", None)
+    transforms = getattr(predictor, "_transforms", None)
+    if pred_fn is None or transforms is None:
+        return None
+
+    orig_hw = get_original_size(predictor)
+    device = getattr(predictor, "device", None) or boxes_t.device
+    boxes_np = boxes_to_original(boxes_t.detach().cpu().numpy(), orig_hw)
+    bt = torch.as_tensor(np.asarray(boxes_np, dtype=np.float32), device=device)
+    unnorm = transforms.transform_boxes(bt, normalize=True, orig_hw=orig_hw).reshape(-1, 4)
+    masks, scores, _ = pred_fn(None, None, boxes=unnorm,
+                               multimask_output=multimask, return_logits=False)
+    return masks.bool().cpu(), scores.float().cpu()
+
+
 def _predict_boxes(boxes_t, predictor, multimask):
     """boxes_t: (N,4), already in SAM's 1024-frame. Returns masks
     (N, num_heads, H, W) bool and scores (N, num_heads).
@@ -352,6 +407,15 @@ def _predict_boxes(boxes_t, predictor, multimask):
     .predict() one box at a time, after converting each box back to
     original pixel coordinates (see _predict_single_box's docstring)."""
     if not hasattr(predictor, "predict_torch"):
+        try:
+            batched = _predict_boxes_batched(boxes_t, predictor, multimask)
+        except Exception as e:  # noqa: BLE001 -- never let the fast path break a run
+            print(f"[warn] batched predict failed ({type(e).__name__}: {e}); "
+                  f"falling back to the per-box loop")
+            batched = None
+        if batched is not None:
+            return batched
+
         orig_size = get_original_size(predictor)
         boxes_np = boxes_to_original(boxes_t.detach().cpu().numpy(), orig_size)
         all_masks, all_scores = [], []
@@ -751,6 +815,14 @@ def parse_args():
     p.add_argument("--grad_only", action="store_true", default=False,
                    help="skip the expensive bon_mm / stability-select baselines; "
                         "compute only undefended, best_of_n, gradient + gated rescue")
+    p.add_argument("--fast", action="store_true", default=False,
+                   help="drop every SAIF-stability method ([C] grad early-stop "
+                        "and the gated grad-rescues) and run best_of_n as one "
+                        "batched call. Leaves undefended / head-select / "
+                        "best_of_n / gradient intact. Those stability methods "
+                        "are ~49 of the ~67 predict calls per case, so this is "
+                        "the difference between a run that finishes and one "
+                        "that does not (measured 15 s/case for SAM3 without it).")
 
     p.add_argument("--out_csv", default="results/grad_refine_percase.csv")
     p.add_argument("--out_plot", default="results/grad_refine.png")
@@ -851,6 +923,11 @@ def build_user_cases(raw_tasks, predictor, gt_tensor):
 
 def main():
     args = parse_args()
+    # --fast is about dropping SAIF stability, and method_stab_select (the [B]
+    # baseline) is the most expensive stability method of all -- leaving it on
+    # would defeat the flag.
+    if args.fast:
+        args.grad_only = True
 
     # SAM-HQ2 / SAM3 live in separate conda envs (package-name clash with
     # sam2, incompatible torch versions -- see heatmaps/env_dispatch.py).
@@ -931,17 +1008,26 @@ def main():
             )
             clean_iou = _iou(gt_tensor, clean_mask)
 
-            # best_of_n defence (with scores -> chosen box & its predicted IoU)
-            bon_mask, bon_perturbed, bon_scores, bon_best_idx = _predict_smoothed_box(
-                bad_box=bad_box, image_shape=(sam_h, sam_w), predictor=predictor,
-                rank=device, Y=args.Y, sigma_w=args.sigma, sigma_h=args.sigma,
-                averaging_mode="best_of_n", sigma_cx=args.sigma_center,
-                sigma_cy=args.sigma_center, perturb_mode=args.perturb_mode, seed=42,
-                return_scores=True,
-            )
+            # best_of_n defence (with scores -> chosen box & its predicted IoU).
+            # --fast takes the batched route: same candidate boxes (same
+            # sampler, same seed), one forward instead of Y.
+            if args.fast:
+                bon_mask, bon_pred, bon_box = best_of_n_batched(
+                    case["bad_box"], predictor, device, args.Y, args.sigma,
+                    args.sigma_center, args.perturb_mode, seed=42)
+            else:
+                bon_mask, bon_perturbed, bon_scores, bon_best_idx = _predict_smoothed_box(
+                    bad_box=bad_box, image_shape=(sam_h, sam_w), predictor=predictor,
+                    rank=device, Y=args.Y, sigma_w=args.sigma, sigma_h=args.sigma,
+                    averaging_mode="best_of_n", sigma_cx=args.sigma_center,
+                    sigma_cy=args.sigma_center, perturb_mode=args.perturb_mode, seed=42,
+                    return_scores=True,
+                )
+                bon_pred = (float(bon_scores[bon_best_idx, 0])
+                            if bon_best_idx >= 0 else float("nan"))
+                bon_box = (bon_perturbed[bon_best_idx].numpy()
+                           if bon_best_idx >= 0 else bad_box_np)
             bon_iou = _iou(gt_tensor, bon_mask)
-            bon_pred = float(bon_scores[bon_best_idx, 0]) if bon_best_idx >= 0 else float("nan")
-            bon_box = (bon_perturbed[bon_best_idx].numpy() if bon_best_idx >= 0 else bad_box_np)
             bon_m = _box_metrics(bon_box, bad_box_np)
 
             # best_of_n x multimask: search boxes AND the 3 heads (skipped if grad_only)
@@ -995,24 +1081,32 @@ def main():
                     gated_iou, gate_dec = bon_mm_iou, "rescue"
                 oracle_gate_iou = max(bon_iou, bon_mm_iou)  # gating ceiling (bon vs bon_mm)
 
-            # (C) gradient early-stop by stability
-            es_step, es_iou, es_stab = grad_estop_by_stability(
-                traj, predictor, device, use_mm=args.multimask,
-                estop_every=args.estop_every, M=args.stab_M,
-                sigma_s=args.stab_sigma, seed=11)
+            # (C) gradient early-stop by stability, and the gated rescues that
+            # depend on it. Together these are ~49 of the ~67 predict calls per
+            # case (6 trajectory checkpoints x 7 boxes, plus 7 for the token-0
+            # gate), so --fast drops them wholesale.
+            if args.fast:
+                es_step, es_iou, es_stab = -1, float("nan"), float("nan")
+                stab_undef = gated_grad_iou = gated_gradv_iou = float("nan")
+                gg_dec = gg_dec_v = "skipped"
+            else:
+                es_step, es_iou, es_stab = grad_estop_by_stability(
+                    traj, predictor, device, use_mm=args.multimask,
+                    estop_every=args.estop_every, M=args.stab_M,
+                    sigma_s=args.stab_sigma, seed=11)
 
-            # gated gradient-rescue: stability of token-0 on the ORIGINAL box is the
-            # gate. Plain: rescue if token-0 unstable. Verified: ALSO require the
-            # grad result to be MORE stable than token-0, so false positives revert
-            # harmlessly to token-0 (decouples recall from harm).
-            stab_undef, _ = stability_score(case["bad_box"], predictor, device,
-                                            False, 0, args.stab_M, args.stab_sigma, seed=3)
-            rescue_flag = stab_undef < args.stab_tau
-            gated_grad_iou = es_iou if rescue_flag else undef_iou
-            gg_dec = "grad_rescue" if rescue_flag else "keep"
-            accept_v = rescue_flag and (es_stab > stab_undef)
-            gated_gradv_iou = es_iou if accept_v else undef_iou
-            gg_dec_v = "grad_rescue" if accept_v else "keep"
+                # gated gradient-rescue: stability of token-0 on the ORIGINAL box is the
+                # gate. Plain: rescue if token-0 unstable. Verified: ALSO require the
+                # grad result to be MORE stable than token-0, so false positives revert
+                # harmlessly to token-0 (decouples recall from harm).
+                stab_undef, _ = stability_score(case["bad_box"], predictor, device,
+                                                False, 0, args.stab_M, args.stab_sigma, seed=3)
+                rescue_flag = stab_undef < args.stab_tau
+                gated_grad_iou = es_iou if rescue_flag else undef_iou
+                gg_dec = "grad_rescue" if rescue_flag else "keep"
+                accept_v = rescue_flag and (es_stab > stab_undef)
+                gated_gradv_iou = es_iou if accept_v else undef_iou
+                gg_dec_v = "grad_rescue" if accept_v else "keep"
 
             rows.append({
                 "image_name": image_name,
@@ -1169,12 +1263,16 @@ def main():
         print(f"  [A] stability-gate       true IoU : {df['gated_iou'].mean():.4f}"
               f"   (token0 {(df['gate_decision'] == 'token0').mean():.0%} / rescue rest)")
         print(f"      oracle-gate (bon|bon_mm) IoU  : {df['oracle_gate_iou'].mean():.4f}  (gating ceiling)")
-    print(f"  [C] grad early-stop(stab)true IoU : {df['grad_estop_iou'].mean():.4f}"
-          f"   (mean stop step {df['grad_estop_step'].mean():.1f})")
-    print(f"  [A+grad] gated grad-rescue   IoU  : {df['gated_grad_iou'].mean():.4f}"
-          f"   (rescued {(df['gg_decision'] == 'grad_rescue').mean():.0%})   <- keep token-0 else grad")
-    print(f"  [A+grad VERIFIED] g-rescue   IoU  : {df['gated_gradv_iou'].mean():.4f}"
-          f"   (rescued {(df['gg_decision_v'] == 'grad_rescue').mean():.0%})   <- accept grad iff more stable")
+    if args.fast:
+        print("  [--fast] SAIF-stability methods skipped: no [C] grad early-stop, "
+              "no gated grad-rescue")
+    else:
+        print(f"  [C] grad early-stop(stab)true IoU : {df['grad_estop_iou'].mean():.4f}"
+              f"   (mean stop step {df['grad_estop_step'].mean():.1f})")
+        print(f"  [A+grad] gated grad-rescue   IoU  : {df['gated_grad_iou'].mean():.4f}"
+              f"   (rescued {(df['gg_decision'] == 'grad_rescue').mean():.0%})   <- keep token-0 else grad")
+        print(f"  [A+grad VERIFIED] g-rescue   IoU  : {df['gated_gradv_iou'].mean():.4f}"
+              f"   (rescued {(df['gg_decision_v'] == 'grad_rescue').mean():.0%})   <- accept grad iff more stable")
     print(f"  grad (final)             true IoU : {df['grad_final_iou'].mean():.4f}"
           f"   (pred {df['grad_final_pred'].mean():.4f})")
     print(f"  grad (best/traj)         true IoU : {df['grad_best_iou'].mean():.4f}  (early-stop oracle)")
@@ -1239,13 +1337,19 @@ def main():
                        ("strong(undef>=0.8)", q >= 0.8)):
         sub = df[mask]
         if len(sub):
-            print(f"  [{name}] n={len(sub):3d}  undef {sub['undefended_iou'].mean():.3f}"
-                  f" -> bon {sub['best_of_n_iou'].mean():.3f}"
-                  f" -> grad {sub['grad_final_iou'].mean():.3f}"
-                  f" -> g-gradV {sub['gated_gradv_iou'].mean():.3f}")
+            line = (f"  [{name}] n={len(sub):3d}  undef {sub['undefended_iou'].mean():.3f}"
+                    f" -> bon {sub['best_of_n_iou'].mean():.3f}"
+                    f" -> grad {sub['grad_final_iou'].mean():.3f}")
+            if not args.fast:
+                line += f" -> g-gradV {sub['gated_gradv_iou'].mean():.3f}"
+            print(line)
 
     # stratify by best_of_n quality -> where does each method help / hurt?
-    if args.grad_only:
+    if args.fast:
+        methods = [("undef", "undefended_iou"), ("headsel", "headsel_iou"),
+                   ("bon", "best_of_n_iou"), ("gradF", "grad_final_iou"),
+                   ("gradBest", "grad_best_iou")]
+    elif args.grad_only:
         methods = [("undef", "undefended_iou"), ("bon", "best_of_n_iou"),
                    ("gradF", "grad_final_iou"), ("gradES", "grad_estop_iou"),
                    ("g-grad", "gated_grad_iou"), ("g-gradV", "gated_gradv_iou")]
@@ -1269,6 +1373,14 @@ def main():
             print(f"  {name:>16} | {len(sub):>3} | {vals}")
 
     # ---- weakness-detector eval: can token-0 stability flag boxes needing rescue? ----
+    if args.fast:
+        print("\n  --- weakness detector: skipped (--fast, no stability scores) ---")
+        print(f"\nSaved per-case -> {out_csv}")
+        sys.stdout = _orig_stdout
+        _summary_f.close()
+        print(f"Saved post-processing report -> {summary_txt_path}")
+        return
+
     weak = (df["undefended_iou"] < args.weak_thresh).to_numpy()
     # low stability => weak, so the detector score is (1 - stab_undef)
     auc = _auroc(1.0 - df["stab_undef"].to_numpy(), weak)
