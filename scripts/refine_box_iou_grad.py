@@ -632,6 +632,147 @@ def tier1_features(extras, undef_mask, bon_mask, bad_box_1024, grad_box_1024,
     return f
 
 
+# ---------------------------------------------------------------------------
+# tier-2 gate features: box geometry and the shape of the ascent trajectory
+#
+# Same inference-time-only rule as tier 1. Three groups:
+#   (4) how far the box moved, RELATIVE to its own size. The absolute pixel
+#       displacements already in the CSV are near-useless as features because
+#       30 px means something different for a 50 px box and a 500 px one.
+#       Plus GIoU/CIoU between the boxes, which fold displacement, size change
+#       and aspect change into one bounded number.
+#   (5) priors on the prompt box itself: small, elongated or border-touching
+#       objects are where the defence is risky.
+#   (6) the shape of the ascent. A run that plateaued early, wandered, or
+#       overshot its own best predicted score is a different animal from one
+#       that walked straight to a maximum -- and none of that is visible in the
+#       final predicted IoU alone.
+# ---------------------------------------------------------------------------
+
+def _giou_ciou(b1, b0) -> tuple:
+    """(IoU, GIoU, CIoU) between two axis-aligned boxes [x0,y0,x1,y1]."""
+    ix0, iy0 = max(b1[0], b0[0]), max(b1[1], b0[1])
+    ix1, iy1 = min(b1[2], b0[2]), min(b1[3], b0[3])
+    inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+    a1 = max(0.0, b1[2] - b1[0]) * max(0.0, b1[3] - b1[1])
+    a0 = max(0.0, b0[2] - b0[0]) * max(0.0, b0[3] - b0[1])
+    union = a1 + a0 - inter
+    iou = inter / union if union > 0 else 0.0
+    ex0, ey0 = min(b1[0], b0[0]), min(b1[1], b0[1])
+    ex1, ey1 = max(b1[2], b0[2]), max(b1[3], b0[3])
+    ec = max(0.0, ex1 - ex0) * max(0.0, ey1 - ey0)
+    giou = iou - (ec - union) / ec if ec > 0 else iou
+    c2 = (ex1 - ex0) ** 2 + (ey1 - ey0) ** 2
+    cx1, cy1 = (b1[0] + b1[2]) / 2, (b1[1] + b1[3]) / 2
+    cx0, cy0 = (b0[0] + b0[2]) / 2, (b0[1] + b0[3]) / 2
+    rho2 = (cx1 - cx0) ** 2 + (cy1 - cy0) ** 2
+    w1, h1 = max(1e-6, b1[2] - b1[0]), max(1e-6, b1[3] - b1[1])
+    w0, h0 = max(1e-6, b0[2] - b0[0]), max(1e-6, b0[3] - b0[1])
+    v = (4.0 / np.pi ** 2) * (np.arctan(w0 / h0) - np.arctan(w1 / h1)) ** 2
+    denom = (1.0 - iou) + v
+    alpha = v / denom if denom > 1e-12 else 0.0
+    ciou = iou - rho2 / c2 - alpha * v if c2 > 0 else iou
+    return float(iou), float(giou), float(ciou)
+
+
+def _box_move_feats(box_new, box_ref, prefix: str) -> dict:
+    """(4) Displacement normalised by the REFERENCE box's own size, plus the
+    bounded box-overlap family."""
+    b1 = np.asarray(box_new, dtype=np.float64)
+    b0 = np.asarray(box_ref, dtype=np.float64)
+    w0, h0 = max(1.0, b0[2] - b0[0]), max(1.0, b0[3] - b0[1])
+    diag = float(np.hypot(w0, h0))
+    m = _box_metrics(b1, b0)
+    iou, giou, ciou = _giou_ciou(b1, b0)
+    a1 = max(1e-6, (b1[2] - b1[0]) * (b1[3] - b1[1]))
+    return {
+        f"{prefix}_corner_l2_rel": m["corner_l2"] / diag,
+        f"{prefix}_center_shift_rel": m["center_shift"] / diag,
+        f"{prefix}_w_delta_rel": m["w_delta"] / w0,
+        f"{prefix}_h_delta_rel": m["h_delta"] / h0,
+        f"{prefix}_box_iou": iou,
+        f"{prefix}_box_giou": giou,
+        f"{prefix}_box_ciou": ciou,
+        f"{prefix}_log_area_ratio": float(np.log(a1 / (w0 * h0))),
+    }
+
+
+def _box_prior_feats(box_orig, orig_hw, prefix: str) -> dict:
+    """(5) The prompt box as a prior on risk, in ORIGINAL pixels."""
+    H, W = orig_hw
+    b = np.asarray(box_orig, dtype=np.float64)
+    w, h = max(1.0, b[2] - b[0]), max(1.0, b[3] - b[1])
+    cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+    return {
+        f"{prefix}_area_frac_img": (w * h) / float(H * W),
+        f"{prefix}_log_aspect": float(np.log(w / h)),
+        f"{prefix}_rel_w": w / float(W),
+        f"{prefix}_rel_h": h / float(H),
+        f"{prefix}_center_off_rel": float(
+            np.hypot(cx - W / 2.0, cy - H / 2.0) / np.hypot(W / 2.0, H / 2.0)),
+        f"{prefix}_touches_border": float(
+            b[0] <= 1 or b[1] <= 1 or b[2] >= W - 1 or b[3] >= H - 1),
+    }
+
+
+def _traj_feats(traj, prefix: str) -> dict:
+    """(6) Shape of the ascent: where the predicted score went and how the box
+    got there. Distances are normalised by the starting box's diagonal."""
+    pred = np.asarray([t["pred_score"] for t in traj], dtype=np.float64)
+    n = len(pred)
+    total = float(pred[-1] - pred[0])
+    out = {
+        f"{prefix}_pred_gain": total,
+        f"{prefix}_pred_max": float(pred.max()),
+        # overshoot: the ascent ended BELOW its own best predicted score
+        f"{prefix}_pred_final_minus_max": float(pred[-1] - pred.max()),
+        f"{prefix}_pred_argmax_frac": float(pred.argmax()) / max(1, n - 1),
+        f"{prefix}_pred_monotone_frac": float((np.diff(pred) >= 0).mean()) if n > 1 else 1.0,
+    }
+    k = min(10, n - 1)
+    out[f"{prefix}_pred_slope_last"] = float((pred[-1] - pred[-1 - k]) / k) if k > 0 else 0.0
+    out[f"{prefix}_pred_slope_first"] = float((pred[k] - pred[0]) / k) if k > 0 else 0.0
+    # how early 99% of the total predicted gain was already banked
+    if total > 1e-9:
+        out[f"{prefix}_plateau_frac"] = float(
+            np.argmax(pred >= pred[0] + 0.99 * total)) / max(1, n - 1)
+    else:
+        out[f"{prefix}_plateau_frac"] = 0.0
+
+    boxes = np.asarray([t["box"] for t in traj], dtype=np.float64) if "box" in traj[0] else None
+    if boxes is not None and n > 1:
+        b0 = boxes[0]
+        diag = float(np.hypot(max(1.0, b0[2] - b0[0]), max(1.0, b0[3] - b0[1])))
+        steps = np.linalg.norm(np.diff(boxes, axis=0), axis=1)
+        path = float(steps.sum())
+        net = float(np.linalg.norm(boxes[-1] - b0))
+        out.update({
+            f"{prefix}_path_len_rel": path / diag,
+            f"{prefix}_net_disp_rel": net / diag,
+            # straightness deficit in [0, 1]: 0 = walked straight, 1 = travelled
+            # a long way and ended up back where it started. NOT path/net --
+            # that ratio blows up exactly at the most-wandering case (net -> 0)
+            # and a guard would have to map it to 0, inverting the feature.
+            f"{prefix}_wander": 1.0 - net / path if path > 1e-6 else 0.0,
+            f"{prefix}_step_max_rel": float(steps.max()) / diag,
+            f"{prefix}_step_last_rel": float(steps[-1]) / diag,
+        })
+    return out
+
+
+def tier2_features(traj, bad_box_1024, grad_box_1024, bon_box_1024, orig_hw) -> dict:
+    """Assemble the tier-2 block (features 4-6) for one case."""
+    f = {}
+    f.update(_box_move_feats(grad_box_1024, bad_box_1024, "t2_grad"))
+    f.update(_box_move_feats(bon_box_1024, bad_box_1024, "t2_bon"))
+    f.update(_box_move_feats(grad_box_1024, bon_box_1024, "t2_gradvbon"))
+    bad_box_o = boxes_to_original(
+        np.asarray(bad_box_1024, dtype=np.float64)[None], orig_hw)[0]
+    f.update(_box_prior_feats(bad_box_o, orig_hw, "t2_box"))
+    f.update(_traj_feats(traj, "t2_traj"))
+    return f
+
+
 def stability_score(box_np, predictor, device, use_mm, head, M, sigma_s, seed):
     """SAIF-style consistency: mean IoU of the candidate mask under M small box
     perturbations. use_mm/head identify the token (use_mm=False -> token-0;
@@ -1280,10 +1421,16 @@ def main():
             # tier-1 gate features: mask-level, GT-free (see tier1_features).
             # The masks are already materialised by the trajectory, so this is
             # cheap next to the ascent itself.
+            orig_hw_now = get_original_size(predictor)
             t1 = tier1_features(
                 extras=grad_extras, undef_mask=undef_mask, bon_mask=bon_mask,
                 bad_box_1024=bad_box_np, grad_box_1024=grad_box,
-                orig_hw=get_original_size(predictor),
+                orig_hw=orig_hw_now,
+            )
+            # tier-2: relative box geometry, box priors, trajectory shape
+            t2 = tier2_features(
+                traj=traj, bad_box_1024=bad_box_np, grad_box_1024=grad_box,
+                bon_box_1024=bon_box, orig_hw=orig_hw_now,
             )
 
             # (B) stability selector: Y boxes x 4 tokens, top-K by pred, re-rank by stability
@@ -1401,6 +1548,7 @@ def main():
                 # from the ground truth or from the reference box -- they are
                 # the target, not features.
                 **t1,
+                **t2,
             })
             n_done += 1
             # running sums, not a mean over `rows` -- recomputing that per case
