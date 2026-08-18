@@ -511,12 +511,6 @@ def _pair_iou(a, b) -> float:
 # geometrically plausible for the box that prompted it.
 # ---------------------------------------------------------------------------
 
-def _mask_dice(a, b) -> float:
-    a = a.bool(); b = b.bool()
-    s = a.sum().item() + b.sum().item()
-    return 2.0 * (a & b).sum().item() / s if s > 0 else 1.0
-
-
 def _boundary_iou(a, b, dilation_ratio: float = 0.02) -> float:
     """IoU restricted to a thin band along each mask's outline (Cheng et al.,
     "Boundary IoU"). Two masks can agree on area while disagreeing on the
@@ -579,7 +573,8 @@ def _head_agreement_feats(masks, preds, prefix: str) -> dict:
     p = np.sort(np.asarray(preds, dtype=np.float64))
     out = {f"{prefix}_head_iou_s{k}": float(v) for k, v in enumerate(ious)}
     out.update({f"{prefix}_head_pred_s{k}": float(v) for k, v in enumerate(p)})
-    out[f"{prefix}_head_iou_min"] = float(ious[0]) if ious else 1.0
+    # no _head_iou_min here: the list is sorted, so it would be _head_iou_s0
+    # verbatim, and an exact duplicate feature only dilutes importances
     out[f"{prefix}_head_iou_mean"] = float(np.mean(ious)) if ious else 1.0
     out[f"{prefix}_head_pred_spread"] = float(p[-1] - p[0]) if p.size else 0.0
     out[f"{prefix}_head_pred_std"] = float(p.std()) if p.size else 0.0
@@ -610,8 +605,9 @@ def tier1_features(extras, undef_mask, bon_mask, bad_box_1024, grad_box_1024,
         # (1) how far the candidates disagree with each other. Two methods that
         # searched independently and landed on the same mask are jointly more
         # trustworthy than two that did not.
+        # (Dice is deliberately absent: 2I/(1+I) is monotone in IoU, so it is
+        # the same feature to a rank statistic and to a tree split.)
         "t1_iou_hsel_grad": _pair_iou(m_hsel, m_grad),
-        "t1_dice_hsel_grad": _mask_dice(m_hsel, m_grad),
         "t1_biou_hsel_grad": _boundary_iou(m_hsel, m_grad),
         "t1_iou_hsel_bon": _pair_iou(m_hsel, bon_mask),
         "t1_iou_grad_bon": _pair_iou(m_grad, bon_mask),
