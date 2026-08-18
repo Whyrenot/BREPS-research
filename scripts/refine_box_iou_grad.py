@@ -95,6 +95,7 @@ def refine_box_by_iou_grad(
     lr: float = 3.0,
     multimask: bool = True,
     gt_tensor: torch.Tensor | None = None,
+    return_extras: bool = False,
 ):
     """Ascend SAM's predicted-IoU w.r.t. the box (cx, cy, w, h).
 
@@ -107,6 +108,13 @@ def refine_box_by_iou_grad(
     Returns (refined_box_1024 tensor, trajectory list[dict]), box back in
     the SAME SAM1-style 1024 frame as the input, regardless of backend.
     Trajectory entry: {step, pred_score, [true_iou], [box] (also 1024-frame)}.
+
+    return_extras: also return a third dict with the raw material the tier-1
+        gate features are built from -- for step 0 (head-select) and the final
+        step: every head's binary mask, every head's predicted IoU, and the
+        argmax head -- plus the argmax-head flip count over the trajectory.
+        Masks are postprocessed to ORIGINAL image resolution, bool, on CPU.
+        Off by default so existing 2-tuple callers keep working.
 
     Portable across three predictor families:
       * SamPredictor (SAM) -- vanilla, as documented above.
@@ -210,7 +218,27 @@ def refine_box_by_iou_grad(
             gt_tensor.unsqueeze(0).unsqueeze(0), mbin.unsqueeze(0).unsqueeze(0)
         ).item()
 
+    def all_head_masks(low_res):
+        """Binary mask of EVERY head at this step (n_heads, H, W) bool on CPU.
+        true_iou_of only materialises the argmax head; head disagreement needs
+        all of them."""
+        outs = []
+        with torch.no_grad():
+            for hh in range(low_res.shape[1]):
+                if is_sam2:
+                    full = transforms.postprocess_masks(
+                        low_res[:, hh:hh + 1].detach(), orig_hw)
+                else:
+                    full = model.postprocess_masks(
+                        low_res[:, hh:hh + 1].detach(),
+                        predictor.input_size, predictor.original_size,
+                    )
+                outs.append((full[0, 0] > thr).cpu())
+        return torch.stack(outs)
+
     traj: list[dict] = []
+    extras: dict = {}
+    heads_seen: list[int] = []
     with torch.enable_grad():
         for step in range(steps + 1):
             box = params_to_box(params)
@@ -235,6 +263,18 @@ def refine_box_by_iou_grad(
                 low_res, iou_pred = mask_decoder(**decoder_kwargs)
             head = int(torch.argmax(iou_pred[0]).item()) if multimask else 0
             score = iou_pred[0, head]
+            heads_seen.append(head)
+            if return_extras and step in (0, steps):
+                snap = {
+                    "masks": all_head_masks(low_res),
+                    "preds": iou_pred[0].detach().cpu().numpy().astype(np.float64),
+                    "head": head,
+                }
+                # steps=0 makes these the same step; both keys must still be set
+                if step == 0:
+                    extras["start"] = snap
+                if step == steps:
+                    extras["final"] = snap
 
             rec = {"step": step, "pred_score": float(score.item()), "head": head}
             if gt_tensor is not None:
@@ -252,6 +292,10 @@ def refine_box_by_iou_grad(
     final_box = params_to_box(params).detach()
     if is_sam2:
         final_box = sam2_box_to_1024(final_box)
+    if return_extras:
+        extras["head_flips"] = sum(
+            1 for a, b in zip(heads_seen, heads_seen[1:]) if a != b)
+        return final_box, traj, extras
     return final_box, traj
 
 
@@ -446,6 +490,148 @@ def _pair_iou(a, b) -> float:
     a = a.bool(); b = b.bool()
     inter = (a & b).sum().item(); union = (a | b).sum().item()
     return inter / union if union > 0 else 1.0
+
+
+# ---------------------------------------------------------------------------
+# tier-1 gate features
+#
+# Features for a downstream gate ("did this defence help or hurt?") that must
+# be computable at INFERENCE time. Everything here is derived from the
+# candidate masks, their predicted IoUs and the prompt box -- never from the
+# ground truth and never from best_box (the reference/un-attacked box is
+# GT-derived, so *_dist_best and clean_* are LEAKAGE and must stay out of any
+# training matrix).
+#
+# The design rationale: scalars derived from the predicted-IoU head are close
+# to exhausted as a signal, so these features deliberately measure things the
+# head does not see -- how far the candidates DISAGREE with each other, how
+# far the multimask heads disagree among themselves, and whether the mask is
+# geometrically plausible for the box that prompted it.
+# ---------------------------------------------------------------------------
+
+def _mask_dice(a, b) -> float:
+    a = a.bool(); b = b.bool()
+    s = a.sum().item() + b.sum().item()
+    return 2.0 * (a & b).sum().item() / s if s > 0 else 1.0
+
+
+def _boundary_iou(a, b, dilation_ratio: float = 0.02) -> float:
+    """IoU restricted to a thin band along each mask's outline (Cheng et al.,
+    "Boundary IoU"). Two masks can agree on area while disagreeing on the
+    contour -- plain IoU hides exactly that."""
+    an = a.numpy().astype(np.uint8); bn = b.numpy().astype(np.uint8)
+    if an.sum() == 0 and bn.sum() == 0:
+        return 1.0
+    if an.sum() == 0 or bn.sum() == 0:
+        return 0.0
+    h, w = an.shape
+    d = max(1, int(round(dilation_ratio * float(np.hypot(h, w)))))
+    # one erode with a (2d+1) kernel instead of d iterations of 3x3: same band,
+    # one pass -- this runs per case, so the constant matters
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (2 * d + 1, 2 * d + 1))
+    ab = an - cv2.erode(an, k)
+    bb = bn - cv2.erode(bn, k)
+    inter = float(np.logical_and(ab, bb).sum())
+    union = float(np.logical_or(ab, bb).sum())
+    return inter / union if union > 0 else 1.0
+
+
+def _mask_shape_feats(mask, box_orig, prefix: str) -> dict:
+    """Is this mask geometrically plausible for the box that prompted it?
+    Catches the two failure modes plain IoU-vs-GT would show but a gate cannot
+    see: the mask drifting onto a neighbouring object (frac_outside_box), and
+    the mask shattering (n_components / largest_cc_frac)."""
+    m = mask.numpy().astype(np.uint8)
+    H, W = m.shape
+    area = float(m.sum())
+    x0, y0, x1, y1 = (float(v) for v in box_orig)
+    box_area = max(1.0, (x1 - x0)) * max(1.0, (y1 - y0))
+    xi0, yi0 = max(0, int(np.floor(x0))), max(0, int(np.floor(y0)))
+    xi1, yi1 = min(W, int(np.ceil(x1))), min(H, int(np.ceil(y1)))
+    inside = float(m[yi0:yi1, xi0:xi1].sum()) if (xi1 > xi0 and yi1 > yi0) else 0.0
+    if area > 0:
+        n_cc, lab = cv2.connectedComponents(m, connectivity=8)
+        sizes = np.bincount(lab.ravel())[1:]
+        largest = float(sizes.max()) / area if sizes.size else 0.0
+        n_comp = float(max(0, n_cc - 1))
+    else:
+        largest, n_comp = 0.0, 0.0
+    return {
+        f"{prefix}_area_frac_img": area / float(H * W),
+        f"{prefix}_area_over_box": area / box_area,
+        f"{prefix}_frac_outside_box": (area - inside) / area if area > 0 else 0.0,
+        f"{prefix}_n_components": n_comp,
+        f"{prefix}_largest_cc_frac": largest,
+        f"{prefix}_is_empty": 1.0 if area == 0 else 0.0,
+    }
+
+
+def _head_agreement_feats(masks, preds, prefix: str) -> dict:
+    """Disagreement among the multimask heads at one step. Pairwise mask IoUs
+    and the predicted IoUs are both emitted SORTED, which makes them invariant
+    to which head happens to sit at which index -- the head ordering carries no
+    meaning across cases."""
+    n = int(masks.shape[0])
+    ious = sorted(_pair_iou(masks[i], masks[j])
+                  for i in range(n) for j in range(i + 1, n))
+    p = np.sort(np.asarray(preds, dtype=np.float64))
+    out = {f"{prefix}_head_iou_s{k}": float(v) for k, v in enumerate(ious)}
+    out.update({f"{prefix}_head_pred_s{k}": float(v) for k, v in enumerate(p)})
+    out[f"{prefix}_head_iou_min"] = float(ious[0]) if ious else 1.0
+    out[f"{prefix}_head_iou_mean"] = float(np.mean(ious)) if ious else 1.0
+    out[f"{prefix}_head_pred_spread"] = float(p[-1] - p[0]) if p.size else 0.0
+    out[f"{prefix}_head_pred_std"] = float(p.std()) if p.size else 0.0
+    return out
+
+
+def tier1_features(extras, undef_mask, bon_mask, bad_box_1024, grad_box_1024,
+                   orig_hw) -> dict:
+    """Assemble the tier-1 feature block for one case.
+
+    extras: the third return value of refine_box_by_iou_grad(return_extras=True)
+    undef_mask / bon_mask: bool (H, W) CPU masks of the token-0 and best_of_n
+        candidates, at the same ORIGINAL resolution as the extras masks.
+    bad_box_1024 / grad_box_1024: prompt box before / after the ascent, in this
+        repo's SAM1-style 1024 frame; converted to original pixels here because
+        the masks live in original pixels.
+    """
+    start, final = extras["start"], extras["final"]
+    m_hsel = start["masks"][start["head"]]
+    m_grad = final["masks"][final["head"]]
+
+    bad_box_o = boxes_to_original(np.asarray(bad_box_1024, dtype=np.float64)[None],
+                                  orig_hw)[0]
+    grad_box_o = boxes_to_original(np.asarray(grad_box_1024, dtype=np.float64)[None],
+                                   orig_hw)[0]
+
+    f = {
+        # (1) how far the candidates disagree with each other. Two methods that
+        # searched independently and landed on the same mask are jointly more
+        # trustworthy than two that did not.
+        "t1_iou_hsel_grad": _pair_iou(m_hsel, m_grad),
+        "t1_dice_hsel_grad": _mask_dice(m_hsel, m_grad),
+        "t1_biou_hsel_grad": _boundary_iou(m_hsel, m_grad),
+        "t1_iou_hsel_bon": _pair_iou(m_hsel, bon_mask),
+        "t1_iou_grad_bon": _pair_iou(m_grad, bon_mask),
+        "t1_iou_undef_hsel": _pair_iou(undef_mask, m_hsel),
+        "t1_iou_undef_grad": _pair_iou(undef_mask, m_grad),
+        # (3) geometry change between the two ends of the ascent
+        "t1_area_ratio_grad_hsel": (
+            float(m_grad.sum().item()) / float(m_hsel.sum().item())
+            if m_hsel.sum().item() > 0 else 0.0),
+        # trajectory-level: an argmax head that keeps switching means the
+        # objective is hopping between basins rather than converging
+        "t1_head_flips": float(extras.get("head_flips", 0)),
+        "t1_head_changed": 1.0 if start["head"] != final["head"] else 0.0,
+    }
+    # (2) inter-head disagreement, at both ends of the ascent
+    f.update(_head_agreement_feats(start["masks"], start["preds"], "t1_start"))
+    f.update(_head_agreement_feats(final["masks"], final["preds"], "t1_final"))
+    # (3) shape plausibility of each candidate w.r.t. the box that prompted it
+    f.update(_mask_shape_feats(m_hsel, bad_box_o, "t1_hsel"))
+    f.update(_mask_shape_feats(m_grad, grad_box_o, "t1_grad"))
+    f.update(_mask_shape_feats(bon_mask, bad_box_o, "t1_bon"))
+    return f
 
 
 def stability_score(box_np, predictor, device, use_mm, head, M, sigma_s, seed):
@@ -786,6 +972,15 @@ def parse_args():
     p.add_argument("--model_type", default="vit_b")
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--limit", type=int, default=100, help="0 = all cases")
+    p.add_argument("--sample_images", type=int, default=0,
+                   help="randomly sample this many IMAGES, keeping ALL of each "
+                        "one's annotations. Unlike --limit (which truncates to "
+                        "the first N annotations and, on a dataset ordered by "
+                        "name, would return a single source dataset), this "
+                        "draws across the whole set. 0 = off. Applied after "
+                        "--limit.")
+    p.add_argument("--sample_seed", type=int, default=0,
+                   help="seed for --sample_images, so a subsample is reproducible")
 
     # gradient refinement
     p.add_argument("--steps", type=int, default=20)
@@ -857,6 +1052,21 @@ def parse_args():
     return p.parse_args()
 
 
+def _sample_images(by_image: dict, n: int, seed: int) -> dict:
+    """Keep a random subset of n image stems with ALL of their annotations.
+
+    Sampling at the IMAGE level (not the annotation level) is what keeps the
+    per-image stratification downstream meaningful: every kept image still
+    contributes its full set of boxes.
+    """
+    if n <= 0 or n >= len(by_image):
+        return by_image
+    stems = sorted(by_image)                      # sort first: dict order must
+    rng = np.random.default_rng(seed)             # not leak into the sample
+    keep = set(rng.choice(np.asarray(stems, dtype=object), size=n, replace=False))
+    return {k: v for k, v in by_image.items() if k in keep}
+
+
 def load_tasks(args):
     """Return (by_image dict[stem]->list of raw tasks, images_dir, masks_dir, kind).
 
@@ -874,7 +1084,12 @@ def load_tasks(args):
         by_image = defaultdict(list)
         for r in recs:
             by_image[r.stem].append(r)
-        print(f"Loaded {len(recs)} user masks over {len(by_image)} images from {root}")
+        n_all = len(by_image)
+        by_image = _sample_images(by_image, args.sample_images, args.sample_seed)
+        n_recs = sum(len(v) for v in by_image.values())
+        note = (f" (sampled {len(by_image)}/{n_all} images, seed {args.sample_seed})"
+                if len(by_image) != n_all else "")
+        print(f"Loaded {n_recs} user masks over {len(by_image)} images from {root}{note}")
         return by_image, str(root / "images"), str(root / "masks"), "user_study"
 
     if not args.images_dir or not args.masks_dir:
@@ -886,7 +1101,12 @@ def load_tasks(args):
     by_image = defaultdict(list)
     for c in shifts:
         by_image[c["image_name"]].append(c)
-    print(f"Loaded {len(shifts)} critical-shift cases from {args.critical_shifts}")
+    n_all = len(by_image)
+    by_image = _sample_images(by_image, args.sample_images, args.sample_seed)
+    n_cases = sum(len(v) for v in by_image.values())
+    note = (f" (sampled {len(by_image)}/{n_all} images, seed {args.sample_seed})"
+            if len(by_image) != n_all else "")
+    print(f"Loaded {n_cases} critical-shift cases from {args.critical_shifts}{note}")
     return by_image, args.images_dir, args.masks_dir, "critical_shifts"
 
 
@@ -1041,10 +1261,10 @@ def main():
                 bon_mm_corner = _box_metrics(mm_box, bad_box_np)["corner_l2"]
 
             # gradient refine from bad_box
-            final_box, traj = refine_box_by_iou_grad(
+            final_box, traj, grad_extras = refine_box_by_iou_grad(
                 case["bad_box"], predictor, device,
                 steps=args.steps, lr=args.lr, multimask=args.multimask,
-                gt_tensor=gt_tensor,
+                gt_tensor=gt_tensor, return_extras=True,
             )
             for t in traj:
                 true_by_step[t["step"]].append(t["true_iou"])
@@ -1058,6 +1278,15 @@ def main():
             # step-0 of the trajectory = multimask head-select on bad_box (no grad)
             headsel_iou = traj[0]["true_iou"]
             headsel_pred = traj[0]["pred_score"]
+
+            # tier-1 gate features: mask-level, GT-free (see tier1_features).
+            # The masks are already materialised by the trajectory, so this is
+            # cheap next to the ascent itself.
+            t1 = tier1_features(
+                extras=grad_extras, undef_mask=undef_mask, bon_mask=bon_mask,
+                bad_box_1024=bad_box_np, grad_box_1024=grad_box,
+                orig_hw=get_original_size(predictor),
+            )
 
             # (B) stability selector: Y boxes x 4 tokens, top-K by pred, re-rank by stability
             if args.grad_only:
@@ -1168,6 +1397,12 @@ def main():
                 "undef_dist_best": _box_metrics(bad_box_np, best_box_np)["corner_l2"],
                 "bon_dist_best": _box_metrics(bon_box, best_box_np)["corner_l2"],
                 "grad_dist_best": _box_metrics(grad_box, best_box_np)["corner_l2"],
+                # tier-1 gate features. NB for whoever trains on this CSV:
+                # undefended_iou/headsel_iou/best_of_n_iou/grad_* IoU columns,
+                # every clean_* column and every *_dist_best column are derived
+                # from the ground truth or from the reference box -- they are
+                # the target, not features.
+                **t1,
             })
             n_done += 1
             # running sums, not a mean over `rows` -- recomputing that per case
