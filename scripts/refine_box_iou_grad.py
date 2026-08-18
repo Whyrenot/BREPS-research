@@ -233,7 +233,7 @@ def refine_box_by_iou_grad(
                         low_res[:, hh:hh + 1].detach(),
                         predictor.input_size, predictor.original_size,
                     )
-                outs.append((full[0, 0] > thr).cpu())
+                outs.append((full[0, 0] > thr).bool().cpu())
         return torch.stack(outs)
 
     traj: list[dict] = []
@@ -267,7 +267,9 @@ def refine_box_by_iou_grad(
             if return_extras and step in (0, steps):
                 snap = {
                     "masks": all_head_masks(low_res),
-                    "preds": iou_pred[0].detach().cpu().numpy().astype(np.float64),
+                    # .float() before .numpy(): SAM3 runs the decoder in
+                    # bfloat16 and torch refuses to convert that to numpy
+                    "preds": iou_pred[0].detach().float().cpu().numpy().astype(np.float64),
                     "head": head,
                 }
                 # steps=0 makes these the same step; both keys must still be set
