@@ -305,6 +305,273 @@ def refine_box_by_iou_grad(
 # experiment driver
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# multi-start gradient ascent
+#
+# best_of_n explores box space by random search; the gradient refines one box
+# locally. Multi-start does both: perturb the prompt box into N starts, ascend
+# ALL of them at once, and read the agreement of where they land.
+#
+# Cost is not N x. The image encoder runs once per image (already cached by
+# set_image), so the per-step cost is the decoder alone, and every backend here
+# takes a batch of prompts against one cached embedding -- SAM2/SAM3 via
+# repeat_image=True, SAM1 because its MaskDecoder repeat_interleaves the image
+# embedding across the token batch itself. So N starts cost ONE batched decoder
+# call per step. Full-resolution masks are materialised only at the end.
+#
+# Read the agreement over MASKS, not boxes. Measured on the 500-image run, the
+# box-geometry block (t2: relative displacement, GIoU, CIoU) was worth +0.0007
+# to a downstream guard while the mask-level block (t1) was worth +0.0022, and
+# both top features were mask-agreement terms. A box prompt is coarse: two
+# distant boxes can produce the same mask, and two near ones can straddle a
+# decision boundary.
+#
+# CAUTION, and the first thing to test: over 50 steps the single-start ascent
+# moves the box 41.8 px (corner L2) but closes only 2.6 px of its 70.8 px gap
+# to the reference box, and rho(d_pred, d_true) is 0.165. The fixed point of
+# the ascent is the head's maximum, not the right box -- so N starts may agree
+# by falling into one shared WRONG attractor, in which case agreement measures
+# a common bias rather than correctness. multistart_oracle_iou read against the
+# agreement features is what settles that.
+# ---------------------------------------------------------------------------
+
+def make_starts(box, n: int, seed: int, extra=None) -> np.ndarray:
+    """N starting boxes around `box` ([x0,y0,x1,y1], any one frame).
+
+    Deterministic first: the box as drawn, then symmetric stretch/shrink pairs
+    so the ensemble is not biased towards larger or smaller boxes. The rest are
+    random, with scale and shift RELATIVE to the box's own size -- absolute
+    pixel jitter means something different for a 50 px box and a 500 px one.
+    `extra` (e.g. the best_of_n box) is inserted as an informed start if given.
+    """
+    b = np.asarray(box, dtype=np.float64)
+    cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+    w, h = max(2.0, b[2] - b[0]), max(2.0, b[3] - b[1])
+    S = [(cx, cy, w, h)]
+    if extra is not None:
+        e = np.asarray(extra, dtype=np.float64)
+        S.append(((e[0] + e[2]) / 2, (e[1] + e[3]) / 2,
+                  max(2.0, e[2] - e[0]), max(2.0, e[3] - e[1])))
+    for sw, sh in [(1.5, 1.0), (1 / 1.5, 1.0), (1.0, 1.5), (1.0, 1 / 1.5),
+                   (1.5, 1.5), (1 / 1.5, 1 / 1.5)]:
+        S.append((cx, cy, w * sw, h * sh))
+    rng = np.random.default_rng(seed)
+    while len(S) < n:
+        dx, dy = rng.normal(0, 0.12, 2)
+        sw, sh = np.exp(rng.normal(0, 0.18, 2))
+        S.append((cx + dx * w, cy + dy * h, w * sw, h * sh))
+    S = np.asarray(S[:n], dtype=np.float64)
+    return np.stack([S[:, 0] - S[:, 2] / 2, S[:, 1] - S[:, 3] / 2,
+                     S[:, 0] + S[:, 2] / 2, S[:, 1] + S[:, 3] / 2], axis=1)
+
+
+def _iou_matrix(masks) -> np.ndarray:
+    """Pairwise IoU of a stack of bool masks (N,H,W), as an (N,N) float array."""
+    n = masks.shape[0]
+    flat = masks.reshape(n, -1).float()
+    inter = (flat @ flat.T).numpy().astype(np.float64)
+    area = flat.sum(1).numpy().astype(np.float64)
+    union = area[:, None] + area[None, :] - inter
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(union > 0, inter / np.maximum(union, 1e-9), 1.0)
+
+
+def _cluster(M: np.ndarray, tau: float) -> np.ndarray:
+    """Connected components of the graph 'pairwise IoU >= tau', labels 0..k-1.
+
+    Single-linkage on purpose: two masks belong together if a chain of
+    near-identical masks connects them, which is what "these trajectories
+    landed in the same basin" means.
+    """
+    n = M.shape[0]
+    lab = -np.ones(n, dtype=int)
+    c = 0
+    for i in range(n):
+        if lab[i] >= 0:
+            continue
+        stack, lab[i] = [i], c
+        while stack:
+            j = stack.pop()
+            for k in np.where((M[j] >= tau) & (lab < 0))[0]:
+                lab[k] = c
+                stack.append(int(k))
+        c += 1
+    return lab
+
+
+def refine_boxes_multistart(box_1024, predictor, device, n_starts=8, steps=50,
+                            lr=1.0, multimask=True, gt_tensor=None, seed=0,
+                            extra_start=None):
+    """Ascend the predicted IoU from N perturbed starts simultaneously.
+
+    Returns (out, extras).
+      out    -- candidate true IoUs, or None when gt_tensor is None:
+                best_pred : the start whose FINAL predicted IoU is highest
+                medoid    : medoid mask of the largest agreement cluster
+                vote      : pixel-wise majority vote inside that cluster
+                oracle    : max true IoU over the N endpoints. Not deployable;
+                            it is what says whether more starts buy anything.
+                start0    : the ascent from the user's own box, i.e. the
+                            existing single-start result, for reference.
+      extras -- final boxes/masks/preds, the pairwise IoU matrix, and the
+                agreement feature block t3_*.
+
+    Backend coverage matches refine_box_by_iou_grad: vanilla SAM, SAM2.1/SAM3
+    (no .predict_torch), SAM-HQ (.interm_features). The HQ batch path is the
+    one NOT verified here -- MaskDecoderHQ takes interm_embeddings for a single
+    image and it is unclear that they broadcast across a prompt batch, so
+    multistart on SAM-HQ must be smoke-tested before it is trusted.
+    """
+    model = predictor.model
+    is_sam2 = not hasattr(predictor, "predict_torch")
+    is_samhq = hasattr(predictor, "interm_features")
+    thr = predictor.mask_threshold if is_sam2 else model.mask_threshold
+
+    if is_sam2:
+        prompt_encoder, mask_decoder = model.sam_prompt_encoder, model.sam_mask_decoder
+        transforms = predictor._transforms
+        orig_hw = get_original_size(predictor)
+        feats = predictor._features["image_embed"][-1].unsqueeze(0)
+        high_res = [f[-1].unsqueeze(0) for f in predictor._features["high_res_feats"]]
+    else:
+        prompt_encoder, mask_decoder = model.prompt_encoder, model.mask_decoder
+        transforms, high_res = None, None
+        orig_hw = get_original_size(predictor)
+        feats = predictor.features
+    image_pe = prompt_encoder.get_dense_pe()
+
+    starts_1024 = make_starts(box_1024, n_starts, seed, extra_start)
+    if is_sam2:
+        so = boxes_to_original(starts_1024, orig_hw)
+        st = torch.as_tensor(so, dtype=torch.float32, device=device)
+        b0 = transforms.transform_boxes(st, normalize=True, orig_hw=orig_hw).reshape(-1, 4)
+    else:
+        b0 = torch.as_tensor(starts_1024, dtype=torch.float32, device=device)
+    N = int(b0.shape[0])
+
+    cx = (b0[:, 0] + b0[:, 2]) / 2
+    cy = (b0[:, 1] + b0[:, 3]) / 2
+    w = (b0[:, 2] - b0[:, 0]).clamp(min=2.0)
+    h = (b0[:, 3] - b0[:, 1]).clamp(min=2.0)
+    params = torch.stack([cx, cy, w, h], dim=1).detach().clone().requires_grad_(True)
+    opt = torch.optim.Adam([params], lr=lr)
+
+    def to_boxes(p):
+        ww, hh = p[:, 2].clamp(min=2.0), p[:, 3].clamp(min=2.0)
+        return torch.stack([p[:, 0] - ww / 2, p[:, 1] - hh / 2,
+                            p[:, 0] + ww / 2, p[:, 1] + hh / 2], dim=1)
+
+    def forward(boxes):
+        if is_sam2:
+            labels = torch.tensor([[2, 3]], dtype=torch.int,
+                                  device=boxes.device).repeat(boxes.shape[0], 1)
+            sparse, dense = prompt_encoder(points=(boxes.reshape(-1, 2, 2), labels),
+                                           boxes=None, masks=None)
+        else:
+            sparse, dense = prompt_encoder(points=None, boxes=boxes, masks=None)
+        kw = dict(image_embeddings=feats, image_pe=image_pe,
+                  sparse_prompt_embeddings=sparse, dense_prompt_embeddings=dense,
+                  multimask_output=multimask)
+        if is_sam2:
+            # one cached embedding, N prompts -- the decoder expands it
+            res = mask_decoder(**kw, repeat_image=boxes.shape[0] > 1,
+                               high_res_features=high_res)
+            return res[0], res[1]
+        if is_samhq:
+            return mask_decoder(**kw, hq_token_only=False,
+                                interm_embeddings=predictor.interm_features)
+        # SAM1's MaskDecoder repeat_interleaves image_embeddings across tokens
+        return mask_decoder(**kw)
+
+    pred_traj = []
+    with torch.enable_grad():
+        for step in range(steps + 1):
+            low_res, iou_pred = forward(to_boxes(params))
+            heads = (iou_pred.argmax(1) if multimask
+                     else torch.zeros(N, dtype=torch.long, device=iou_pred.device))
+            scores = iou_pred[torch.arange(N, device=iou_pred.device), heads]
+            pred_traj.append(scores.detach().float().cpu().numpy())
+            if step == steps:
+                break
+            opt.zero_grad()
+            # the N starts share no parameters, so one summed backward gives
+            # each of them its own independent gradient -- same as N separate
+            # ascents, at the cost of one batched pass
+            (-scores.sum()).backward()
+            opt.step()
+
+    final_boxes = to_boxes(params).detach()
+    with torch.no_grad():
+        outs = []
+        for i in range(N):
+            hi = int(heads[i].item())
+            if is_sam2:
+                full = transforms.postprocess_masks(low_res[i:i + 1, hi:hi + 1], orig_hw)
+            else:
+                full = model.postprocess_masks(low_res[i:i + 1, hi:hi + 1],
+                                               predictor.input_size,
+                                               predictor.original_size)
+            outs.append((full[0, 0] > thr).bool().cpu())
+        masks = torch.stack(outs)
+    preds = scores.detach().float().cpu().numpy()
+
+    if is_sam2:
+        H, W = orig_hw
+        scale = torch.tensor([W, H, W, H], dtype=torch.float32,
+                             device=final_boxes.device)
+        bo = (final_boxes / transforms.resolution * scale).cpu().numpy()
+        final_1024 = original_to_1024(bo, orig_hw)
+    else:
+        final_1024 = final_boxes.cpu().numpy()
+
+    M = _iou_matrix(masks)
+    off = ~np.eye(N, dtype=bool)
+    lab = _cluster(M, 0.90)
+    sizes = np.bincount(lab)
+    big = int(sizes.argmax())
+    idx = np.where(lab == big)[0]
+    # medoid: the member agreeing most with the rest of its own cluster
+    medoid = int(idx[int(np.argmax(M[np.ix_(idx, idx)].sum(1)))])
+    vote = (masks[idx].float().mean(0) > 0.5)
+
+    b1 = np.asarray(box_1024, dtype=np.float64)
+    bdiag = float(np.hypot(max(1.0, b1[2] - b1[0]), max(1.0, b1[3] - b1[1])))
+    bc = np.stack([(final_1024[:, 0] + final_1024[:, 2]) / 2,
+                   (final_1024[:, 1] + final_1024[:, 3]) / 2], axis=1)
+    t3 = {
+        "t3_conv_iou_mean": float(M[off].mean()),
+        "t3_conv_iou_min": float(M[off].min()),
+        "t3_conv_iou_std": float(M[off].std()),
+        "t3_n_clusters_90": float(sizes.size),
+        "t3_n_clusters_80": float(np.bincount(_cluster(M, 0.80)).size),
+        "t3_largest_cluster_frac": float(sizes.max() / N),
+        "t3_medoid_agree": float(M[medoid, idx].mean()),
+        "t3_pred_mean": float(preds.mean()),
+        "t3_pred_std": float(preds.std()),
+        "t3_pred_max": float(preds.max()),
+        # box-level spread, kept ONLY so it can be compared against the
+        # mask-level terms rather than assumed equivalent to them
+        "t3_box_center_spread": float(
+            np.linalg.norm(bc - bc.mean(0), axis=1).mean() / bdiag),
+        "t3_start0_in_big": float(lab[0] == big),
+    }
+    extras = {"boxes_1024": final_1024, "masks": masks, "preds": preds,
+              "iou_matrix": M, "labels": lab, "medoid": medoid,
+              "pred_traj": np.stack(pred_traj), "t3": t3}
+
+    out = None
+    if gt_tensor is not None:
+        tv = np.array([_iou(gt_tensor, masks[i]) for i in range(N)])
+        out = {"multistart_best_pred_iou": float(tv[int(preds.argmax())]),
+               "multistart_medoid_iou": float(tv[medoid]),
+               "multistart_vote_iou": float(_iou(gt_tensor, vote)),
+               "multistart_oracle_iou": float(tv.max()),
+               "multistart_start0_iou": float(tv[0]),
+               "multistart_n": float(N)}
+        extras["true_ious"] = tv
+    return out, extras
+
+
 def _load_gt(mask_path, predictor) -> torch.Tensor:
     gt = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
     if gt is None:
@@ -1111,6 +1378,15 @@ def parse_args():
     p.add_argument("--model_type", default="vit_b")
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--limit", type=int, default=100, help="0 = all cases")
+    p.add_argument("--multistart", type=int, default=0,
+                   help="N starting boxes for the batched multi-start ascent "
+                        "(0 = off). The N starts go through the decoder in ONE "
+                        "batched call per step against the cached image "
+                        "embedding, so this costs far less than N separate "
+                        "ascents. Adds the multistart_* candidates and the "
+                        "t3_* agreement features.")
+    p.add_argument("--multistart_seed", type=int, default=0,
+                   help="seed for the random half of the multi-start set")
     p.add_argument("--sample_images", type=int, default=0,
                    help="randomly sample this many IMAGES, keeping ALL of each "
                         "one's annotations. Unlike --limit (which truncates to "
@@ -1427,6 +1703,20 @@ def main():
                 bad_box_1024=bad_box_np, grad_box_1024=grad_box,
                 orig_hw=orig_hw_now,
             )
+            # multi-start: N perturbed starts ascended together, then the
+            # agreement of where they landed. bon's chosen box goes in as an
+            # informed start -- it is already computed.
+            if args.multistart > 0:
+                ms_out, ms_ex = refine_boxes_multistart(
+                    case["bad_box"], predictor, device, n_starts=args.multistart,
+                    steps=args.steps, lr=args.lr, multimask=args.multimask,
+                    gt_tensor=gt_tensor, seed=args.multistart_seed,
+                    extra_start=bon_box,
+                )
+                ms = {**ms_out, **ms_ex["t3"]}
+            else:
+                ms = {}
+
             # tier-2: relative box geometry, box priors, trajectory shape
             t2 = tier2_features(
                 traj=traj, bad_box_1024=bad_box_np, grad_box_1024=grad_box,
@@ -1542,13 +1832,15 @@ def main():
                 "undef_dist_best": _box_metrics(bad_box_np, best_box_np)["corner_l2"],
                 "bon_dist_best": _box_metrics(bon_box, best_box_np)["corner_l2"],
                 "grad_dist_best": _box_metrics(grad_box, best_box_np)["corner_l2"],
-                # tier-1 gate features. NB for whoever trains on this CSV:
+                # gate features. NB for whoever trains on this CSV:
                 # undefended_iou/headsel_iou/best_of_n_iou/grad_* IoU columns,
-                # every clean_* column and every *_dist_best column are derived
-                # from the ground truth or from the reference box -- they are
-                # the target, not features.
+                # every clean_* column, every *_dist_best column and every
+                # multistart_*_iou column are derived from the ground truth or
+                # from the reference box -- they are the target, not features.
+                # The feature blocks are exactly t1_*, t2_* and t3_*.
                 **t1,
                 **t2,
+                **ms,
             })
             n_done += 1
             # running sums, not a mean over `rows` -- recomputing that per case
@@ -1657,6 +1949,21 @@ def main():
     print(f"  grad (final)             true IoU : {df['grad_final_iou'].mean():.4f}"
           f"   (pred {df['grad_final_pred'].mean():.4f})")
     print(f"  grad (best/traj)         true IoU : {df['grad_best_iou'].mean():.4f}  (early-stop oracle)")
+    if "multistart_n" in df.columns and df["multistart_n"].notna().any():
+        print()
+        print(f"  --- multi-start (N={int(df['multistart_n'].mean())}) ---")
+        for col, lbl in [("multistart_start0_iou", "start0 (user box, = single-start grad)"),
+                         ("multistart_best_pred_iou", "pick best predicted IoU"),
+                         ("multistart_medoid_iou", "medoid of largest cluster"),
+                         ("multistart_vote_iou", "majority vote inside cluster"),
+                         ("multistart_oracle_iou", "ORACLE max over starts")]:
+            print(f"  {lbl:<40} {df[col].mean():.4f}")
+        print(f"  mean pairwise mask IoU across starts     {df['t3_conv_iou_mean'].mean():.4f}")
+        print(f"  mean largest-cluster fraction            {df['t3_largest_cluster_frac'].mean():.4f}")
+        # the premise under test: does agreement track being right?
+        agree = df["t3_conv_iou_mean"]
+        for col, lbl in [("multistart_medoid_iou", "medoid"), ("multistart_oracle_iou", "oracle")]:
+            print(f"  Spearman(agreement, {lbl:<7} true IoU)  {_spearman(agree, df[col]):+.4f}")
     print(f"  grad - undef            : {df['grad_vs_undef'].mean():+.4f}")
     print(f"  grad - best_of_n        : {df['grad_vs_bon'].mean():+.4f}")
     print(f"  grad beats best_of_n in : {(df['grad_final_iou'] > df['best_of_n_iou']).mean():.1%} of cases")
