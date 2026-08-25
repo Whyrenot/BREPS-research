@@ -43,6 +43,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import signal
 import sys
@@ -401,7 +402,7 @@ def _cluster(M: np.ndarray, tau: float) -> np.ndarray:
 
 def refine_boxes_multistart(box_1024, predictor, device, n_starts=8, steps=50,
                             lr=1.0, multimask=True, gt_tensor=None, seed=0,
-                            extra_start=None):
+                            extra_start=None, checkpoint_every=0):
     """Ascend the predicted IoU from N perturbed starts simultaneously.
 
     Returns (out, extras).
@@ -413,8 +414,22 @@ def refine_boxes_multistart(box_1024, predictor, device, n_starts=8, steps=50,
                             it is what says whether more starts buy anything.
                 start0    : the ascent from the user's own box, i.e. the
                             existing single-start result, for reference.
-      extras -- final boxes/masks/preds, the pairwise IoU matrix, and the
-                agreement feature block t3_*.
+      extras -- final boxes/masks/preds, the pairwise IoU matrix, the
+                agreement block t3_*, and (when checkpoint_every > 0)
+                extras["cand_rows"]: one row per (start, checkpoint) carrying
+                CAUSAL features and that candidate's true IoU.
+
+    checkpoint_every: score every k-th step as well as the last, turning one
+        ascent into a pool of n_starts x n_checkpoints candidates so a ranker
+        can choose the start AND the stopping point in one decision. Perfect
+        step selection alone is worth +0.0143 mean IoU (grad_best 0.7932 vs
+        grad_final 0.7790 over 500 images), independent of the
+        candidate-selection headroom.
+
+        Only the TARGET needs a full-resolution mask; every feature is read off
+        the 256px logits, which cost nothing extra. A deployed ranker therefore
+        needs no postprocessing per checkpoint at all -- the expense here buys
+        labels, not predictions.
 
     Backend coverage matches refine_box_by_iou_grad: vanilla SAM, SAM2.1/SAM3
     (no .predict_torch), SAM-HQ (.interm_features). The HQ batch path is the
@@ -483,6 +498,24 @@ def refine_boxes_multistart(box_1024, predictor, device, n_starts=8, steps=50,
         # SAM1's MaskDecoder repeat_interleaves image_embeddings across tokens
         return mask_decoder(**kw)
 
+    # the low-res logits cover the model's own square input frame, so a box in
+    # that frame maps into low-res pixels by this factor
+    frame = float(transforms.resolution) if is_sam2 else 1024.0
+
+    def full_mask(lr_row, head):
+        if is_sam2:
+            full = transforms.postprocess_masks(lr_row[:, head:head + 1], orig_hw)
+        else:
+            full = model.postprocess_masks(lr_row[:, head:head + 1],
+                                           predictor.input_size,
+                                           predictor.original_size)
+        return (full[0, 0] > thr).bool().cpu()
+
+    def want_ckpt(k):
+        return checkpoint_every > 0 and (k % checkpoint_every == 0 or k == steps)
+
+    cand_rows, pred_hist = [], []
+
     pred_traj = []
     with torch.enable_grad():
         for step in range(steps + 1):
@@ -491,6 +524,60 @@ def refine_boxes_multistart(box_1024, predictor, device, n_starts=8, steps=50,
                      else torch.zeros(N, dtype=torch.long, device=iou_pred.device))
             scores = iou_pred[torch.arange(N, device=iou_pred.device), heads]
             pred_traj.append(scores.detach().float().cpu().numpy())
+            pred_hist.append(iou_pred.detach().float().cpu().numpy())
+
+            if want_ckpt(step):
+                with torch.no_grad():
+                    ar = torch.arange(N, device=low_res.device)
+                    # features off the 256px logits: free, and agreement at low
+                    # resolution is a faithful proxy for agreement at full
+                    lowm = (low_res[ar, heads] > thr).bool().cpu()
+                    Mk = _iou_matrix(lowm)
+                    labk = _cluster(Mk, 0.90)
+                    sizek = np.bincount(labk)
+                    bxk = to_boxes(params).detach().cpu().numpy()
+                    ipk = pred_hist[-1]
+                    lo = float(low_res.shape[-1]) / frame
+                    b0np = b0.detach().cpu().numpy()
+                    for i in range(N):
+                        pk = ipk[i]
+                        hi = int(heads[i])
+                        w = min(10, step)
+                        row = {
+                            "start": i, "step": step,
+                            "step_frac": step / max(1, steps),
+                            "is_start0": float(i == 0),
+                            "c_pred": float(pk[hi]),
+                            "c_pred_start": float(pred_hist[0][i].max()),
+                            "c_head": float(hi),
+                            "c_head_switched": float(
+                                hi != int(np.argmax(pred_hist[0][i]))),
+                            "c_head_pred_spread": float(pk.max() - pk.min()),
+                            "c_head_pred_std": float(pk.std()),
+                        }
+                        row["c_pred_gain"] = row["c_pred"] - row["c_pred_start"]
+                        row["c_pred_slope"] = (
+                            (row["c_pred"] - float(pred_hist[step - w][i].max())) / w
+                            if w > 0 else 0.0)
+                        oth = np.delete(Mk[i], i)
+                        row["c_agree_mean"] = float(oth.mean())
+                        row["c_agree_min"] = float(oth.min())
+                        row["c_agree_max"] = float(oth.max())
+                        row["c_agree_start0"] = float(Mk[i, 0])
+                        row["c_cluster_frac"] = float(sizek[labk[i]] / N)
+                        row["c_n_clusters"] = float(sizek.size)
+                        row.update(_mask_shape_feats(lowm[i], bxk[i] * lo, "c"))
+                        bi, bg, _ = _giou_ciou(bxk[i], b0np[i])
+                        row["c_box_iou_own_start"] = bi
+                        row["c_box_giou_own_start"] = bg
+                        bi0, bg0, _ = _giou_ciou(bxk[i], b0np[0])
+                        row["c_box_iou_user"] = bi0
+                        row["c_box_giou_user"] = bg0
+                        if gt_tensor is not None:
+                            row["target_iou"] = _iou(
+                                gt_tensor, full_mask(low_res[i:i + 1], hi))
+                        cand_rows.append(row)
+
             if step == steps:
                 break
             opt.zero_grad()
@@ -557,7 +644,8 @@ def refine_boxes_multistart(box_1024, predictor, device, n_starts=8, steps=50,
     }
     extras = {"boxes_1024": final_1024, "masks": masks, "preds": preds,
               "iou_matrix": M, "labels": lab, "medoid": medoid,
-              "pred_traj": np.stack(pred_traj), "t3": t3}
+              "pred_traj": np.stack(pred_traj), "t3": t3,
+              "cand_rows": cand_rows}
 
     out = None
     if gt_tensor is not None:
@@ -1387,6 +1475,15 @@ def parse_args():
                         "t3_* agreement features.")
     p.add_argument("--multistart_seed", type=int, default=0,
                    help="seed for the random half of the multi-start set")
+    p.add_argument("--checkpoint_every", type=int, default=0,
+                   help="with --multistart, also score every k-th step, turning "
+                        "the run into a pool of n_starts x n_checkpoints "
+                        "candidates. Only useful with --dump_candidates.")
+    p.add_argument("--dump_candidates", default=None,
+                   help="long-format CSV, one row per (case, start, checkpoint): "
+                        "causal features plus target_iou. Written incrementally "
+                        "-- at 8 starts x 11 checkpoints a 12500-case run is "
+                        "~1.1M rows, too much to hold in memory.")
     p.add_argument("--sample_images", type=int, default=0,
                    help="randomly sample this many IMAGES, keeping ALL of each "
                         "one's annotations. Unlike --limit (which truncates to "
@@ -1593,6 +1690,13 @@ def main():
     n_done = 0
     run_undef = run_grad = 0.0
     stopped_early = False
+
+    # long-format candidate dump, appended per case rather than accumulated
+    cand_fh = cand_writer = None
+    if args.dump_candidates:
+        Path(args.dump_candidates).parent.mkdir(parents=True, exist_ok=True)
+        cand_fh = open(args.dump_candidates, "w", newline="", encoding="utf-8")
+
     pbar = tqdm(total=sum(len(v) for v in by_image.values()),
                 desc=f"{args.model_name} cases", unit="case", dynamic_ncols=True)
     for image_name, raw_tasks in by_image.items():
@@ -1712,8 +1816,20 @@ def main():
                     steps=args.steps, lr=args.lr, multimask=args.multimask,
                     gt_tensor=gt_tensor, seed=args.multistart_seed,
                     extra_start=bon_box,
+                    checkpoint_every=args.checkpoint_every,
                 )
                 ms = {**ms_out, **ms_ex["t3"]}
+                if cand_fh is not None and ms_ex["cand_rows"]:
+                    ident = {"image_name": image_name,
+                             "kind": case.get("kind", ""),
+                             "user": case.get("user", ""),
+                             "attempt": case.get("attempt", "")}
+                    out_rows = [{**ident, **r} for r in ms_ex["cand_rows"]]
+                    if cand_writer is None:
+                        cand_writer = csv.DictWriter(cand_fh,
+                                                     fieldnames=list(out_rows[0]))
+                        cand_writer.writeheader()
+                    cand_writer.writerows(out_rows)
             else:
                 ms = {}
 
@@ -1855,6 +1971,9 @@ def main():
             break
 
     pbar.close()
+    if cand_fh is not None:
+        cand_fh.close()
+        print(f"Saved candidate dump -> {args.dump_candidates}")
     if stopped_early:
         print(f"[stop] interrupted after {n_done} cases -- writing PARTIAL results "
               f"to {args.out_csv} and the report below.", file=sys.stderr, flush=True)
