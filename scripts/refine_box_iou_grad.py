@@ -717,6 +717,49 @@ def best_of_n_batched(bad_box, predictor, device, Y, sigma, sigma_center,
     return masks[best, 0].cpu(), float(scores[best, 0].item()), perturbed[best].cpu().numpy()
 
 
+def smooth_batched(bad_box, predictor, device, Y, sigma, sigma_center,
+                   perturb_mode, seed, mode="sigmoid"):
+    """Randomized smoothing over the PROMPT box, in one batched call.
+
+    Same candidate boxes as best_of_n_batched -- same sampler, same seed -- so
+    the two differ only in how the Y predictions are combined. best_of_n PICKS
+    one candidate mask by predicted IoU; these modes COMBINE all Y, which makes
+    the output an expectation over the prompt distribution rather than a
+    selection from it. That distinction is the point: selection inherits the
+    variance of the prompt, averaging integrates it out.
+
+    Returns (mask bool (H,W), mean candidate score, base box) or None when the
+    backend cannot batch, in which case the caller should fall back to
+    _predict_smoothed_box.
+
+    mode: "sigmoid" averages probabilities, "logit" averages logits before the
+    sigmoid, "binary" is a per-pixel majority vote. All threshold at 0.5, and
+    all match heatmaps.defend_critical_shifts._predict_smoothed_box.
+    """
+    sam_h, sam_w = getattr(predictor, "input_size", (1024, 1024))
+    base = torch.as_tensor(bad_box, dtype=torch.float32)
+    if perturb_mode == "size_center":
+        perturbed = sample_size_and_center_perturbed_boxes(
+            base, (sam_h, sam_w), Y, sigma, sigma, sigma_center, sigma_center, seed)
+    else:
+        perturbed = sample_size_perturbed_boxes(base, (sam_h, sam_w), Y, sigma, sigma, seed)
+
+    out = _predict_boxes_batched(perturbed.float().to(device), predictor,
+                                 False, return_logits=True)
+    if out is None:
+        return None
+    logits, scores = out                       # (Y,1,H,W), (Y,1)
+    if mode == "logit":
+        m = torch.sigmoid(logits.mean(dim=0)) > 0.5
+    elif mode == "binary":
+        m = (logits > 0.0).float().mean(dim=0) > 0.5
+    else:
+        m = torch.sigmoid(logits).mean(dim=0) > 0.5
+    # averaging elects no candidate box, so the prompt box is what the
+    # displacement metrics are measured against -- they are zero by definition
+    return m[0].bool(), float(scores[:, 0].mean()), np.asarray(bad_box, dtype=np.float64)
+
+
 def best_of_n_multimask(bad_box, predictor, device, Y, sigma, sigma_center, perturb_mode, seed):
     """best_of_n that searches over BOTH perturbed boxes AND the 3 multimask
     heads: pick the (box, head) with the highest predicted IoU.
@@ -769,7 +812,7 @@ def best_of_n_multimask(bad_box, predictor, device, Y, sigma, sigma_center, pert
 # SAIF-style stability  (methods A / B / C)
 # ---------------------------------------------------------------------------
 
-def _predict_boxes_batched(boxes_t, predictor, multimask):
+def _predict_boxes_batched(boxes_t, predictor, multimask, return_logits=False):
     """All boxes in ONE decoder call, or None if this backend cannot do it.
 
     SAM2ImagePredictor / SAM3InteractiveImagePredictor have no public
@@ -795,7 +838,12 @@ def _predict_boxes_batched(boxes_t, predictor, multimask):
     bt = torch.as_tensor(np.asarray(boxes_np, dtype=np.float32), device=device)
     unnorm = transforms.transform_boxes(bt, normalize=True, orig_hw=orig_hw).reshape(-1, 4)
     masks, scores, _ = pred_fn(None, None, boxes=unnorm,
-                               multimask_output=multimask, return_logits=False)
+                               multimask_output=multimask,
+                               return_logits=return_logits)
+    if return_logits:
+        # raw logits: needed to average PROBABILITIES across perturbations,
+        # which cannot be recovered from thresholded masks
+        return masks.float().cpu(), scores.float().cpu()
     return masks.bool().cpu(), scores.float().cpu()
 
 
@@ -1505,6 +1553,15 @@ def parse_args():
     p.add_argument("--sigma", type=float, default=0.05)
     p.add_argument("--sigma_center", type=float, default=0.03)
     p.add_argument("--perturb_mode", default="size", choices=["size", "size_center"])
+    p.add_argument("--averaging_mode", default="best_of_n",
+                   choices=["best_of_n", "sigmoid", "logit", "binary"],
+                   help="how the Y prompt perturbations are combined into the "
+                        "'bon' slot. best_of_n PICKS the candidate with the "
+                        "highest predicted IoU; sigmoid/logit/binary AVERAGE "
+                        "all Y, making the output an expectation over the "
+                        "prompt distribution instead of a selection from it. "
+                        "The candidate boxes are identical either way, so the "
+                        "comparison isolates the aggregation.")
 
     # SAIF-style stability (methods A/B/C)
     p.add_argument("--K", type=int, default=5,
@@ -1750,7 +1807,15 @@ def main():
             # best_of_n defence (with scores -> chosen box & its predicted IoU).
             # --fast takes the batched route: same candidate boxes (same
             # sampler, same seed), one forward instead of Y.
-            if args.fast:
+            smoothed = None
+            if args.averaging_mode != "best_of_n":
+                smoothed = smooth_batched(
+                    case["bad_box"], predictor, device, args.Y, args.sigma,
+                    args.sigma_center, args.perturb_mode, seed=42,
+                    mode=args.averaging_mode)
+            if smoothed is not None:
+                bon_mask, bon_pred, bon_box = smoothed
+            elif args.fast and args.averaging_mode == "best_of_n":
                 bon_mask, bon_pred, bon_box = best_of_n_batched(
                     case["bad_box"], predictor, device, args.Y, args.sigma,
                     args.sigma_center, args.perturb_mode, seed=42)
@@ -1758,7 +1823,7 @@ def main():
                 bon_mask, bon_perturbed, bon_scores, bon_best_idx = _predict_smoothed_box(
                     bad_box=bad_box, image_shape=(sam_h, sam_w), predictor=predictor,
                     rank=device, Y=args.Y, sigma_w=args.sigma, sigma_h=args.sigma,
-                    averaging_mode="best_of_n", sigma_cx=args.sigma_center,
+                    averaging_mode=args.averaging_mode, sigma_cx=args.sigma_center,
                     sigma_cy=args.sigma_center, perturb_mode=args.perturb_mode, seed=42,
                     return_scores=True,
                 )
@@ -2138,6 +2203,40 @@ def main():
 
     # stratify by initial (undefended) quality -> does it help the WEAK ones?
     q = df["undefended_iou"]
+    # Within-image groups: rank each image's cases by head-select IoU and cut
+    # 20/60/20. Unlike the absolute cut below, every image contributes the same
+    # proportion to every group, so the groups mean the same thing across runs
+    # and across models -- see scripts/regroup_by_image_rank.py for why the
+    # absolute cut is not comparable.
+    print("\n  --- stratified WITHIN image by head-select rank (20/60/20) ---")
+    _wg = np.empty(len(df), dtype=object)
+    for _, _g in df.groupby("image_name", sort=False):
+        _o = _g["headsel_iou"].sort_values(kind="mergesort").index
+        _n = len(_o)
+        _a, _b = int(round(0.2 * _n)), int(round(0.8 * _n))
+        for _nm, _ix in (("weak", _o[:_a]), ("mid", _o[_a:_b]), ("strong", _o[_b:])):
+            _wg[df.index.get_indexer(_ix)] = _nm
+    _cols = [("undef", "undefended_iou"), ("headsel", "headsel_iou"),
+             (args.averaging_mode[:9], "best_of_n_iou"),
+             ("grad", "grad_final_iou"), ("gradBest", "grad_best_iou")]
+    _cols = [(l, c) for l, c in _cols if c in df.columns and df[c].notna().any()]
+    _hdr = (f"  {'group':>7} | {'n':>5} | "
+            + " | ".join(f"{l:>9}" for l, _ in _cols)
+            + f" | {'smooth-hsel':>19} | {'grad-hsel':>19}")
+    print(_hdr)
+    print("  " + "-" * (len(_hdr) - 2))
+    for _nm in ("weak", "mid", "strong"):
+        _sub = df[_wg == _nm]
+        if _sub.empty:
+            continue
+        _h = _sub["headsel_iou"].mean()
+        _sm = _sub["best_of_n_iou"].mean() - _h
+        _gr = _sub["grad_final_iou"].mean() - _h
+        print(f"  {_nm:>7} | {len(_sub):>5} | "
+              + " | ".join(f"{_sub[c].mean():>9.4f}" for _, c in _cols)
+              + f" | {_sm:>+8.4f} ({_sm / _h * 100:>+6.2f}%)"
+              + f" | {_gr:>+8.4f} ({_gr / _h * 100:>+6.2f}%)")
+
     print("\n  --- stratified by undefended quality ---")
     for name, mask in (("weak  (undef<0.5)", q < 0.5),
                        ("mid   (0.5-0.8) ", (q >= 0.5) & (q < 0.8)),
