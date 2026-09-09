@@ -560,9 +560,19 @@ def refine_boxes_multistart(box_1024, predictor, device, n_starts=8, steps=50,
                             (row["c_pred"] - float(pred_hist[step - w][i].max())) / w
                             if w > 0 else 0.0)
                         oth = np.delete(Mk[i], i)
-                        row["c_agree_mean"] = float(oth.mean())
-                        row["c_agree_min"] = float(oth.min())
-                        row["c_agree_max"] = float(oth.max())
+                        if oth.size:
+                            row["c_agree_mean"] = float(oth.mean())
+                            row["c_agree_min"] = float(oth.min())
+                            row["c_agree_max"] = float(oth.max())
+                        else:
+                            # n_starts=1 (pure step selection): there is no
+                            # other candidate to agree with. NaN, not 1.0 --
+                            # CatBoost reads it as missing, and a column that
+                            # is entirely missing carries nothing, which is the
+                            # truth here rather than perfect agreement.
+                            row["c_agree_mean"] = float("nan")
+                            row["c_agree_min"] = float("nan")
+                            row["c_agree_max"] = float("nan")
                         row["c_agree_start0"] = float(Mk[i, 0])
                         row["c_cluster_frac"] = float(sizek[labk[i]] / N)
                         row["c_n_clusters"] = float(sizek.size)
@@ -718,8 +728,8 @@ def best_of_n_batched(bad_box, predictor, device, Y, sigma, sigma_center,
 
 
 def smooth_batched(bad_box, predictor, device, Y, sigma, sigma_center,
-                   perturb_mode, seed, mode="sigmoid"):
-    """Randomized smoothing over the PROMPT box, in one batched call.
+                   perturb_mode, seed, mode="sigmoid", chunk=4):
+    """Randomized smoothing over the PROMPT box, reduced in chunks.
 
     Same candidate boxes as best_of_n_batched -- same sampler, same seed -- so
     the two differ only in how the Y predictions are combined. best_of_n PICKS
@@ -727,6 +737,15 @@ def smooth_batched(bad_box, predictor, device, Y, sigma, sigma_center,
     the output an expectation over the prompt distribution rather than a
     selection from it. That distinction is the point: selection inherits the
     variance of the prompt, averaging integrates it out.
+
+    Memory. Averaging needs raw logits, which are float32 at FULL image
+    resolution -- 32x the bytes of the bool masks every other path here uses.
+    Materialising all Y at once and moving them to host RAM costs ~200 MB per
+    case on a 2048x1536 image, allocated and freed 12500 times over a full run.
+    So the reduction runs `chunk` boxes at a time and accumulates on the
+    DEVICE; only the final bool mask crosses to host. Peak float memory is
+    chunk/Y of the naive version plus one accumulator, and host traffic drops
+    by ~32x. Raising `chunk` to Y reproduces the one-shot behaviour.
 
     Returns (mask bool (H,W), mean candidate score, base box) or None when the
     backend cannot batch, in which case the caller should fall back to
@@ -744,20 +763,34 @@ def smooth_batched(bad_box, predictor, device, Y, sigma, sigma_center,
     else:
         perturbed = sample_size_perturbed_boxes(base, (sam_h, sam_w), Y, sigma, sigma, seed)
 
-    out = _predict_boxes_batched(perturbed.float().to(device), predictor,
-                                 False, return_logits=True)
-    if out is None:
+    acc, n_done, score_sum = None, 0, 0.0
+    with torch.no_grad():
+        for s in range(0, int(perturbed.shape[0]), max(1, chunk)):
+            out = _predict_boxes_batched(
+                perturbed[s:s + max(1, chunk)].float().to(device), predictor,
+                False, return_logits=True, to_cpu=False)
+            if out is None:
+                return None
+            logits, scores = out               # (c,1,H,W) on device, (c,1)
+            if mode == "logit":
+                part = logits.sum(dim=0)
+            elif mode == "binary":
+                part = (logits > 0.0).float().sum(dim=0)
+            else:
+                part = torch.sigmoid(logits).sum(dim=0)
+            acc = part if acc is None else acc.add_(part)
+            score_sum += float(scores[:, 0].sum())
+            n_done += int(logits.shape[0])
+            del logits, scores, part
+    if acc is None or n_done == 0:
         return None
-    logits, scores = out                       # (Y,1,H,W), (Y,1)
-    if mode == "logit":
-        m = torch.sigmoid(logits.mean(dim=0)) > 0.5
-    elif mode == "binary":
-        m = (logits > 0.0).float().mean(dim=0) > 0.5
-    else:
-        m = torch.sigmoid(logits).mean(dim=0) > 0.5
+    avg = acc / n_done
+    # "logit" averages before the squashing function, the others after it
+    m = (torch.sigmoid(avg) > 0.5) if mode == "logit" else (avg > 0.5)
     # averaging elects no candidate box, so the prompt box is what the
     # displacement metrics are measured against -- they are zero by definition
-    return m[0].bool(), float(scores[:, 0].mean()), np.asarray(bad_box, dtype=np.float64)
+    return (m[0].bool().cpu(), score_sum / n_done,
+            np.asarray(bad_box, dtype=np.float64))
 
 
 def best_of_n_multimask(bad_box, predictor, device, Y, sigma, sigma_center, perturb_mode, seed):
@@ -812,7 +845,8 @@ def best_of_n_multimask(bad_box, predictor, device, Y, sigma, sigma_center, pert
 # SAIF-style stability  (methods A / B / C)
 # ---------------------------------------------------------------------------
 
-def _predict_boxes_batched(boxes_t, predictor, multimask, return_logits=False):
+def _predict_boxes_batched(boxes_t, predictor, multimask, return_logits=False,
+                           to_cpu=True):
     """All boxes in ONE decoder call, or None if this backend cannot do it.
 
     SAM2ImagePredictor / SAM3InteractiveImagePredictor have no public
@@ -841,9 +875,13 @@ def _predict_boxes_batched(boxes_t, predictor, multimask, return_logits=False):
                                multimask_output=multimask,
                                return_logits=return_logits)
     if return_logits:
-        # raw logits: needed to average PROBABILITIES across perturbations,
-        # which cannot be recovered from thresholded masks
-        return masks.float().cpu(), scores.float().cpu()
+        # Raw logits: needed to average PROBABILITIES across perturbations,
+        # which cannot be recovered from thresholded masks. These are float32
+        # at FULL image resolution, i.e. 32x the bytes of the bool path, so
+        # to_cpu=False lets a caller reduce them on the device and keep them
+        # off host RAM entirely.
+        m = masks.float()
+        return (m.cpu() if to_cpu else m), (scores.float().cpu() if to_cpu else scores.float())
     return masks.bool().cpu(), scores.float().cpu()
 
 
@@ -1562,6 +1600,15 @@ def parse_args():
                         "prompt distribution instead of a selection from it. "
                         "The candidate boxes are identical either way, so the "
                         "comparison isolates the aggregation.")
+    p.add_argument("--smooth_chunk", type=int, default=4,
+                   help="how many perturbations the averaging modes reduce at "
+                        "a time. Averaging needs full-resolution float32 "
+                        "logits (32x the bytes of the bool masks used "
+                        "elsewhere), so they are accumulated on the device in "
+                        "chunks and only the final bool mask reaches host RAM. "
+                        "Lower this if the GPU is tight; --smooth_chunk equal "
+                        "to --Y reproduces the one-shot behaviour. No effect "
+                        "with --averaging_mode best_of_n.")
 
     # SAIF-style stability (methods A/B/C)
     p.add_argument("--K", type=int, default=5,
@@ -1812,7 +1859,7 @@ def main():
                 smoothed = smooth_batched(
                     case["bad_box"], predictor, device, args.Y, args.sigma,
                     args.sigma_center, args.perturb_mode, seed=42,
-                    mode=args.averaging_mode)
+                    mode=args.averaging_mode, chunk=args.smooth_chunk)
             if smoothed is not None:
                 bon_mask, bon_pred, bon_box = smoothed
             elif args.fast and args.averaging_mode == "best_of_n":
