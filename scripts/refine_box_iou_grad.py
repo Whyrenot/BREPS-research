@@ -402,7 +402,8 @@ def _cluster(M: np.ndarray, tau: float) -> np.ndarray:
 
 def refine_boxes_multistart(box_1024, predictor, device, n_starts=8, steps=50,
                             lr=1.0, multimask=True, gt_tensor=None, seed=0,
-                            extra_start=None, checkpoint_every=0):
+                            extra_start=None, checkpoint_every=0,
+                            cand_row_fn=None):
     """Ascend the predicted IoU from N perturbed starts simultaneously.
 
     Returns (out, extras).
@@ -430,6 +431,13 @@ def refine_boxes_multistart(box_1024, predictor, device, n_starts=8, steps=50,
         the 256px logits, which cost nothing extra. A deployed ranker therefore
         needs no postprocessing per checkpoint at all -- the expense here buys
         labels, not predictions.
+
+    cand_row_fn: when given, it OWNS the schema of extras["cand_rows"] --
+        it is called once per (start, checkpoint) with a context dict and its
+        return value is appended instead of the built-in c_* row. The point is
+        that the ascent, with its three backend-specific branches, stays
+        written once: a caller that wants different features supplies them
+        rather than reimplementing the loop. See dump_selector_data.py.
 
     Backend coverage matches refine_box_by_iou_grad: vanilla SAM, SAM2.1/SAM3
     (no .predict_torch), SAM-HQ (.interm_features). The HQ batch path is the
@@ -502,6 +510,18 @@ def refine_boxes_multistart(box_1024, predictor, device, n_starts=8, steps=50,
     # that frame maps into low-res pixels by this factor
     frame = float(transforms.resolution) if is_sam2 else 1024.0
 
+    def boxes_to_1024(bx):
+        """Model-frame boxes -> this repo's 1024 frame, which is what every
+        feature, every other method and every saved box here is expressed in.
+        SAM2/SAM3 ascend in their own normalised square frame, so without this
+        their boxes are not comparable with anything else."""
+        b = np.asarray(bx, dtype=np.float64).reshape(-1, 4)
+        if not is_sam2:
+            return b
+        H, W = orig_hw
+        sc = np.array([W, H, W, H], dtype=np.float64)
+        return original_to_1024(b / float(transforms.resolution) * sc, orig_hw)
+
     def full_mask(lr_row, head):
         if is_sam2:
             full = transforms.postprocess_masks(lr_row[:, head:head + 1], orig_hw)
@@ -539,9 +559,28 @@ def refine_boxes_multistart(box_1024, predictor, device, n_starts=8, steps=50,
                     ipk = pred_hist[-1]
                     lo = float(low_res.shape[-1]) / frame
                     b0np = b0.detach().cpu().numpy()
+                    bxk_1024 = boxes_to_1024(bxk) if cand_row_fn else None
                     for i in range(N):
                         pk = ipk[i]
                         hi = int(heads[i])
+                        if cand_row_fn is not None:
+                            cand_rows.append(cand_row_fn({
+                                "step": step, "start": i,
+                                "step_frac": step / max(1, steps),
+                                "box_1024": bxk_1024[i],
+                                "pred": pk, "head": hi,
+                                "mask_low": lowm[i], "lo": lo,
+                                "agree": Mk[i],
+                                "cluster_frac": float(sizek[labk[i]] / N),
+                                "n_clusters": float(sizek.size),
+                                "orig_hw": orig_hw,
+                                # lazy: the full-resolution mask is the one
+                                # expensive thing here, and it is only needed
+                                # for the label
+                                "full_mask": (lambda j=i, h=hi:
+                                              full_mask(low_res[j:j + 1], h)),
+                            }))
+                            continue
                         w = min(10, step)
                         row = {
                             "start": i, "step": step,
@@ -612,14 +651,7 @@ def refine_boxes_multistart(box_1024, predictor, device, n_starts=8, steps=50,
         masks = torch.stack(outs)
     preds = scores.detach().float().cpu().numpy()
 
-    if is_sam2:
-        H, W = orig_hw
-        scale = torch.tensor([W, H, W, H], dtype=torch.float32,
-                             device=final_boxes.device)
-        bo = (final_boxes / transforms.resolution * scale).cpu().numpy()
-        final_1024 = original_to_1024(bo, orig_hw)
-    else:
-        final_1024 = final_boxes.cpu().numpy()
+    final_1024 = boxes_to_1024(final_boxes.cpu().numpy())
 
     M = _iou_matrix(masks)
     off = ~np.eye(N, dtype=bool)
@@ -702,6 +734,22 @@ def _box_metrics(box_new, box_ref) -> dict:
     }
 
 
+def sample_bon_boxes(bad_box, predictor, Y, sigma, sigma_center,
+                     perturb_mode, seed):
+    """The Y perturbed prompt boxes every best_of_n / smoothing path searches.
+
+    One function on purpose: the defence, its dumps and its baselines are only
+    comparable while they draw the SAME candidates from the SAME seed, and that
+    guarantee is worth more than the five lines it saves.
+    """
+    sam_h, sam_w = getattr(predictor, "input_size", (1024, 1024))
+    base = torch.as_tensor(bad_box, dtype=torch.float32)
+    if perturb_mode == "size_center":
+        return sample_size_and_center_perturbed_boxes(
+            base, (sam_h, sam_w), Y, sigma, sigma, sigma_center, sigma_center, seed)
+    return sample_size_perturbed_boxes(base, (sam_h, sam_w), Y, sigma, sigma, seed)
+
+
 def best_of_n_batched(bad_box, predictor, device, Y, sigma, sigma_center,
                       perturb_mode, seed):
     """best_of_n (token-0) in one batched call instead of Y looped .predict()s.
@@ -714,17 +762,104 @@ def best_of_n_batched(bad_box, predictor, device, Y, sigma, sigma_center,
 
     Returns (mask bool (H,W), pred_score, chosen_box_1024 np).
     """
-    sam_h, sam_w = getattr(predictor, "input_size", (1024, 1024))
-    base = torch.as_tensor(bad_box, dtype=torch.float32)
-    if perturb_mode == "size_center":
-        perturbed = sample_size_and_center_perturbed_boxes(
-            base, (sam_h, sam_w), Y, sigma, sigma, sigma_center, sigma_center, seed)
-    else:
-        perturbed = sample_size_perturbed_boxes(base, (sam_h, sam_w), Y, sigma, sigma, seed)
+    perturbed = sample_bon_boxes(bad_box, predictor, Y, sigma, sigma_center,
+                                 perturb_mode, seed)
 
     masks, scores = _predict_boxes(perturbed.float().to(device), predictor, multimask=False)
     best = int(torch.argmax(scores[:, 0]).item())
     return masks[best, 0].cpu(), float(scores[best, 0].item()), perturbed[best].cpu().numpy()
+
+
+def best_of_n_candidates(bad_box, predictor, device, Y, sigma, sigma_center,
+                         perturb_mode, seed, gt_tensor=None, stride=4):
+    """best_of_n, plus one feature row per candidate -- the dump a BoN selector
+    trains on, and the only way to see the oracle over the Y candidates.
+
+    Same sampler, same seed and the same argmax as best_of_n_batched, so the
+    winner returned here IS today's defence: swapping this in changes what gets
+    recorded, never what gets chosen. The Y masks and scores are materialised
+    by the defence anyway, so the extra cost is feature arithmetic, not
+    forwards.
+
+    Rows carry `b_*` features -- causal, nothing derived from the GT -- plus
+    `target_iou` when a GT mask is given. Two things a tree cannot recover on
+    its own are emitted explicitly:
+      * rank and margin WITHIN the case. Selection is a within-case
+        comparison, and the absolute level of a predicted-IoU score says
+        little about which of these Y is best.
+      * how far the candidates agree with EACH OTHER. This is the block the
+        predicted-IoU head has no access to, and the reason to expect a
+        selector to beat it at all.
+
+    `stride` subsamples the masks for the agreement matrix and the shape
+    features: Y full-resolution masks pairwise-IoU'd, per case, is the one part
+    of this that would cost real time, and every feature it feeds is a ratio.
+    target_iou is always measured on the FULL-resolution mask.
+
+    Returns (best_mask bool (H,W), pred_score, chosen_box_1024 np, rows).
+    """
+    perturbed = sample_bon_boxes(bad_box, predictor, Y, sigma, sigma_center,
+                                 perturb_mode, seed)
+
+    masks, scores = _predict_boxes(perturbed.float().to(device), predictor, multimask=False)
+    masks = masks[:, 0].cpu().bool()                       # (Y, H, W)
+    s = scores[:, 0].float().cpu().numpy().astype(np.float64)
+    n = int(masks.shape[0])
+    best = int(np.argmax(s))
+
+    st = max(1, int(stride))
+    sub = masks[:, ::st, ::st]
+    M = _iou_matrix(sub)
+    lab = _cluster(M, 0.90)
+    sizes = np.bincount(lab)
+
+    orig_hw = get_original_size(predictor)
+    cand_1024 = perturbed.cpu().numpy().astype(np.float64).reshape(-1, 4)
+    cand_orig = boxes_to_original(cand_1024, orig_hw).astype(np.float64)
+    base_1024 = np.asarray(bad_box, dtype=np.float64).reshape(4)
+
+    order = np.argsort(-s, kind="mergesort")
+    rank = np.empty(n, dtype=np.float64)
+    rank[order] = np.arange(n, dtype=np.float64)
+    s_mean, s_std = float(s.mean()), float(s.std())
+
+    rows = []
+    for i in range(n):
+        oth = np.delete(M[i], i)
+        row = {
+            "y": i,
+            "b_pred": float(s[i]),
+            "b_pred_rank": float(rank[i]),
+            "b_pred_margin_max": float(s[i] - s.max()),
+            "b_pred_minus_mean": float(s[i] - s_mean),
+            "b_pred_z": float((s[i] - s_mean) / s_std) if s_std > 0 else 0.0,
+            "b_is_argmax": float(i == best),
+            # constant within a case, but it is how hard the choice was, and
+            # across cases that is exactly what a selector needs to know
+            "b_case_pred_max": float(s.max()),
+            "b_case_pred_spread": float(s.max() - s.min()),
+            "b_case_pred_std": s_std,
+            "b_agree_leader": float(M[i, best]),
+            "b_cluster_frac": float(sizes[lab[i]] / n),
+            "b_n_clusters": float(sizes.size),
+        }
+        if oth.size:
+            row["b_agree_mean"] = float(oth.mean())
+            row["b_agree_min"] = float(oth.min())
+            row["b_agree_max"] = float(oth.max())
+        else:
+            # Y=1: there is no other candidate to agree with. NaN, not 1.0 --
+            # CatBoost reads it as missing, which is the truth here rather
+            # than perfect agreement.
+            row["b_agree_mean"] = row["b_agree_min"] = row["b_agree_max"] = float("nan")
+        row.update(_mask_shape_feats(sub[i], cand_orig[i] / st, "b"))
+        row.update(_box_move_feats(cand_1024[i], base_1024, "b"))
+        row.update(_box_prior_feats(cand_orig[i], orig_hw, "b_box"))
+        if gt_tensor is not None:
+            row["target_iou"] = _iou(gt_tensor, masks[i])
+        rows.append(row)
+
+    return masks[best], float(s[best]), cand_1024[best], rows
 
 
 def smooth_batched(bad_box, predictor, device, Y, sigma, sigma_center,
@@ -755,13 +890,8 @@ def smooth_batched(bad_box, predictor, device, Y, sigma, sigma_center,
     sigmoid, "binary" is a per-pixel majority vote. All threshold at 0.5, and
     all match heatmaps.defend_critical_shifts._predict_smoothed_box.
     """
-    sam_h, sam_w = getattr(predictor, "input_size", (1024, 1024))
-    base = torch.as_tensor(bad_box, dtype=torch.float32)
-    if perturb_mode == "size_center":
-        perturbed = sample_size_and_center_perturbed_boxes(
-            base, (sam_h, sam_w), Y, sigma, sigma, sigma_center, sigma_center, seed)
-    else:
-        perturbed = sample_size_perturbed_boxes(base, (sam_h, sam_w), Y, sigma, sigma, seed)
+    perturbed = sample_bon_boxes(bad_box, predictor, Y, sigma, sigma_center,
+                                 perturb_mode, seed)
 
     acc, n_done, score_sum = None, 0, 0.0
     with torch.no_grad():
@@ -799,13 +929,8 @@ def best_of_n_multimask(bad_box, predictor, device, Y, sigma, sigma_center, pert
 
     Returns (best_mask bool (H,W), pred_score, chosen_box_1024 np, head_idx).
     """
-    sam_h, sam_w = getattr(predictor, "input_size", (1024, 1024))
-    base = torch.as_tensor(bad_box, dtype=torch.float32)
-    if perturb_mode == "size_center":
-        perturbed = sample_size_and_center_perturbed_boxes(
-            base, (sam_h, sam_w), Y, sigma, sigma, sigma_center, sigma_center, seed)
-    else:
-        perturbed = sample_size_perturbed_boxes(base, (sam_h, sam_w), Y, sigma, sigma, seed)
+    perturbed = sample_bon_boxes(bad_box, predictor, Y, sigma, sigma_center,
+                                 perturb_mode, seed)
 
     perturbed_t = perturbed.float().to(device)
     if not hasattr(predictor, "predict_torch"):
@@ -1239,13 +1364,8 @@ def method_stab_select(bad_box, predictor, device, Y, sigma, sigma_center,
     (which used heads 1-3 only and dropped the well-calibrated single-output token).
     Returns (mask, stability, box, token_idx 0..3, pred).
     """
-    sam_h, sam_w = getattr(predictor, "input_size", (1024, 1024))
-    base = torch.as_tensor(bad_box, dtype=torch.float32)
-    if perturb_mode == "size_center":
-        perturbed = sample_size_and_center_perturbed_boxes(
-            base, (sam_h, sam_w), Y, sigma, sigma, sigma_center, sigma_center, seed)
-    else:
-        perturbed = sample_size_perturbed_boxes(base, (sam_h, sam_w), Y, sigma, sigma, seed)
+    perturbed = sample_bon_boxes(bad_box, predictor, Y, sigma, sigma_center,
+                                 perturb_mode, seed)
     pt = perturbed.float().to(device)
 
     m0, s0 = _predict_boxes(pt, predictor, False)   # token-0  (Y,1,*),(Y,1)
@@ -1570,6 +1690,18 @@ def parse_args():
                         "causal features plus target_iou. Written incrementally "
                         "-- at 8 starts x 11 checkpoints a 12500-case run is "
                         "~1.1M rows, too much to hold in memory.")
+    p.add_argument("--dump_bon_candidates", default=None,
+                   help="long-format CSV, one row per (case, best_of_n "
+                        "candidate): causal b_* features plus target_iou. "
+                        "Costs no extra forwards -- the Y masks and scores are "
+                        "materialised by the defence anyway -- and is what "
+                        "makes the oracle over the Y candidates visible "
+                        "(reported as bon_oracle_iou). Requires "
+                        "--averaging_mode best_of_n.")
+    p.add_argument("--bon_dump_stride", type=int, default=4,
+                   help="subsample masks by this factor for the candidate "
+                        "agreement matrix and shape features. target_iou is "
+                        "always measured at full resolution.")
     p.add_argument("--sample_images", type=int, default=0,
                    help="randomly sample this many IMAGES, keeping ALL of each "
                         "one's annotations. Unlike --limit (which truncates to "
@@ -1801,6 +1933,15 @@ def main():
         Path(args.dump_candidates).parent.mkdir(parents=True, exist_ok=True)
         cand_fh = open(args.dump_candidates, "w", newline="", encoding="utf-8")
 
+    bon_fh = bon_writer = None
+    if args.dump_bon_candidates:
+        if args.averaging_mode != "best_of_n":
+            raise SystemExit("--dump_bon_candidates needs --averaging_mode best_of_n: "
+                             "the averaging modes elect no candidate, so there is "
+                             "nothing to select among")
+        Path(args.dump_bon_candidates).parent.mkdir(parents=True, exist_ok=True)
+        bon_fh = open(args.dump_bon_candidates, "w", newline="", encoding="utf-8")
+
     pbar = tqdm(total=sum(len(v) for v in by_image.values()),
                 desc=f"{args.model_name} cases", unit="case", dynamic_ncols=True)
     for image_name, raw_tasks in by_image.items():
@@ -1855,6 +1996,7 @@ def main():
             # --fast takes the batched route: same candidate boxes (same
             # sampler, same seed), one forward instead of Y.
             smoothed = None
+            bon_rows = []
             if args.averaging_mode != "best_of_n":
                 smoothed = smooth_batched(
                     case["bad_box"], predictor, device, args.Y, args.sigma,
@@ -1862,6 +2004,13 @@ def main():
                     mode=args.averaging_mode, chunk=args.smooth_chunk)
             if smoothed is not None:
                 bon_mask, bon_pred, bon_box = smoothed
+            elif bon_fh is not None:
+                # same sampler, same seed, same argmax as best_of_n_batched --
+                # the defence is unchanged, only more of it is recorded
+                bon_mask, bon_pred, bon_box, bon_rows = best_of_n_candidates(
+                    case["bad_box"], predictor, device, args.Y, args.sigma,
+                    args.sigma_center, args.perturb_mode, seed=42,
+                    gt_tensor=gt_tensor, stride=args.bon_dump_stride)
             elif args.fast and args.averaging_mode == "best_of_n":
                 bon_mask, bon_pred, bon_box = best_of_n_batched(
                     case["bad_box"], predictor, device, args.Y, args.sigma,
@@ -1880,6 +2029,22 @@ def main():
                            if bon_best_idx >= 0 else bad_box_np)
             bon_iou = _iou(gt_tensor, bon_mask)
             bon_m = _box_metrics(bon_box, bad_box_np)
+            # ceiling of ANY selector over these Y candidates. Without it the
+            # question "is a better selector worth building?" has no answer:
+            # bon_iou only says what the predicted-IoU head managed to pick.
+            bon_oracle_iou = (max(r["target_iou"] for r in bon_rows)
+                              if bon_rows and "target_iou" in bon_rows[0]
+                              else float("nan"))
+            if bon_fh is not None and bon_rows:
+                b_ident = {"image_name": image_name,
+                           "kind": case.get("kind", ""),
+                           "user": case.get("user", ""),
+                           "attempt": case.get("attempt", "")}
+                b_out = [{**b_ident, **r} for r in bon_rows]
+                if bon_writer is None:
+                    bon_writer = csv.DictWriter(bon_fh, fieldnames=list(b_out[0]))
+                    bon_writer.writeheader()
+                bon_writer.writerows(b_out)
 
             # best_of_n x multimask: search boxes AND the 3 heads (skipped if grad_only)
             if args.grad_only:
@@ -2018,6 +2183,7 @@ def main():
                 "headsel_pred": headsel_pred,
                 "best_of_n_iou": bon_iou,
                 "bon_pred": bon_pred,
+                "bon_oracle_iou": bon_oracle_iou,
                 "bon_mm_iou": bon_mm_iou,
                 "bon_mm_pred": mm_pred,
                 "bon_mm_head": mm_head,
@@ -2086,6 +2252,9 @@ def main():
     if cand_fh is not None:
         cand_fh.close()
         print(f"Saved candidate dump -> {args.dump_candidates}")
+    if bon_fh is not None:
+        bon_fh.close()
+        print(f"Saved best_of_n candidate dump -> {args.dump_bon_candidates}")
     if stopped_early:
         print(f"[stop] interrupted after {n_done} cases -- writing PARTIAL results "
               f"to {args.out_csv} and the report below.", file=sys.stderr, flush=True)
@@ -2159,6 +2328,14 @@ def main():
           f"   (pred {df['headsel_pred'].mean():.4f})   <- NO box change")
     print(f"  best_of_n (1 head)       true IoU : {df['best_of_n_iou'].mean():.4f}"
           f"   (pred {df['bon_pred'].mean():.4f})")
+    if "bon_oracle_iou" in df.columns and df["bon_oracle_iou"].notna().any():
+        _bo = df["bon_oracle_iou"]
+        _hd = _bo.mean() - df["best_of_n_iou"].mean()
+        print(f"  best_of_n ORACLE over Y  true IoU : {_bo.mean():.4f}"
+              f"   (+{_hd:.4f} over the pred-IoU head)   <- selector ceiling")
+        _und = _bo.mean() - df["undefended_iou"].mean()
+        print(f"      head captures {(df['best_of_n_iou'].mean() - df['undefended_iou'].mean()) / _und:.1%} "
+              f"of what selection over Y can reach (+{_und:.4f} vs undefended)")
     if not args.grad_only:
         print(f"  best_of_n x multimask    true IoU : {df['bon_mm_iou'].mean():.4f}"
               f"   (pred {df['bon_mm_pred'].mean():.4f})   <- boxes x heads 1-3")
