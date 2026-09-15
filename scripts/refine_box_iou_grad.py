@@ -655,6 +655,10 @@ def refine_boxes_multistart(box_1024, predictor, device, n_starts=8, steps=50,
 
     M = _iou_matrix(masks)
     off = ~np.eye(N, dtype=bool)
+    # empty with n_starts=1 (pure step selection): there is no other endpoint
+    # to agree with. NaN for the same reason c_agree_* is NaN there -- a
+    # reduction over no pairs is missing, not perfect agreement.
+    pair = M[off]
     lab = _cluster(M, 0.90)
     sizes = np.bincount(lab)
     big = int(sizes.argmax())
@@ -668,9 +672,9 @@ def refine_boxes_multistart(box_1024, predictor, device, n_starts=8, steps=50,
     bc = np.stack([(final_1024[:, 0] + final_1024[:, 2]) / 2,
                    (final_1024[:, 1] + final_1024[:, 3]) / 2], axis=1)
     t3 = {
-        "t3_conv_iou_mean": float(M[off].mean()),
-        "t3_conv_iou_min": float(M[off].min()),
-        "t3_conv_iou_std": float(M[off].std()),
+        "t3_conv_iou_mean": float(pair.mean()) if pair.size else float("nan"),
+        "t3_conv_iou_min": float(pair.min()) if pair.size else float("nan"),
+        "t3_conv_iou_std": float(pair.std()) if pair.size else float("nan"),
         "t3_n_clusters_90": float(sizes.size),
         "t3_n_clusters_80": float(np.bincount(_cluster(M, 0.80)).size),
         "t3_largest_cluster_frac": float(sizes.max() / N),
