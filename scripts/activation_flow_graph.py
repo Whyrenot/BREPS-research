@@ -14,12 +14,37 @@ boxes, and draws the prompt encoder + mask decoder as a directed dataflow graph
   edge colour  gain along the edge, rel(dst) / rel(src); by default the
                specific gain gain(bad) / gain(control) = ratio(dst) / ratio(src)
 
-A control box is shifted from best_box by the same L-inf distance as bad_box,
-in a random direction (cosine with the attack direction <= --ctrl_max_cos),
-and is kept only if its mask is still good (IoU with GT >= --ctrl_min_iou).
-ratio ~ 1 means the node reacts to the critical shift like to any shift of
-that size; the layer that breaks the mask is where ratio jumps, i.e. where the
-specific gain on the incoming edges is >> 1.
+A control box moves best_box by the attack's own amounts, rearranged: the
+shift d = bad_box - best_box with its four components permuted across
+(x0, y0, x1, y1) and any of them sign-flipped (cosine with d <=
+--ctrl_max_cos), e.g. [-9.6, 9.6, 0, -8] -> [9.6, 0, -8, -9.6]. So a control
+has exactly the attack's L-inf and L2 (ratio at the box prompt = 1) and differs
+only in which sides move which way; it is kept only if its mask is still good
+(IoU with GT >= --ctrl_min_iou). ratio ~ 1 means the node reacts to the
+critical shift like to a benign shift of the same size; the layer that breaks
+the mask is where ratio jumps, i.e. where the specific gain on the incoming
+edges is >> 1.
+
+ACTIVATION PATCHING
+-------------------
+Divergence says where bad and best differ, not which difference matters. So
+for every box-dependent node (on the token stream also per token group, and
+for the two routes by which the box enters the decoder -- the input of layer 1
+and the prompt tokens re-added before every attention -- separately) the trace
+is re-run with that one tensor taken from another box's forward, everything
+downstream recomputed:
+  restore  bad run,  tensor from best    (IoU - IoU_bad) / (IoU_best - IoU_bad)
+  break    best run, tensor from bad     (IoU_best - IoU) / (IoU_best - IoU_bad)
+  control  best run, tensor from each control box, same formula as break
+           (median): the baseline of what splicing a benign shift does.
+Every patched forward is checked against the drawn graph, and any failure
+aborts the run:
+  a. no tensor outside the node's drawn descendants changes (an edge missing
+     from the graph shows up here);
+  b. every drawn outgoing edge of the node carries the change (a dead edge,
+     or a patch the trace does not use, shows up here);
+  c. patching a cut node -- one that every box -> mask path goes through --
+     reproduces the donor's forward exactly downstream.
 
 Node labels use the terms of the paper (Kirillov et al., "Segment Anything",
 ICCV 2023, Appendix A); the exact attribute path in facebookresearch/
@@ -66,8 +91,9 @@ Outputs (in --out_dir)
   activation_graph.html   the interactive graph (open in a browser)
   per_pair_keys.csv       rel(best,bad), rel(best,control), ratio per traced tensor
   per_pair_edges.csv      gains per edge
+  per_pair_patching.csv   IoU and effect of every patched forward
   repro.csv               JSON vs recomputed IoU for every pair, kept/dropped
-  checks.json             results of checks 1-5
+  checks.json             results of all checks
 
 Example
 -------
@@ -87,6 +113,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import itertools
 import json
 import math
 import sys
@@ -205,42 +232,63 @@ def _mlp(mlp, x, rec, name):
 
 
 @torch.inference_mode()
-def trace_forward(predictor, box_1024) -> "OrderedDict[str, torch.Tensor]":
+def trace_forward(predictor, box_1024, patch=None) -> "OrderedDict[str, torch.Tensor]":
     """Every tensor on the path box -> mask, keyed by the official module path
     where the tensor is a module output, and by a descriptive key otherwise.
 
     Mirrors SamPredictor.predict_torch(None, None, boxes=box[None],
     multimask_output=False) on the image set with predictor.set_image().
+
+    patch: {site: (donor tensor, token slice or None)} replaces that tensor (or
+    only its token rows) and everything downstream is recomputed from it. A
+    site is a recorded key, or one of the two routes by which the token tensor
+    enters the decoder: "mask_decoder.tokens@stream" (the input of layer 1) and
+    "mask_decoder.tokens@pe" (the prompt tokens re-added before every attention).
+    Every recorded tensor is the one the rest of the trace goes on with, which
+    is what makes each of them patchable.
     """
     sam = predictor.model
     pe, dec = sam.prompt_encoder, sam.mask_decoder
     T: OrderedDict[str, torch.Tensor] = OrderedDict()
+    patch = patch or {}
+    applied = set()
+
+    def site(key, t):
+        if key not in patch:
+            return t
+        donor, sl = patch[key]
+        applied.add(key)
+        if sl is None:
+            return donor
+        t = t.clone()
+        t[:, sl] = donor[:, sl]
+        return t
 
     def rec(key, t):
         if key in T:
             raise KeyError(f"trace key recorded twice: {key}")
+        t = site(key, t)
         T[key] = t
         return t
 
-    box = torch.as_tensor(np.asarray(box_1024, dtype=np.float32), device=predictor.device)[None]
-    rec("box", box)
+    box = rec("box", torch.as_tensor(np.asarray(box_1024, dtype=np.float32), device=predictor.device)[None])
 
     # --- PromptEncoder.forward(points=None, boxes=box, masks=None) ---
     bs = box.shape[0]
     sparse = torch.empty((bs, 0, pe.embed_dim), device=pe._get_device())
     boxes = box + 0.5                                   # _embed_boxes
     coords = boxes.reshape(-1, 2, 2)
-    corner = pe.pe_layer.forward_with_coords(coords, pe.input_image_size)
-    rec("prompt_encoder.corner_pe", corner.clone())
+    # the official code adds the learned corner embeddings in place; on a copy
+    # here, so the recorded PE (or a donor's, when patched) stays untouched
+    corner = rec("prompt_encoder.corner_pe", pe.pe_layer.forward_with_coords(coords, pe.input_image_size)).clone()
     rec("prompt_encoder.corner_learned",
         torch.cat([pe.point_embeddings[2].weight, pe.point_embeddings[3].weight], dim=0)[None])
     corner[:, 0, :] += pe.point_embeddings[2].weight
     corner[:, 1, :] += pe.point_embeddings[3].weight
-    sparse = torch.cat([sparse, corner], dim=1)
+    sparse = rec("prompt_encoder[sparse_embeddings]", torch.cat([sparse, corner], dim=1))
     dense = pe.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
         bs, -1, pe.image_embedding_size[0], pe.image_embedding_size[1]
     )
-    rec("prompt_encoder[sparse_embeddings]", sparse)
     rec("prompt_encoder[dense_embeddings]", dense)
 
     # --- predict_torch: image_embeddings=self.features, image_pe=get_dense_pe() ---
@@ -261,8 +309,10 @@ def trace_forward(predictor, box_1024) -> "OrderedDict[str, torch.Tensor]":
     tr = dec.transformer
     image_embedding = src.flatten(2).permute(0, 2, 1)
     image_pe_flat = pos_src.flatten(2).permute(0, 2, 1)
-    point_embedding = tokens
-    queries, keys = point_embedding, image_embedding
+    # official: queries = point_embedding = tokens; two names here so the two
+    # routes of the prompt into the decoder can be patched one at a time
+    point_embedding = site("mask_decoder.tokens@pe", tokens)
+    queries, keys = site("mask_decoder.tokens@stream", tokens), image_embedding
     for li, layer in enumerate(tr.layers):
         # --- TwoWayAttentionBlock.forward(queries, keys, query_pe=point_embedding, key_pe=image_pe) ---
         p = f"mask_decoder.transformer.layers.{li}"
@@ -284,8 +334,7 @@ def trace_forward(predictor, box_1024) -> "OrderedDict[str, torch.Tensor]":
 
         h1 = rec(f"{p}.mlp.lin1", layer.mlp.lin1(queries))       # MLPBlock.forward
         a1 = rec(f"{p}.mlp.act", layer.mlp.act(h1))
-        mlp_out = rec(f"{p}.mlp.lin2", layer.mlp.lin2(a1))
-        rec(f"{p}.mlp", mlp_out)
+        mlp_out = rec(f"{p}.mlp", rec(f"{p}.mlp.lin2", layer.mlp.lin2(a1)))
         queries = queries + mlp_out
         queries = rec(f"{p}.norm3", layer.norm3(queries))
 
@@ -311,7 +360,7 @@ def trace_forward(predictor, box_1024) -> "OrderedDict[str, torch.Tensor]":
 
     iou_token_out = rec("mask_decoder.iou_token_out", hs[:, 0, :])
     mask_tokens_out = rec("mask_decoder.mask_tokens_out", hs[:, 1:(1 + dec.num_mask_tokens), :])
-    rec("mask_decoder.mask_tokens_out[0]", mask_tokens_out[:, 0, :])
+    mask_token0 = rec("mask_decoder.mask_tokens_out[0]", mask_tokens_out[:, 0, :])
 
     src = src.transpose(1, 2).view(b, c, h, w)
     x = src
@@ -319,14 +368,13 @@ def trace_forward(predictor, box_1024) -> "OrderedDict[str, torch.Tensor]":
         x = rec(f"mask_decoder.output_upscaling.{i}", m(x))
     upscaled = rec("mask_decoder.output_upscaling", x)
     hyper_in_list = [
-        _mlp(dec.output_hypernetworks_mlps[i], mask_tokens_out[:, i, :], rec,
+        _mlp(dec.output_hypernetworks_mlps[i], mask_token0 if i == 0 else mask_tokens_out[:, i, :], rec,
              f"mask_decoder.output_hypernetworks_mlps.{i}")
         for i in range(dec.num_mask_tokens)
     ]
     hyper_in = torch.stack(hyper_in_list, dim=1)
     b, c, h, w = upscaled.shape
-    masks = (hyper_in @ upscaled.view(b, c, h * w)).view(b, -1, h, w)
-    rec("mask_decoder.masks_all", masks)
+    masks = rec("mask_decoder.masks_all", (hyper_in @ upscaled.view(b, c, h * w)).view(b, -1, h, w))
     iou_pred = _mlp(dec.iou_prediction_head, iou_token_out, rec, "mask_decoder.iou_prediction_head")
 
     # --- MaskDecoder.forward, multimask_output=False -> slice(0, 1) ---
@@ -334,9 +382,11 @@ def trace_forward(predictor, box_1024) -> "OrderedDict[str, torch.Tensor]":
     rec("mask_decoder[iou_pred]", iou_pred[:, slice(0, 1)])
 
     # --- SamPredictor.predict_torch: postprocess + threshold ---
-    up = sam.postprocess_masks(low_res, predictor.input_size, predictor.original_size)
-    rec("postprocess_masks", up)
+    up = rec("postprocess_masks", sam.postprocess_masks(low_res, predictor.input_size, predictor.original_size))
     rec("mask", up > sam.mask_threshold)
+    missing = set(patch) - applied
+    if missing:
+        raise RuntimeError(f"patch sites never reached by the trace: {sorted(missing)}")
     return T
 
 
@@ -721,8 +771,70 @@ def build_spec(depth: int) -> dict:
     assert len(ids) == len(set(ids)), "duplicate node ids"
     eids = [x["id"] for x in edges]
     assert len(eids) == len(set(eids)), "duplicate edge ids"
-    return {"nodes": nodes, "edges": edges, "groups": groups, "lanes": LANES,
+    spec = {"nodes": nodes, "edges": edges, "groups": groups, "lanes": LANES,
             "token_groups": [[gid, lab] for gid, (lab, _) in TOKEN_GROUPS.items()]}
+    g = GraphIndex(spec)
+    for n in nodes:
+        n["affects_mask"] = "mask" in g.reach([n["id"]])
+        # a cut: every box -> mask path goes through it
+        n["cut"] = n["kind"] != "const" and (
+            n["id"] in ("box", "mask") or "mask" not in g.reach(["box"], blocked={n["id"]}))
+    spec["patch_sites"] = patch_sites(spec)
+    return spec
+
+
+class GraphIndex:
+    """Reachability on the drawn graph; patched forwards are checked against it."""
+
+    def __init__(self, spec):
+        self.nodes = spec["nodes"]
+        kind = {n["id"]: n["kind"] for n in self.nodes}
+        self.key = {n["id"]: n["key"] for n in self.nodes}
+        self.keys = {n["id"]: [n["key"]] + [k for k, _ in n["internals"]] for n in self.nodes}
+        self.cut = {n["id"]: n.get("cut", False) for n in self.nodes}
+        self.succ = {n["id"]: [] for n in self.nodes}
+        for e in spec["edges"]:
+            self.succ[e["src"]].append(e["dst"])
+        self.var_edges = {e["id"] for e in spec["edges"] if kind[e["src"]] != "const"}
+
+    def reach(self, seeds, blocked=()):
+        seen, stack = set(), [x for x in seeds if x not in blocked]
+        while stack:
+            x = stack.pop()
+            if x not in seen:
+                seen.add(x)
+                stack.extend(y for y in self.succ[x] if y not in blocked)
+        return seen
+
+
+def patch_sites(spec) -> list[dict]:
+    """Where a tensor gets replaced: every box-dependent node; on the token
+    stream also one token group at a time; and the two routes by which the
+    token tensor enters the decoder, separately.
+
+      at     the trace site that gets replaced
+      src    the recorded key the donor's value is taken from
+      seeds  the nodes that consume the replaced value (they and everything
+             downstream of them may change, nothing else may)
+    """
+    sites = []
+    for n in spec["nodes"]:
+        if n["kind"] == "const":
+            continue
+        sites.append({"id": n["id"], "node": n["id"], "group": None, "at": n["key"], "src": n["key"],
+                      "sub": "", "seeds": [n["id"]]})
+        if n["id"] == "tokens":
+            for route, sub in (("stream", "только вход в decoder layer 1"),
+                               ("pe", "только re-added prompt tokens (перед каждой attention)")):
+                sites.append({"id": f"tokens@{route}", "node": "tokens", "group": None,
+                              "at": f"mask_decoder.tokens@{route}", "src": n["key"], "sub": sub,
+                              "seeds": [e["dst"] for e in spec["edges"]
+                                        if e["src"] == "tokens" and (e["role"] == "pe") == (route == "pe")]})
+        elif n["tok"] and n["lane"] == 1:          # token residual stream: per token group too
+            for gid, (lab, _) in TOKEN_GROUPS.items():
+                sites.append({"id": f"{n['id']}#{gid}", "node": n["id"], "group": gid, "at": n["key"],
+                              "src": n["key"], "sub": lab, "seeds": [n["id"]]})
+    return sites
 
 
 def spec_keys(spec) -> list[str]:
@@ -745,9 +857,15 @@ def _r4(x):
     return float(f"{x:.4g}")
 
 
-def pair_scalars(rb: dict, rc: dict, spec, detail_keys) -> dict:
-    """Flat {(section, id, metric): value} for one pair."""
+def pair_scalars(rb: dict, rc: dict, spec, detail_keys, patch_res=None) -> dict:
+    """Flat {(section, id, metric): value} for one pair. Patch effects of a
+    whole node go with the node; token-group and route patches to 'patch'."""
     s = {}
+    if patch_res is not None:
+        for site in spec["patch_sites"]:
+            sect, ident = ("nodes", site["node"]) if site["id"] == site["node"] else ("patch", site["id"])
+            for m in PATCH_METRICS:
+                s[(sect, ident, m)] = patch_res[site["id"]][m]
 
     def triple(key):
         b, c = rb.get(key), rc.get(key)
@@ -781,16 +899,18 @@ def median_scalars(dicts: list[dict]) -> dict:
 
 
 def aggregate(dicts: list[dict], spread: str) -> dict:
-    """[median, lo, hi, n(>1), n] per scalar; spread 'iqr' or 'minmax'."""
-    view = {"nodes": {}, "keys": {}, "edges": {}}
+    """[median, lo, hi, n(above), n] per scalar; spread 'iqr' or 'minmax';
+    'above' is > 1 for ratios and gains, >= 0.5 for patch effects."""
+    view = {"nodes": {}, "keys": {}, "edges": {}, "patch": {}}
     for key in dicts[0]:
+        sect, ident, metric = key
         v = np.array([d[key] for d in dicts if _finite(d[key])], dtype=np.float64)
         if v.size == 0:
             stat = None
         else:
             lo, hi = (np.percentile(v, [25, 75]) if spread == "iqr" else (v.min(), v.max()))
-            stat = [_r4(np.median(v)), _r4(lo), _r4(hi), int((v > 1).sum()), int(v.size)]
-        sect, ident, metric = key
+            above = (v >= 0.5) if metric in PATCH_METRICS else (v > 1)
+            stat = [_r4(np.median(v)), _r4(lo), _r4(hi), int(above.sum()), int(v.size)]
         view[sect].setdefault(ident, {})[metric] = stat
     return view
 
@@ -799,23 +919,130 @@ def aggregate(dicts: list[dict], spread: str) -> dict:
 # Control boxes and thumbnails
 # ---------------------------------------------------------------------------
 
-def control_candidates(best, bad, frame_wh, rng, max_cos, tries):
-    """Boxes at the same L-inf distance from best as bad, random direction."""
+def control_candidates(best, bad, frame_wh, rng, max_cos):
+    """The attack's own shift, rearranged: d = bad - best with its four
+    components permuted across (x0, y0, x1, y1) and any of them sign-flipped,
+    in random order. Each candidate moves the box by exactly the attack's
+    amounts (same L-inf, same L2, same set of |shifts|) and differs only in
+    which sides move which way. ResizeLongestSide scales x and y alike, so the
+    candidates stay on the pixel grid of the heatmap too."""
     d = (bad - best).astype(np.float64)
-    linf, dn = float(np.abs(d).max()), float(np.linalg.norm(d))
+    dn = float(np.linalg.norm(d))
     W, H = frame_wh
-    for _ in range(tries):
-        u = rng.standard_normal(4)
-        u = u / np.abs(u).max() * linf
-        cos = float(u @ d / (np.linalg.norm(u) * dn + EPS))
-        if cos > max_cos:
+    seen, cands = {tuple(d)}, []
+    for perm in itertools.permutations(range(4)):
+        for signs in itertools.product((1.0, -1.0), repeat=4):
+            u = d[list(perm)] * np.array(signs)
+            if tuple(u) in seen:
+                continue
+            seen.add(tuple(u))
+            cos = float(u @ d / (dn * dn + EPS))
+            if cos > max_cos:
+                continue
+            c = (best.astype(np.float64) + u).astype(np.float32)
+            if not (c[0] < c[2] and c[1] < c[3]):
+                continue
+            if c[0] < 0 or c[1] < 0 or c[2] > W or c[3] > H:
+                continue
+            cands.append((c, cos))
+    for i in rng.permutation(len(cands)):
+        yield cands[i]
+
+
+# ---------------------------------------------------------------------------
+# Activation patching
+# ---------------------------------------------------------------------------
+
+PATCH_METRICS = ("pr", "pb", "pc")
+
+
+class PatchLog:
+    def __init__(self):
+        self.runs = 0
+        self.tensors = 0
+        self.cut_runs = 0
+        self.live: set[str] = set()
+
+
+def run_patch(predictor, box_r, T_r, T_d, site, g: GraphIndex, plog: PatchLog, tol, live):
+    """Forward of the recipient box with one site taken from the donor's
+    forward. Returns the patched binary mask, or None when donor and recipient
+    agree at the site (nothing to patch). Raises if the patched forward
+    disagrees with the drawn graph:
+      a. a tensor outside the site's drawn descendants changed -> an edge is
+         missing from the graph;
+      b. (live, whole-tensor patches only) a drawn outgoing edge did not carry
+         the change -> the edge is dead, or the trace ignores the patched
+         value. A token-group patch may legitimately miss a consumer that reads
+         other rows (final_norm#mask123 never reaches the mask token);
+      c. patching a cut did not reproduce the donor's forward downstream.
+    """
+    sl = TOKEN_GROUPS[site["group"]][1] if site["group"] else None
+    donor, own = T_d[site["src"]], T_r[site["src"]]
+    if torch.equal(donor if sl is None else donor[:, sl], own if sl is None else own[:, sl]):
+        return None
+    T = trace_forward(predictor, box_r, patch={site["at"]: (donor, sl)})
+    may_change = g.reach(site["seeds"])
+    for n in g.nodes:
+        if n["id"] in may_change:
             continue
-        c = (best.astype(np.float64) + u).astype(np.float32)
-        if not (c[0] < c[2] and c[1] < c[3]):
-            continue
-        if c[0] < 0 or c[1] < 0 or c[2] > W or c[3] > H:
-            continue
-        yield c, cos
+        for k in g.keys[n["id"]]:
+            d, _ = _cmp(T[k], T_r[k])
+            plog.tensors += 1
+            if d > tol:
+                raise RuntimeError(f"patching '{site['id']}' changed {k} (node '{n['id']}'), which the graph "
+                                   f"does not draw downstream of it (rel {d:.3g}): an edge is missing")
+    if live and site["group"] is None:
+        whole_node = site["at"] == site["src"]
+        for t in (g.succ[site["node"]] if whole_node else site["seeds"]):
+            if torch.equal(T[g.key[t]], T_r[g.key[t]]):
+                raise RuntimeError(f"patching '{site['id']}' did not reach '{t}': the drawn edge carries nothing")
+            plog.live.add(f"{site['node']}>{t}")
+    if site["group"] is None and site["at"] == site["src"] and g.cut[site["node"]]:
+        for nid in may_change:
+            d, _ = _cmp(T[g.key[nid]], T_d[g.key[nid]])
+            if d > tol:
+                raise RuntimeError(f"patching the cut '{site['id']}' did not reproduce the donor at "
+                                   f"'{nid}' (rel {d:.3g})")
+        plog.cut_runs += 1
+    plog.runs += 1
+    return T["mask"][0, 0]
+
+
+def patch_pair(predictor, best, bad, T_best, T_bad, T_ctrls, gt, iou_best, iou_bad, sites, g, plog, tol):
+    """restore: bad run, site from best -> share of the IoU drop recovered;
+    break: best run, site from bad -> share of the drop reproduced;
+    control: best run, site from each control (median) -> same share, the
+    baseline of what splicing a benign shift's tensor does."""
+    den = iou_best - iou_bad
+
+    def share(iou, recipient):
+        if iou is None or den <= 1e-6:
+            return None
+        return (iou - iou_bad) / den if recipient == "bad" else (iou_best - iou) / den
+
+    res, rows = {}, []
+    for s in sites:
+        out = {}
+        for m, box_r, T_r, T_d, rec_name, donor_name in (("pr", bad, T_bad, T_best, "bad", "best"),
+                                                         ("pb", best, T_best, T_bad, "best", "bad")):
+            mask = run_patch(predictor, box_r, T_r, T_d, s, g, plog, tol, live=True)
+            iou = None if mask is None else mask_iou(mask, gt)
+            out[m] = share(iou, rec_name)
+            rows.append({"site": s["id"], "node": s["node"], "group": s["group"] or "", "metric": m,
+                         "recipient": rec_name, "donor": donor_name, "iou": iou, "effect": out[m]})
+        pcs = []
+        for ci, T_c in enumerate(T_ctrls):
+            mask = run_patch(predictor, best, T_best, T_c, s, g, plog, tol, live=False)
+            iou = None if mask is None else mask_iou(mask, gt)
+            e = share(iou, "best")
+            if e is not None:
+                pcs.append(e)
+            rows.append({"site": s["id"], "node": s["node"], "group": s["group"] or "", "metric": "pc",
+                         "recipient": "best", "donor": f"control{ci + 1}", "iou": iou, "effect": e})
+        out["pc"] = float(np.median(pcs)) if pcs else None
+        res[s["id"]] = out
+    return res, rows
 
 
 BEST_BGR, BAD_BGR, CTRL_BGR = (214, 120, 42), (52, 104, 235), (122, 175, 27)
@@ -864,8 +1091,13 @@ def run(args) -> int:
     sam = predictor.model
     depth = len(sam.mask_decoder.transformer.layers)
     spec = build_spec(depth)
+    gidx = GraphIndex(spec)
+    sites = [] if args.skip_patching else spec["patch_sites"]
+    if not sites:
+        spec["patch_sites"] = []
     const_keys = box_independent_keys(depth)
     log = CheckLog()
+    plog = PatchLog()
 
     cases = json.loads(Path(args.critical_shifts).read_text())
     by_img: OrderedDict[str, list] = OrderedDict()
@@ -875,7 +1107,8 @@ def run(args) -> int:
     print(f"{len(cases)} pairs over {len(by_img)} images in {args.critical_shifts}; using {len(names)} images")
 
     images_dir, masks_dir = Path(args.images_dir), Path(args.masks_dir)
-    repro, pairs_info, pair_rel = [], {}, {}
+    repro, pairs_info, pair_rel, patch_res, patch_rows = [], {}, {}, {}, []
+    ctrl_l2_dev = ctrl_linf_dev = 0.0
     det_max, det_where = 0.0, ""
     zero_max, zero_where = 0.0, ""
     grid_max = 0.0
@@ -932,8 +1165,11 @@ def run(args) -> int:
                 det_max, det_where = rel_again[k_again], k_again
 
             rng = np.random.default_rng([args.seed, pid])
-            controls, rel_ctrl, n_tried = [], [], 0
-            for cbox, cos in control_candidates(best, bad, (in_w, in_h), rng, args.ctrl_max_cos, args.ctrl_tries):
+            controls, rel_ctrl, T_ctrls, n_tried = [], [], [], 0
+            d_att = (bad - best).astype(np.float64)
+            for cbox, cos in control_candidates(best, bad, (in_w, in_h), rng, args.ctrl_max_cos):
+                if args.ctrl_tries and n_tried >= args.ctrl_tries:
+                    break
                 n_tried += 1
                 m_c, _ = predict_official(predictor, cbox)
                 iou_c = mask_iou(m_c, gt)
@@ -941,9 +1177,12 @@ def run(args) -> int:
                     continue
                 T_c, m_c, p_c = trace_and_verify(predictor, cbox, log, args.trace_tol)
                 rel_ctrl.append(rel_divergence(T_best, T_c))
+                T_ctrls.append(T_c)
+                d_c = cbox.astype(np.float64) - best
+                ctrl_l2_dev = max(ctrl_l2_dev, abs(np.linalg.norm(d_c) / np.linalg.norm(d_att) - 1))
+                ctrl_linf_dev = max(ctrl_linf_dev, abs(np.abs(d_c).max() - np.abs(d_att).max()))
                 controls.append({"box": [round(float(v), 2) for v in cbox], "iou": iou_c, "pred_iou": p_c,
                                  "cos_to_attack": round(cos, 3), "mask": m_c})
-                del T_c
                 if len(controls) >= args.n_controls:
                     break
             r["n_ctrl"], r["ctrl_tried"] = len(controls), n_tried
@@ -969,6 +1208,11 @@ def run(args) -> int:
             pair_rel[pid] = {"rb": rel_bad, "rc": rel_c_med,
                              "rc_min": {k: min(rc[k] for rc in rel_ctrl) for k in rel_bad},
                              "rc_max": {k: max(rc[k] for rc in rel_ctrl) for k in rel_bad}}
+            if sites:
+                patch_res[pid], rows = patch_pair(predictor, best, bad, T_best, T_bad, T_ctrls, gt,
+                                                  iou_best, iou_bad, sites, gidx, plog, args.trace_tol)
+                patch_rows.extend(dict(row, pid=pid, image=name) for row in rows)
+            del T_ctrls
 
             thumb = None
             if args.thumb_h > 0:
@@ -1004,12 +1248,16 @@ def run(args) -> int:
     n_kept = len(pair_rel)
     print(f"kept {n_kept}/{len(cases)} pairs; trace checks: {log.runs} runs, "
           f"{log.exact_runs} bit-exact, worst rel diff {log.worst:.3g} ({log.worst_where or '-'})")
+    if sites:
+        print(f"patching: {plog.runs} patched forwards, {plog.tensors} off-graph tensors unchanged, "
+              f"{len(plog.live)}/{len(gidx.var_edges)} edges live, {plog.cut_runs} cut patches = donor")
     if n_kept == 0:
         print("no pair reproduced -- see repro.csv", file=sys.stderr)
         return 1
 
     # --- views -----------------------------------------------------------
-    scal = {pid: pair_scalars(m["rb"], m["rc"], spec, detail_keys) for pid, m in pair_rel.items()}
+    scal = {pid: pair_scalars(m["rb"], m["rc"], spec, detail_keys, patch_res.get(pid))
+            for pid, m in pair_rel.items()}
     images = []
     views = {}
     img_medians = []
@@ -1030,6 +1278,12 @@ def run(args) -> int:
         "determinism": {"max_rel": det_max, "where": det_where},
         "box_independent_zero": {"keys": const_keys, "max_rel": zero_max, "where": zero_where},
         "grid": {"max_dev_px": grid_max},
+        "control_shift": {"max_rel_l2_dev": ctrl_l2_dev, "max_linf_dev_px": ctrl_linf_dev},
+        "patching": None if not sites else {
+            "runs": plog.runs, "sites": len(sites), "tensors_checked": plog.tensors,
+            "cut_runs": plog.cut_runs, "cut_nodes": [n["id"] for n in spec["nodes"] if n["cut"]],
+            "live_edges": len(plog.live), "var_edges": len(gidx.var_edges),
+            "dead_edges": sorted(gidx.var_edges - plog.live)},
     }
     meta = {
         "model": f"SAM {args.model_type}", "checkpoint": Path(args.checkpoint_path).name,
@@ -1047,6 +1301,8 @@ def run(args) -> int:
     html_path = out_dir / "activation_graph.html"
     html_path.write_text(render_html(payload), encoding="utf-8")
     _write_pair_csvs(out_dir, pair_rel, scal, spec, pairs_info)
+    if patch_rows:
+        _write_patch_csv(out_dir / "per_pair_patching.csv", patch_rows)
     (out_dir / "checks.json").write_text(json.dumps(checks, indent=2))
     print(f"wrote {html_path} ({html_path.stat().st_size / 1e6:.1f} MB) and CSVs to {out_dir}")
     return 0
@@ -1072,6 +1328,15 @@ def _write_repro_csv(path, repro):
         w.writeheader()
         for r in repro:
             w.writerow(r)
+
+
+def _write_patch_csv(path, rows):
+    cols = ["pid", "image", "site", "node", "group", "metric", "recipient", "donor", "iou", "effect"]
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: ("" if r[k] is None else r[k]) for k in cols})
 
 
 def _write_pair_csvs(out_dir, pair_rel, scal, spec, pairs_info):
@@ -1141,6 +1406,35 @@ def self_test(args) -> int:
     if nonzero_var:
         ok = False
         print("FAIL graph nodes marked box-dependent did not change:", nonzero_var)
+
+    # controls: rearrangements of the attack shift, so same L-inf and L2
+    best, bad = boxes[0], boxes[1]
+    cands = list(control_candidates(best, bad, (1024, 683), np.random.default_rng(0), 0.9))
+    d = bad.astype(np.float64) - best
+    dev = max(abs(np.linalg.norm(c.astype(np.float64) - best) / np.linalg.norm(d) - 1) for c, _ in cands)
+    print(f"control candidates: {len(cands)}, max |L2 / L2_attack - 1| = {dev:.2g}")
+    if not cands or dev > 1e-4:          # float32 box coordinates
+        ok = False
+        print("FAIL control candidates do not match the attack shift")
+
+    # patching: every site, both directions, checked against the drawn graph
+    g = GraphIndex(spec)
+    print("cut nodes:", [n["id"] for n in spec["nodes"] if n["cut"]])
+    plog = PatchLog()
+    try:
+        for r, dn in ((0, 1), (1, 0)):
+            for site in spec["patch_sites"]:
+                run_patch(predictor, boxes[r], Ts[r], Ts[dn], site, g, plog, args.trace_tol, live=True)
+        dead = sorted(g.var_edges - plog.live)
+        print(f"patching: {len(spec['patch_sites'])} sites, {plog.runs} patched forwards, "
+              f"{plog.tensors} off-graph tensors unchanged, {len(plog.live)}/{len(g.var_edges)} edges live, "
+              f"{plog.cut_runs} cut patches = donor")
+        if dead:
+            ok = False
+            print("FAIL edges never shown to carry a patch:", dead)
+    except RuntimeError as e:
+        ok = False
+        print("FAIL patching:", e)
     print("SELF-TEST", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -1247,6 +1541,9 @@ summary{cursor:pointer;font-weight:600}
       <option value="r">ratio = rel(best→bad) / rel(best→control)</option>
       <option value="rb">rel L2 best→bad</option>
       <option value="rc">rel L2 best→control</option>
+      <option value="pr">patching: восстановление (bad ← best)</option>
+      <option value="pb">patching: поломка (best ← bad)</option>
+      <option value="pc">patching: поломка от control (best ← control)</option>
     </select></label>
     <label>Цвет рёбер <select id="sel-em">
       <option value="gs">специфическое усиление gain(bad) / gain(control)</option>
@@ -1268,15 +1565,19 @@ summary{cursor:pointer;font-weight:600}
   <div class="tbl" id="tbl-nodes"></div>
   <h2>Рёбра с наибольшим усилением (метрика рёбер)</h2>
   <div class="tbl" id="tbl-edges"></div>
+  <h2 id="h-patch">Activation patching: подмена одного тензора</h2>
+  <div class="tbl" id="tbl-patch"></div>
   <details open>
     <summary>Как читать</summary>
     <ul>
       <li><b>Узел</b> — тензор forward-прохода SAM от box prompt до маски; сверху вниз — порядок исполнения. Подписи — термины статьи (Kirillov et al., <i>Segment Anything</i>, 2023, Appendix A); точный путь в коде <code>segment_anything</code> — в панели справа.</li>
       <li><b>rel(a→b)</b> = ‖A<sub>b</sub> − A<sub>a</sub>‖₂ / ‖A<sub>a</sub>‖₂ на тензоре узла; A<sub>a</sub> — активация на best box.</li>
-      <li><b>Цвет узла</b> по умолчанию — <b>ratio</b> = rel(best→bad) / rel(best→control): во сколько раз критический сдвиг меняет этот тензор сильнее, чем безобидный сдвиг той же L∞-величины. Серый (×1) — узел реагирует на критический сдвиг как на любой; красный — сильнее; синий — слабее.</li>
+      <li><b>Цвет узла</b> по умолчанию — <b>ratio</b> = rel(best→bad) / rel(best→control): во сколько раз критический сдвиг меняет этот тензор сильнее, чем безобидный сдвиг того же размера. Серый (×1) — узел реагирует на критический сдвиг как на любой; красный — сильнее; синий — слабее. На входе (box prompt) ratio = 1 по построению control.</li>
       <li><b>Цвет ребра</b> по умолчанию — <b>специфическое усиление</b> gain(bad) / gain(control), где gain = rel(dst) / rel(src). Ровно ratio(dst) = ratio(src) × это число, поэтому слой, который «ломает», — тот, на чьих входящих рёбрах оно ≫ 1. Подписаны только рёбра с усилением ≥ ×2 или ≤ ×0.5.</li>
       <li><b>Штрихованные узлы</b> не зависят от бокса (image embedding, ‘no mask’, image PE, learned tokens). Их расхождение обязано быть ровно 0 — это проверяется (раздел «Проверки»).</li>
-      <li><b>Control</b>: K боксов, сдвинутых от best на ту же L∞-величину, что и best→bad, в случайном направлении (косинус с направлением атаки ≤ порога); оставляются только те, у которых маска осталась хорошей (IoU с GT ≥ порога). rel(best→control) — медиана по K.</li>
+      <li><b>Control</b>: K боксов, у которых стороны best-бокса сдвинуты на те же величины, что в атаке, но переставлены и/или с другими знаками (атака [−9.6, 9.6, 0, −8] → control, например, [9.6, 0, −8, −9.6]); косинус с атакой ≤ порога. У control ровно те же L∞ и L2 сдвига, отличается только то, какие стороны куда едут. Оставляются только control с хорошей маской (IoU с GT ≥ порога). rel(best→control) — медиана по K.</li>
+      <li><b>Activation patching</b> (режимы «patching» в «Цвет узлов» и таблица ниже) отвечает на вопрос «какое расхождение важно», а не «где оно есть». Прогон повторяется с одним тензором, взятым из прогона другого бокса; всё ниже по графу пересчитывается. <b>Восстановление</b>: bad-прогон, тензор узла из best — какая доля потерянного IoU вернулась. <b>Поломка</b>: best-прогон, тензор из bad — какая доля потери воспроизвелась. <b>Поломка от control</b>: то же с тензором control-бокса — базовая линия: сколько ломает сама «склейка» двух прогонов. Значимо, когда поломка заметно выше этой линии.</li>
+      <li><b>Разрез</b> — узел, через который проходит любой путь от бокса к маске (box, corner PE, prompt tokens, tokens, low-res и upscaled логиты, mask). Подмена в нём = подмена всего бокса, поэтому там 100% по определению; интересны узлы между разрезами. В середине декодера путей много: residual-сумма, image-сторона и re-added prompt tokens, которые вносят бокс в каждую attention в обход слоёв (их подмена отдельно — строки «только re-added prompt tokens» и «только вход в decoder layer 1»).</li>
       <li><b>Агрегация</b>: пара → медиана по парам картинки → медиана по картинкам. Диапазон в «Все картинки» — IQR по картинкам, в виде одной картинки — min–max по её парам. «n&gt;1» — у скольких картинок (пар) значение больше 1.</li>
       <li>Пара попадает в граф, только если пересчёт SAM даёт IoU best и bad в пределах допуска от JSON (раздел «Сверка с JSON»).</li>
     </ul>
@@ -1323,6 +1624,10 @@ function fmtX(x) {
   if (x >= 0.1) return "×" + x.toFixed(2);
   return "×" + x.toPrecision(2);
 }
+function fmtPct(x) {
+  if (x == null || !isFinite(x)) return "—";
+  return Math.round(x * 100) + "%";
+}
 function fmtRel(x) {
   if (x == null || !isFinite(x)) return "—";
   if (x === 0) return "0";
@@ -1336,7 +1641,14 @@ const METRIC = {
   gs: {name: "специфическое усиление", long: "gain(bad) / gain(control)", kind: "div", fmt: fmtX},
   gb: {name: "усиление best→bad", long: "rel(dst) / rel(src)", kind: "div", fmt: fmtX},
   gc: {name: "усиление best→control", long: "rel(dst) / rel(src)", kind: "div", fmt: fmtX},
+  pr: {name: "patching: восстановление", long: "bad-прогон, тензор узла из best: доля вернувшегося IoU", kind: "unit", fmt: fmtPct},
+  pb: {name: "patching: поломка", long: "best-прогон, тензор узла из bad: доля потерянного IoU", kind: "unit", fmt: fmtPct},
+  pc: {name: "patching: поломка от control", long: "best-прогон, тензор узла из control: базовая линия", kind: "unit", fmt: fmtPct},
 };
+const PATCH = ["pr", "pb", "pc"];
+const PATCH_ROW = {pr: "восстановление: bad ← best", pb: "поломка: best ← bad", pc: "поломка: best ← control"};
+const HAS_PATCH = Array.isArray(S.patch_sites) && S.patch_sites.length > 0;
+function nLabel(m) { return METRIC[m].kind === "unit" ? "≥50%" : ">1"; }
 
 // ---------- colour ----------
 const PAL = {
@@ -1371,7 +1683,9 @@ function textOn(hex) {
 // neutral midpoint is a mid gray that stays visible on the surface
 function colorFor(metric, x, dom, pal) {
   if (x == null || !isFinite(x)) return null;
-  return METRIC[metric].kind === "div" ? divColor(Math.max(x, 1e-9), pal) : seqColor(x, dom);
+  const kind = METRIC[metric].kind;
+  if (kind === "unit") return ramp(PAL[scheme()].seq, x);
+  return kind === "div" ? divColor(Math.max(x, 1e-9), pal) : seqColor(x, dom);
 }
 
 // ---------- data access ----------
@@ -1380,6 +1694,8 @@ function V() { return D.views[vid()]; }
 function ns(id, m) { const x = V().nodes[id]; return x ? x[m] : null; }
 function es(id, m) { const x = V().edges[id]; return x ? x[m] : null; }
 function ks(k, m) { const x = V().keys[k]; return x ? x[m] : null; }
+function ps(id, m) { const x = (V().patch || {})[id]; return x ? x[m] : null; }
+function siteStat(site, m) { return site.id === site.node ? ns(site.node, m) : ps(site.id, m); }
 function seqDomain(m) {
   const v = S.nodes.filter(n => n.kind !== "const").map(n => ns(n.id, m)).filter(s => s && s[0] > 0).map(s => Math.log10(s[0]));
   if (!v.length) return [-4, 0];
@@ -1456,6 +1772,11 @@ function nodeTipRows(n) {
     const s = ns(n.id, m), p = npos(s);
     rows.push(["v", METRIC[m].name + ": " + statText(s, METRIC[m].fmt) + (m === "r" && p ? "   (>1: " + p + ")" : "")]);
   }
+  if (HAS_PATCH) for (const m of PATCH) {
+    const s = ns(n.id, m), p = npos(s);
+    rows.push(["v", METRIC[m].name + ": " + statText(s, fmtPct) + (p ? "   (≥50%: " + p + ")" : "")]);
+  }
+  if (HAS_PATCH && n.cut) rows.push(["l", "разрез графа: подмена = подмена всего бокса"]);
   return rows;
 }
 function edgeTipRows(e) {
@@ -1543,8 +1864,12 @@ function drawGraph() {
     if (n.kind === "const") t2.textContent = "const · ≡ 0";
     else {
       t2.textContent = s && s[0] != null ? METRIC[st.nm].fmt(s[0]) : "—";
-      const pp = npos(s);
-      if (st.nm === "r" && pp && s[4] > 1) { const ts = sv("tspan", {"font-size": 11}); ts.textContent = "   >1: " + pp; t2.appendChild(ts); }
+      const pp = npos(s), unit = METRIC[st.nm].kind === "unit";
+      let extra = "";
+      if (unit && n.cut) extra = "   · разрез";
+      else if (unit && !n.affects_mask) extra = "   · не влияет на маску";
+      else if ((st.nm === "r" || unit) && pp && s[4] > 1) extra = "   " + nLabel(st.nm) + ": " + pp;
+      if (extra) { const ts = sv("tspan", {"font-size": 11}); ts.textContent = extra; t2.appendChild(ts); }
     }
     g.appendChild(t2);
     g.addEventListener("pointerenter", ev => showTip(ev, nodeTipRows(n)));
@@ -1573,7 +1898,9 @@ function legendBar(metric, dom, pal) {
   bar.style.background = "linear-gradient(90deg," + stops.join(",") + ")";
   it.appendChild(bar);
   const ticks = el("div", {class: "ticks"});
-  const labels = METRIC[metric].kind === "div" ? ["≤×1/8", "×1/2", "×1", "×2", "≥×8"]
+  const kind = METRIC[metric].kind;
+  const labels = kind === "div" ? ["≤×1/8", "×1/2", "×1", "×2", "≥×8"]
+    : kind === "unit" ? ["0%", "50%", "100%"]
     : [dom[0], (dom[0] + dom[1]) / 2, dom[1]].map(v => "1e" + (Math.round(v * 10) / 10));
   for (const l of labels) ticks.appendChild(el("span", null, l));
   it.appendChild(ticks);
@@ -1612,19 +1939,30 @@ function drawSummary() {
     statText(best.s, fmtX) + (npos(best.s) ? "  (>1: " + npos(best.s) + ")" : "")));
   const sm = ns("mask", "r");
   if (sm) box.appendChild(chip("на выходе (mask) ratio:", fmtX(sm[0]), ""));
+  if (HAS_PATCH) {
+    // the earliest node between the cuts whose single tensor already decides the mask
+    const firstAt = m => S.nodes.find(n => n.kind !== "const" && !n.cut && n.affects_mask &&
+      (s => s && s[0] != null && s[0] >= 0.5)(ns(n.id, m)));
+    for (const [m, title] of [["pr", "первый узел (кроме разрезов), чья подмена на best возвращает ≥50% IoU:"],
+                              ["pb", "первый узел (кроме разрезов), чья подмена на bad отнимает ≥50% IoU:"]]) {
+      const n = firstAt(m);
+      box.appendChild(chip(title, n ? n.label : "нет", n ? "(" + n.key + ")  " + statText(ns(n.id, m), fmtPct) +
+        "; от control: " + fmtPct((ns(n.id, "pc") || [])[0]) : ""));
+    }
+  }
 }
 
 // ---------- side panel ----------
-function metricTable(rows, withN) {
+function metricTable(rows, nl) {
   const t = el("table"); const h = el("tr");
-  for (const c of ["", "медиана", spreadLabel() || "", withN ? ">1" : ""]) h.appendChild(el("th", {class: "num"}, c));
+  for (const c of ["", "медиана", spreadLabel() || "", nl || ""]) h.appendChild(el("th", {class: "num"}, c));
   t.appendChild(h);
   for (const [label, s, fmt] of rows) {
     const tr = el("tr");
     tr.appendChild(el("td", null, label));
     tr.appendChild(el("td", {class: "num"}, s && s[0] != null ? fmt(s[0]) : "—"));
     tr.appendChild(el("td", {class: "num"}, s && s[4] > 1 ? fmt(s[1]) + " – " + fmt(s[2]) : ""));
-    tr.appendChild(el("td", {class: "num"}, withN ? npos(s) : ""));
+    tr.appendChild(el("td", {class: "num"}, nl ? npos(s) : ""));
     t.appendChild(tr);
   }
   return t;
@@ -1658,7 +1996,26 @@ function drawPanel() {
     if (n.note) P.appendChild(el("p", {class: "note"}, n.note));
     if (n.kind === "const") { P.appendChild(el("p", null, "Не зависит от бокса: внутри пары тензор одинаков, расхождение ≡ 0 (проверено).")); }
     else {
-      P.appendChild(metricTable([["ratio", ns(n.id, "r"), fmtX], ["rel best→bad", ns(n.id, "rb"), fmtRel], ["rel best→control", ns(n.id, "rc"), fmtRel]], true));
+      P.appendChild(metricTable([["ratio", ns(n.id, "r"), fmtX], ["rel best→bad", ns(n.id, "rb"), fmtRel], ["rel best→control", ns(n.id, "rc"), fmtRel]], ">1"));
+      if (HAS_PATCH) {
+        P.appendChild(el("h3", {style: "margin-top:12px"}, "Activation patching"));
+        if (n.cut) P.appendChild(el("p", {class: "note"}, "Разрез графа: любой путь от бокса к маске проходит через этот узел, поэтому подмена = подмена всего бокса (проверено: прогон после подмены побитово равен прогону донора)."));
+        else if (!n.affects_mask) P.appendChild(el("p", {class: "note"}, "Узел не лежит на пути к маске: подмена не может её изменить."));
+        P.appendChild(metricTable(PATCH.map(m => [PATCH_ROW[m], ns(n.id, m), fmtPct]), "≥50%"));
+        const extra = S.patch_sites.filter(x => x.node === n.id && x.id !== n.id);
+        if (extra.length) {
+          const t = el("table"); const h = el("tr");
+          for (const c of ["подменено только", "восст.", "поломка", "ctrl"]) h.appendChild(el("th", {class: c === "подменено только" ? "" : "num"}, c));
+          t.appendChild(h);
+          for (const x of extra) {
+            const tr = el("tr");
+            tr.appendChild(el("td", null, x.sub));
+            for (const m of PATCH) tr.appendChild(el("td", {class: "num"}, fmtPct((ps(x.id, m) || [])[0])));
+            t.appendChild(tr);
+          }
+          P.appendChild(t);
+        }
+      }
       if (n.internals.length) { P.appendChild(el("h3", {style: "margin-top:12px"}, "Внутри")); P.appendChild(keyTable(n.internals)); }
       if (n.tok) {
         P.appendChild(el("h3", {style: "margin-top:12px"}, "По группам токенов"));
@@ -1690,7 +2047,7 @@ function drawPanel() {
       ? "positional encodings are added to the image embedding whenever they participate in an attention layer"
       : "the entire original prompt tokens (including their positional encodings) are re-added to the updated tokens whenever they participate in an attention layer") + "»"));
     if (NODE[e.src].kind === "const") P.appendChild(el("p", null, "Источник не зависит от бокса — усиление не определено."));
-    else P.appendChild(metricTable([["специфическое", es(e.id, "gs"), fmtX], ["best→bad", es(e.id, "gb"), fmtX], ["best→control", es(e.id, "gc"), fmtX]], true));
+    else P.appendChild(metricTable([["специфическое", es(e.id, "gs"), fmtX], ["best→bad", es(e.id, "gb"), fmtX], ["best→control", es(e.id, "gc"), fmtX]], ">1"));
     const b1 = el("button", {type: "button"}, "← " + NODE[e.src].label); b1.addEventListener("click", () => select({type: "node", id: e.src}));
     const b2 = el("button", {type: "button"}, NODE[e.dst].label + " →"); b2.addEventListener("click", () => select({type: "node", id: e.dst}));
     const row = el("p"); row.append(b1, document.createTextNode(" "), b2); P.appendChild(row);
@@ -1730,6 +2087,25 @@ function drawTables() {
     t2.appendChild(tr);
   }
   $("tbl-edges").replaceChildren(t2);
+}
+
+function drawPatchTable() {
+  if (!HAS_PATCH) { $("h-patch").hidden = true; $("tbl-patch").hidden = true; return; }
+  const t = el("table"); const h = el("tr");
+  for (const c of ["подмена", "код", PATCH_ROW.pr, PATCH_ROW.pb, PATCH_ROW.pc, "≥50% восст."])
+    h.appendChild(el("th", {class: ["подмена", "код"].includes(c) ? "" : "num"}, c));
+  t.appendChild(h);
+  for (const x of S.patch_sites) {
+    const n = NODE[x.node], whole = x.id === x.node;
+    const tr = el("tr", {class: "click"});
+    tr.appendChild(el("td", null, whole ? n.label + (n.cut ? "  (разрез)" : "") : "    ↳ " + x.sub));
+    tr.appendChild(el("td", {class: "mono"}, whole ? n.key : ""));
+    for (const m of PATCH) tr.appendChild(el("td", {class: "num"}, statText(siteStat(x, m), fmtPct)));
+    tr.appendChild(el("td", {class: "num"}, npos(siteStat(x, "pr"))));
+    tr.addEventListener("click", () => { select({type: "node", id: x.node}); $("graph").scrollIntoView({behavior: "smooth", block: "start"}); });
+    t.appendChild(tr);
+  }
+  $("tbl-patch").replaceChildren(t);
 }
 
 // ---------- thumbnails ----------
@@ -1781,6 +2157,14 @@ function drawChecks() {
     [C.box_independent_zero.max_rel === 0, "Тензоры, не зависящие от бокса (" + C.box_independent_zero.keys.length + "), дают rel = " + C.box_independent_zero.max_rel.toExponential(2) + (C.box_independent_zero.where ? " (" + C.box_independent_zero.where + ")" : "") + "."],
     [C.grid.max_dev_px < 0.01, "Кадр боксов: JSON-боксы / масштаб ResizeLongestSide отстоят от целой пиксельной сетки исходной картинки максимум на " + C.grid.max_dev_px.toFixed(4) + " px (ожидается ≈0: боксы действительно в 1024-кадре SAM)."],
   ];
+  const cs = C.control_shift;
+  if (cs) items.push([cs.max_rel_l2_dev < 1e-4, "Control = перестановки сдвига атаки: макс. |L2/L2_атаки − 1| = " + cs.max_rel_l2_dev.toExponential(1) + ", макс. разница L∞ = " + cs.max_linf_dev_px.toExponential(1) + " px (округление float32)."]);
+  const PC = C.patching;
+  if (PC) {
+    items.push([true, "Activation patching: " + PC.runs + " прогонов с подменой в " + PC.sites + " точках; ни один тензор вне нарисованных потомков подменённого узла не изменился (" + PC.tensors_checked + " сравнений) — в графе нет пропущенных зависимостей."]);
+    items.push([PC.dead_edges.length === 0, "Живые рёбра: " + PC.live_edges + "/" + PC.var_edges + " рёбер из зависящих от бокса узлов действительно переносят подмену" + (PC.dead_edges.length ? " (не подтверждены: " + PC.dead_edges.join(", ") + ")" : "") + "."]);
+    items.push([true, "Разрезы (" + PC.cut_nodes.join(", ") + "): " + PC.cut_runs + " подмен побитово воспроизвели прогон донора ниже по графу."]);
+  }
   const ul = el("ul");
   for (const [ok, text] of items) { const li = el("li"); li.appendChild(el("b", {class: ok ? "ok" : "warn"}, ok ? "OK  " : "ВНИМАНИЕ  ")); li.appendChild(document.createTextNode(text)); ul.appendChild(li); }
   box.appendChild(ul);
@@ -1831,7 +2215,7 @@ function readHash() {
   if (img && D.images.some(x => x.name === img)) st.img = img;
   const pair = h.get("pair");
   if (pair && st.img !== "all" && D.images.find(x => x.name === st.img).pids.map(String).includes(pair)) st.pair = pair;
-  if (["r", "rb", "rc"].includes(h.get("nm"))) st.nm = h.get("nm");
+  if (["r", "rb", "rc", ...(HAS_PATCH ? PATCH : [])].includes(h.get("nm"))) st.nm = h.get("nm");
   if (["gs", "gb", "gc"].includes(h.get("em"))) st.em = h.get("em");
   st.pe = h.get("pe") === "1";
   const sel = h.get("sel") || "", i = sel.indexOf(":");
@@ -1853,7 +2237,7 @@ function writeHash() {
   if (th) h.set("theme", th);
   try { history.replaceState(null, "", "#" + h.toString()); } catch (e) { /* file:// in some browsers */ }
 }
-function render() { fillSelects(); drawLegend(); drawSummary(); drawGraph(); drawPanel(); drawTables(); drawThumbs(); writeHash(); }
+function render() { fillSelects(); drawLegend(); drawSummary(); drawGraph(); drawPanel(); drawTables(); drawPatchTable(); drawThumbs(); writeHash(); }
 $("sel-img").addEventListener("change", e => { st.img = e.target.value; st.pair = ""; render(); });
 $("sel-pair").addEventListener("change", e => { st.pair = e.target.value; render(); });
 $("sel-nm").addEventListener("change", e => { st.nm = e.target.value; render(); });
@@ -1861,10 +2245,11 @@ $("sel-em").addEventListener("change", e => { st.em = e.target.value; render(); 
 $("chk-pe").addEventListener("change", e => { st.pe = e.target.checked; drawGraph(); writeHash(); });
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
 
+if (!HAS_PATCH) for (const k of PATCH) { const o = $("sel-nm").querySelector('option[value="' + k + '"]'); if (o) o.remove(); }
 const m = D.meta;
 $("meta").textContent = m.model + " · " + m.checkpoint + " · " + m.json + ": " + m.n_pairs_kept + "/" + m.n_pairs_json +
   " пар воспроизведено (допуск IoU ±" + m.repro_tol + "), " + m.n_images + " картинок · control: K=" + m.n_controls +
-  ", IoU ≥ " + m.ctrl_min_iou + ", cos ≤ " + m.ctrl_max_cos + " · " + m.device + ", torch " + m.torch + " · " + m.created;
+  " перестановок сдвига атаки, IoU ≥ " + m.ctrl_min_iou + ", cos ≤ " + m.ctrl_max_cos + " · " + m.device + ", torch " + m.torch + " · " + m.created;
 readHash(); drawChecks(); drawRepro(); render();
 })();
 </script>
@@ -1890,7 +2275,9 @@ def parse_args(argv=None):
                    help="a control box must keep IoU with GT >= this (the 'good' threshold of find_critical_shifts)")
     p.add_argument("--ctrl_max_cos", type=float, default=0.9,
                    help="max cosine between the control and the attack displacement")
-    p.add_argument("--ctrl_tries", type=int, default=300)
+    p.add_argument("--ctrl_tries", type=int, default=0,
+                   help="max control candidates to try (0 = all rearrangements of the attack shift, <= 383)")
+    p.add_argument("--skip_patching", action="store_true", help="divergence graph only, no activation patching")
     p.add_argument("--trace_tol", type=float, default=1e-5,
                    help="max relative difference trace vs SAM's own module outputs (expected: 0)")
     p.add_argument("--seed", type=int, default=0)
