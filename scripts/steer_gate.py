@@ -88,10 +88,13 @@ import steer_user_study as SUS  # noqa: E402
 from steer_sam_decoder import Cfg, Runner, assign_folds, batch_iou, build_sites, feature_of, make_edit, mask_change  # noqa: E402
 
 try:
-    from sklearn.ensemble import HistGradientBoostingRegressor
+    from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 except ImportError:                                   # scikit-learn < 1.0
     from sklearn.experimental import enable_hist_gradient_boosting  # noqa: F401
-    from sklearn.ensemble import HistGradientBoostingRegressor
+    from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 KEY, GROUPS, TOKEN_NAMES, _a, _name = SUS.KEY, SUS.GROUPS, SUS.TOKEN_NAMES, SUS._a, SUS._name
 PROJ = [f"proj_{t}" for t in TOKEN_NAMES]
@@ -261,13 +264,14 @@ def fit_tau(pred0: np.ndarray, d: np.ndarray) -> float:
     return float(cands[int(np.argmax(gains))])
 
 
-def make_gbm(seed: int):
+def make_gbm(seed: int, classifier: bool = False):
+    cls = HistGradientBoostingClassifier if classifier else HistGradientBoostingRegressor
     kw = dict(max_depth=3, learning_rate=0.05, max_iter=300, min_samples_leaf=40, l2_regularization=1.0,
               random_state=seed)
     try:
-        return HistGradientBoostingRegressor(early_stopping=False, **kw)
+        return cls(early_stopping=False, **kw)
     except TypeError:                                 # scikit-learn < 0.23: no early stopping by default
-        return HistGradientBoostingRegressor(**kw)
+        return cls(**kw)
 
 
 class Policies:
@@ -384,6 +388,173 @@ def analyse(D: pd.DataFrame, ref: pd.DataFrame | None, args) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Methods table: one row per method, every test table, and their mean
+# ---------------------------------------------------------------------------
+#   IoU-head selector      alpha (or none) whose steered mask SAM's IoU head
+#                          scores highest -- best-of-N over alpha, no training
+#   alpha selector         a classifier of the box's best alpha (GT argmax over
+#                          none + the grid), logistic regression or GBM, on the
+#                          box features + every alpha's features side by side
+#   alpha regressor        the gain of every alpha regressed (linear regression,
+#                          one per alpha; or the long-table GBM of Policies),
+#                          then the alpha with the largest predicted gain, none
+#                          if no predicted gain > 0
+
+def alpha_x(D: pd.DataFrame, a: float) -> np.ndarray:
+    k = _a(a)
+    return np.column_stack([D[f"pred_{k}"] - D.pred0, D[f"chg_{k}"], D[f"fill_{k}"] - D.fill0,
+                            D[f"stab_{k}"] - D.stab0])
+
+
+class Methods:
+    def __init__(self, args):
+        self.alphas, self.fs, self.seed = list(args.alphas), args.methods_features, args.seed
+        self.fixed = [a for a in args.fixed_alphas if a in self.alphas]
+
+    def _bx(self, D):
+        return D[BOX_FEATS[self.fs]].to_numpy(float)
+
+    def _wide(self, D):
+        return np.hstack([self._bx(D)] + [alpha_x(D, a) for a in self.alphas])
+
+    def fit(self, D: pd.DataFrame) -> "Methods":
+        W = iou_matrix(D, self.alphas)
+        Xw, best = self._wide(D), W.argmax(1)
+        self.sel = OrderedDict([
+            ("α-селектор, логистическая регрессия",
+             make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=5000)).fit(Xw, best)),
+            ("α-селектор, GBM", make_gbm(self.seed, classifier=True).fit(Xw, best))])
+        bx = self._bx(D)
+        self.lin = [make_pipeline(StandardScaler(), LinearRegression()).fit(np.hstack([bx, alpha_x(D, a)]),
+                                                                            W[:, j + 1] - W[:, 0])
+                    for j, a in enumerate(self.alphas)]
+        self.gbm = make_gbm(self.seed).fit(*long_xy(D, self.alphas, self.fs))
+        return self
+
+    def choose(self, D: pd.DataFrame) -> "OrderedDict[str, np.ndarray]":
+        n = len(D)
+        cols = OrderedDict((f"α = {a:g}", np.full(n, self.alphas.index(a) + 1)) for a in self.fixed)
+        cols["IoU-head селектор"] = D[["pred0"] + [f"pred_{_a(a)}" for a in self.alphas]].to_numpy(float).argmax(1)
+        Xw = self._wide(D)
+        for name, m in self.sel.items():
+            cols[name] = m.predict(Xw).astype(int)
+        bx = self._bx(D)
+        P = np.column_stack([m.predict(np.hstack([bx, alpha_x(D, a)])) for m, a in zip(self.lin, self.alphas)])
+        cols["α-регрессор, линейная регрессия"] = np.where(P.max(1) > 0, P.argmax(1) + 1, 0)
+        P = self.gbm.predict(long_xy(D, self.alphas, self.fs)[0]).reshape(len(self.alphas), n).T
+        cols["α-регрессор, GBM"] = np.where(P.max(1) > 0, P.argmax(1) + 1, 0)
+        return cols
+
+
+def boot_samples(d: np.ndarray, images: np.ndarray, n_boot: int, seed: int) -> np.ndarray:
+    """Bootstrap means of d over images (the boxes of an image drawn together)."""
+    codes, img = np.unique(images, return_inverse=True)
+    S = np.bincount(img, weights=d, minlength=len(codes))
+    N = np.bincount(img, minlength=len(codes)).astype(float)
+    idx = np.random.default_rng(seed).integers(0, len(codes), size=(n_boot, len(codes)))
+    return S[idx].sum(1) / N[idx].sum(1)
+
+
+def methods_table(D: pd.DataFrame, ref: pd.DataFrame | None, args) -> pd.DataFrame:
+    """Methods fitted on --methods_train, every other table scored; then the
+    mean over the test tables (all / natural / medical), each table weighted
+    equally, its CI from a bootstrap that resamples images within each table."""
+    alphas = list(args.alphas)
+    train = args.methods_train.split("+")
+    M = Methods(args).fit(D[D.table.isin(train)].reset_index(drop=True))
+    tests = [t for t in dict.fromkeys(D.table) if t not in train]
+    per = OrderedDict()
+    for t in tests:
+        Dt = D[D.table == t].reset_index(drop=True)
+        W = iou_matrix(Dt, alphas)
+        rows = OrderedDict([("undef", (W[:, 0], W[:, 0]))])
+        if ref is not None:
+            e = Dt[KEY].merge(ref, on=KEY, how="left")
+            rows["grad"] = (e.grad_final_iou.to_numpy(float), e.undefended_iou.to_numpy(float))
+        for name, c in M.choose(Dt).items():
+            rows[name] = (W[np.arange(len(Dt)), c], W[:, 0])
+        per[t] = (Dt, rows)
+
+    out = []
+    samples = {}                                       # (table, method, group) -> bootstrap means of d
+    for ti, (t, (Dt, rows)) in enumerate(per.items()):
+        img, grp = Dt.image_name.to_numpy(), Dt.group.to_numpy()
+        for name, (x, u) in rows.items():
+            for g in GROUPS:
+                m = (np.ones(len(Dt), bool) if g == "all" else grp == g) & np.isfinite(x)
+                d = x[m] - u[m]
+                s = boot_samples(d, img[m], args.n_boot, args.seed + ti)
+                samples[(t, name, g)] = s
+                lo, hi = np.percentile(s, [2.5, 97.5])
+                out.append({"block": t, "method": name, "group": g, "n": int(m.sum()), "iou": x[m].mean(),
+                            "base": u[m].mean(), "d": d.mean(), "d_lo": lo, "d_hi": hi,
+                            "pct": (x[m].mean() - u[m].mean()) / u[m].mean() * 100})
+    T = pd.DataFrame(out)
+    natural = [t for t in tests if t not in SUS.MEDICAL]
+    medical = [t for t in tests if t in SUS.MEDICAL]
+    means = [(f"среднее по {len(tests)} test", tests), (f"среднее, натуральные ({len(natural)})", natural),
+             (f"среднее, медицина ({len(medical)})", medical)]
+    macro = []
+    for label, ts in means:
+        if not ts:
+            continue
+        for name in per[tests[0]][1]:
+            for g in GROUPS:
+                s = T[(T.block.isin(ts)) & (T.method == name) & (T.group == g)]
+                iou, base = s.iou.mean(), s.base.mean()
+                boot = np.mean([samples[(t, name, g)] for t in ts], axis=0)
+                lo, hi = np.percentile(boot, [2.5, 97.5])
+                macro.append({"block": label, "method": name, "group": g, "n": int(s.n.sum()), "iou": iou,
+                              "base": base, "d": s.d.mean(), "d_lo": lo, "d_hi": hi,
+                              "pct": (iou - base) / base * 100})
+    return pd.concat([T, pd.DataFrame(macro)], ignore_index=True)
+
+
+def md_methods(T: pd.DataFrame, D: pd.DataFrame, args) -> str:
+    train = args.methods_train.split("+")
+    n_tr = D[D.table.isin(train)]
+    L = ["# Steering SAM-1 vit_b: фиксированные α и выбор α по боксу, user study (`m`)", "",
+         "**Где и что прибавляется.** Узел `L2.norm2` — выход LayerNorm `norm2` второго (последнего) two-way блока "
+         "декодера масок, т.е. поток токенов сразу после cross-attention «токены → картинка». Вектор прибавляется "
+         "ко **всем 7 токенам** декодера: IoU-токен, 4 mask-токена (маску даёт mask-токен 0, multimask выключен) "
+         "и 2 prompt-токена углов бокса; у каждого токена свой вектор (7 × 256), h' = h + α·v. "
+         "Энкодер картинки, prompt encoder и остальной декодер не меняются.", "",
+         f"**Вектор.** DM = среднее top50 − среднее bottom50, разность внутри каждой картинки, усреднена по "
+         f"25 картинкам COCO (половина A, 625 боксов), заморожен; ‖v‖ ≈ 3.2% ‖h‖ при α = 1. "
+         f"**Селекторы и регрессоры** обучены только на {', '.join(train)} ({n_tr.image_name.nunique()} картинок, "
+         f"{len(n_tr)} боксов; метки — на векторе других фолдов A), признаки без GT (`{args.methods_features}`: "
+         "предсказанный IoU, stability, заполнение бокса маской и то, как каждая α сдвигает маску и прогноз), "
+         f"сетка α = {', '.join(f'{a:g}' for a in args.alphas)} или без steering. На тестовых наборах ничего "
+         "не подбиралось.", "",
+         "- *IoU-head селектор* — α (или без steering), при которой IoU-голова SAM даёт наибольший предсказанный "
+         "IoU; без обучения;",
+         "- *α-селектор* — классификатор лучшей α бокса (логистическая регрессия / GBM);",
+         "- *α-регрессор* — регрессия выигрыша IoU при каждой α (линейная регрессия / GBM), берётся α с наибольшим "
+         "предсказанным выигрышем, если он > 0;",
+         "- *grad* — градиентная доводка бокса по IoU-голове (`samfull_m.csv`, те же боксы).", "",
+         "Ячейка — IoU и прирост к undef в %; Δ — к undef с 95% CI (бутстреп по картинкам; для средних — внутри "
+         "каждого набора). Группы — по undef IoU внутри картинки (12 худших / 13 лучших из 25). "
+         "Жирным — лучший метод в колонке внутри блока.", "",
+         "| набор | метод | all | bottom50 | top50 | Δ all [95% CI] |", "|---|---|---|---|---|---|"]
+    for block, B in T.groupby("block", sort=False):
+        n_img = D[D.table == block].image_name.nunique() if block in set(D.table) else None
+        title = (f"**{'COCO (половина B)' if block == 'COCO_B' else _name(block)}**, {n_img} изобр."
+                 if n_img else f"**{block}**")
+        best = {g: B[(B.group == g) & (B.method != "undef")].iou.max() for g in GROUPS}
+        for i, (name, s) in enumerate(B.groupby("method", sort=False)):
+            s = s.set_index("group")
+            cells = []
+            for g in GROUPS:
+                r = s.loc[g]
+                c = f"{r.iou:.4f}" if name == "undef" else f"{r.iou:.4f} ({r.pct:+.2f}%)"
+                cells.append(f"**{c}**" if name != "undef" and np.isclose(r.iou, best[g]) else c)
+            a = s.loc["all"]
+            ci = "—" if name == "undef" else f"{a.d:+.4f} [{a.d_lo:+.4f}, {a.d_hi:+.4f}]"
+            L.append(f"| {title if i == 0 else ''} | {name} | " + " | ".join(cells) + f" | {ci} |")
+    return "\n".join(L) + "\n"
+
+
+# ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
 
@@ -471,11 +642,17 @@ def run(args) -> int:
             return fail(", ".join(failed))
         (out / "checks.json").write_text(json.dumps(checks, indent=2, default=SUS._json_default), encoding="utf-8")
 
-    res = analyse(D, ref, args)
-    res.to_csv(out / "gate_results.csv", index=False)
-    md = summary_md(res, D, args, checks)
-    (out / "summary_gate.md").write_text(md, encoding="utf-8")
     enc = sys.stdout.encoding or "utf-8"
+    if not args.methods_only:
+        res = analyse(D, ref, args)
+        res.to_csv(out / "gate_results.csv", index=False)
+        md = summary_md(res, D, args, checks)
+        (out / "summary_gate.md").write_text(md, encoding="utf-8")
+        print("\n" + md.encode(enc, "replace").decode(enc))
+    T = methods_table(D, ref, args)
+    T.to_csv(out / "table_methods.csv", index=False)
+    md = md_methods(T, D, args)
+    (out / "table_methods.md").write_text(md, encoding="utf-8")
     print("\n" + md.encode(enc, "replace").decode(enc))
     meta = {"args": vars(args), "boxes": int(len(D)), "tables": D.table.value_counts().to_dict(),
             "minutes": round((time.time() - t0) / 60, 1), "created": time.strftime("%Y-%m-%d %H:%M")}
@@ -504,6 +681,9 @@ def parse_args(argv=None):
     p.add_argument("--feature_sets", nargs="*", default=list(BOX_FEATS), choices=list(BOX_FEATS))
     p.add_argument("--regimes", nargs="*", default=["COCO_A", "COCO_A+COCO_B+Berkeley+GrabCut"],
                    help="training tables per regime, joined by +; scored on every other table")
+    p.add_argument("--methods_train", default="COCO_A", help="training tables of the methods table, joined by +")
+    p.add_argument("--methods_features", default="out", choices=list(BOX_FEATS), help="features of the methods table")
+    p.add_argument("--methods_only", action="store_true", help="only the methods table (with --from_dump)")
     p.add_argument("--folds", type=int, default=5, help="image folds: cross-fitting on A, out-of-fold scores")
     p.add_argument("--split_seed", type=int, default=0)
     p.add_argument("--seed", type=int, default=0)
