@@ -36,6 +36,17 @@ PROTOCOL  (STEERING_USER_STUDY_HANDOFF.md)
             pre-registered configuration; 0.5 and 0.1 are smaller doses of the
             same vector
 
+FROZEN VECTOR ON OTHER SUBSETS  (--vector, --datasets, --select_alpha_on)
+  --vector takes v and rand from a finished run's vector.npz instead of
+  recomputing them, so every subset of the user study -- the medical ones
+  (ACDC, BUID, MedScribble) included -- sees exactly the vector reported
+  before; the split must match the split.json next to it, so COCO B stays
+  held out. A sweep over larger alphas is reported in full, but picking the
+  best alpha by a test table is optimistic. alpha* is therefore chosen on the
+  --select_alpha_on tables (natural images by default: the largest mean delta
+  IoU over all boxes, the tables weighted equally, ties -> the smaller alpha)
+  and carried over, frozen, to every other subset.
+
 METRICS (per dataset x alpha x group)
 -------
   IoU with GT (inter / (union + 1e-6)), its delta to the undefended forward
@@ -55,9 +66,11 @@ CHECKS (checks.json; a failure stops the run before any table is written)
      --repro_tol must stay <= --repro_max_frac (that csv ran one box per
      forward, this script a whole image per forward: a few pixels may differ);
   3. groups: 12 bottom50 / 13 top50 on every image; the undefended IoU per
-     group over all 50 images of each subset matches the handoff's table (and
-     the reference csv) within --group_tol;
-  4. split: A and B disjoint, 25 + 25 stems; v averages 25 x 25 boxes;
+     group matches the reference csv on the same images, and the handoff's
+     table on subsets run in full (50 images), within --group_tol;
+  4. split: A and B disjoint, 25 + 25 stems; v averages 25 x 25 boxes (with
+     --vector: A equals the vector's split.json, v and rand hash to the
+     vector_sha256 of its checks.json);
   5. steer_sam_decoder.py --self_test passes (hooks, trace agreement).
 
 OUTPUTS (--out_dir)
@@ -70,7 +83,8 @@ OUTPUTS (--out_dir)
                         half (A / B / -), group, undef_iou, ref_undef_iou, and
                         per alpha dm_iou_a<alpha>, rand_iou_a<alpha>,
                         chg_dm_a<alpha>, chg_rand_a<alpha>
-  table_COCO_B.csv, table_Berkeley.csv, table_GrabCut.csv
+  table_<subset>.csv    table_COCO_B.csv, table_Berkeley.csv, ... one per subset
+  alpha_select.csv      the score of every alpha on the --select_alpha_on tables
   reference_rows.csv    head-select / best-of-N / grad on the same boxes
   summary.md, checks.json, meta.json
 
@@ -82,6 +96,14 @@ Example
         --site L2.norm2 --alphas 1,0.5,0.1 --tokens all --split_seed 0 \\
         --reference_csv results/samfull_m.csv \\
         --out_dir exp_res/steer_user_study
+
+    # the same frozen vector on the medical subsets, larger alphas
+    CUDA_VISIBLE_DEVICES=0 python scripts/steer_user_study.py \\
+        --root /.../FOR_TEST --use m --checkpoint_path /.../sam_vit_b_01ec64.pth \\
+        --vector exp_res/steer_user_study/vector.npz \\
+        --datasets Berkeley GrabCut ACDC BUID MedScribble --alphas 1,2,3,4,6,8,12,16 \\
+        --reference_csv results/samfull_m.csv --skip_self_test \\
+        --out_dir exp_res/steer_user_study_med
 """
 
 from __future__ import annotations
@@ -115,8 +137,12 @@ from steer_sam_decoder import (  # noqa: E402
     zero_edit,
 )
 
-# dataset -> image-stem prefix in FOR_TEST
-DATASETS = OrderedDict([("COCO", "COCO_MVal_"), ("Berkeley", "Berkeley_"), ("GrabCut", "GrabCut_")])
+# dataset -> image-stem prefix in FOR_TEST (selector_data names a subset by
+# the stem's first "_" field, so COCO_MVal_* is "COCO")
+DATASETS = OrderedDict([("COCO", "COCO_MVal_"), ("Berkeley", "Berkeley_"), ("GrabCut", "GrabCut_"),
+                        ("DAVIS", "DAVIS_"), ("PASCAL", "PASCAL_"), ("ADE20K", "ADE20K_"), ("TETRIS", "TETRIS_"),
+                        ("ACDC", "ACDC_"), ("BUID", "BUID_"), ("MedScribble", "MedScribble_")])
+MEDICAL = ("ACDC", "BUID", "MedScribble")
 GROUPS = ("all", "bottom50", "top50")
 # undefended SAM-1 `m` per group over all 50 images of each subset, from
 # samfull_m.csv (handoff section 5): all / bottom50 / top50
@@ -251,6 +277,35 @@ def build_vector(df: pd.DataFrame, H: np.ndarray):
     return d_img.mean(0), d_img, used
 
 
+def vector_sha(v: np.ndarray, rand: np.ndarray) -> str:
+    return hashlib.sha256(np.ascontiguousarray(v).tobytes() + np.ascontiguousarray(rand).tobytes()).hexdigest()
+
+
+def load_vector(path: Path, site_id: str, A, checks: dict):
+    """v, rand and the A states of a finished run (--vector), checked against
+    that run: same site, same half A (so COCO B is still held out), same hash.
+    -> (v, rand, H) or None when a check fails (recorded in checks)."""
+    z = np.load(path)
+    v, rand, H = z["v"].astype(np.float32), z["rand"].astype(np.float32), z["states_A"].astype(np.float32)
+    src = path.parent
+    c = {"path": str(path), "site": str(z["site"]) if "site" in z.files else None, "sha256": vector_sha(v, rand)}
+    ok = c["site"] in (None, site_id)
+    split = src / "split.json"
+    if split.is_file():
+        c["split_A_matches"] = sorted(json.loads(split.read_text(encoding="utf-8"))["A"]) == list(A)
+    else:
+        c["split_A_matches"] = f"no split.json in {src}: cannot show COCO B is held out"
+    ok = ok and c["split_A_matches"] is True
+    src_checks = src / "checks.json"
+    if src_checks.is_file():
+        c["sha256_source"] = json.loads(src_checks.read_text(encoding="utf-8")).get("vector_sha256")
+        c["sha256_matches"] = c["sha256_source"] == c["sha256"]
+        ok = ok and c["sha256_matches"]
+    c["ok"] = ok
+    checks["vector_source"] = c
+    return (v, rand, H) if ok else None
+
+
 def evaluate_target(runner: Runner, site, root: Path, dataset: str, half: str, stems, recs: dict, Vt: dict,
                     group: str, alphas, checks: dict) -> pd.DataFrame:
     """Every box of every image: unsteered, then dm and rand at every alpha, on
@@ -312,7 +367,8 @@ def check_repro(df: pd.DataFrame, ref: pd.DataFrame | None, args) -> dict:
 
 
 def check_groups(df: pd.DataFrame, ref: pd.DataFrame | None, args, full: bool) -> dict:
-    """Check 3: 12 / 13 per image; undefended per group over all 50 images."""
+    """Check 3: 12 / 13 per image; undefended per group against the reference
+    csv on the same images, and against the handoff's table on full subsets."""
     cnt = df.groupby(["image_name", "group"]).size().unstack(fill_value=0)
     for g in ("bottom50", "top50"):
         if g not in cnt:
@@ -335,20 +391,21 @@ def check_groups(df: pd.DataFrame, ref: pd.DataFrame | None, args, full: bool) -
         rr = rr.assign(group=assign_groups(rr))
         mm = df[KEY + ["group"]].merge(rr[KEY + ["group"]], on=KEY, how="left", suffixes=("", "_ref"))
         r["group_label_mismatch_vs_reference"] = int((mm.group != mm.group_ref).sum())
-    for ds, vals in REF_UNDEF.items():
+    for ds in dict.fromkeys(df.dataset):
         s = df[df.dataset == ds]
-        if s.empty:
-            continue
         got = means(s)
-        row = {g: {"undef": float(got.get(g, math.nan)), "handoff": w} for g, w in zip(GROUPS, vals)}
+        row = {g: {"undef": float(got.get(g, math.nan))} for g in GROUPS}
+        if ds in REF_UNDEF and s.image_name.nunique() == 50:
+            for g, w in zip(GROUPS, REF_UNDEF[ds]):
+                row[g]["handoff"] = w
         if rr is not None:
             exact = means(rr[rr.image_name.str.startswith(DATASETS[ds])])
             for g in GROUPS:
                 row[g]["reference_csv"] = float(exact.get(g, math.nan))
         for g in GROUPS:
             diffs = [abs(row[g]["undef"] - row[g][k]) for k in ("handoff", "reference_csv") if k in row[g]]
-            row[g]["max_abs_diff"] = max(diffs) if diffs else math.nan
-            if not diffs or not max(diffs) <= args.group_tol:
+            row[g]["max_abs_diff"] = max(diffs) if diffs else "not checked"
+            if diffs and not max(diffs) <= args.group_tol:
                 ok = False
         rows[ds] = row
     r["group_means"] = rows
@@ -421,8 +478,59 @@ def reference_rows(df: pd.DataFrame, ref: pd.DataFrame | None, name: str) -> pd.
     return pd.DataFrame(rows)
 
 
+def choose_alpha(tables: dict, select_on, alphas):
+    """alpha* = the largest mean delta IoU over all boxes on the select_on
+    tables, each table weighted equally; ties -> the smaller alpha.
+    -> (alpha*, scores) or (None, None) when there is nothing to choose on."""
+    names = [n for n in select_on if n in tables]
+    if not names or len(alphas) < 2:
+        return None, None
+    rows = []
+    for a in alphas:
+        r = {"alpha": a}
+        for n in names:
+            t = tables[n][0]
+            r[n] = float(t[(t.alpha == a) & (t.group == "all")].d_dm.iloc[0])
+        r["score"] = float(np.mean([r[n] for n in names]))
+        rows.append(r)
+    sc = pd.DataFrame(rows)
+    best = float(sc.sort_values(["score", "alpha"], ascending=[False, True]).alpha.iloc[0])
+    sc["chosen"] = sc.alpha == best
+    return best, sc
+
+
+def _name(name: str) -> str:
+    return f"{name} (медицина)" if name in MEDICAL else name
+
+
 def _f(x, nd=4):
     return "-" if x is None or not np.isfinite(x) else f"{x:.{nd}f}"
+
+
+def md_overview(tables: dict, alphas, group: str) -> str:
+    """Delta IoU of dm per subset x alpha, one group."""
+    out = ["| набор | " + " | ".join(f"α={a:g}" for a in alphas) + " |", "|---|" + "---|" * len(alphas)]
+    for name, (t, _) in tables.items():
+        tt = t[t.group == group].set_index("alpha")
+        out.append(f"| {_name(name)} | " + " | ".join(f"{tt.loc[a, 'd_dm']:+.4f}" for a in alphas) + " |")
+    return "\n".join(out)
+
+
+def md_transfer(tables: dict, skip, alphas_show) -> str:
+    """The subsets alpha was not chosen on, at the alphas fixed elsewhere."""
+    cols = ["набор", "α", "группа", "n", "undef", "steering", "Δ [95% CI]", "% к undef", "↑ / ↓ боксов",
+            "случайное, Δ [95% CI]"]
+    out = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
+    for name, (t, _) in tables.items():
+        if name in skip:
+            continue
+        for a in alphas_show:
+            for r in t[t.alpha == a].to_dict("records"):
+                out.append(f"| {_name(name)} | {a:g} | {r['group']} | {r['n']} | {_f(r['undef'])} | {_f(r['dm'])} | "
+                           f"{r['d_dm']:+.4f} [{r['d_dm_lo']:+.4f}, {r['d_dm_hi']:+.4f}] | {r['pct_dm']:+.2f}% | "
+                           f"{r['up_dm']:.1%} / {r['down_dm']:.1%} | "
+                           f"{r['d_rand']:+.4f} [{r['d_rand_lo']:+.4f}, {r['d_rand_hi']:+.4f}] |")
+    return "\n".join(out)
 
 
 def md_table(t: pd.DataFrame) -> str:
@@ -547,28 +655,39 @@ def run(args) -> int:
     runner = Runner(predictor, sites, args.batch, field_grid=64, field_margin=0.25)
     ref = read_reference(args.reference_csv, args.use)
 
-    # pass 1: half A -> the vector
-    print(f"\npass 1: half A ({len(A)} COCO images), states at {site.id}", flush=True)
-    try:
-        dfA, H, R = collect_source(runner, site, root, A, index["COCO"], checks, args.seed)
-    except CheckFailed as e:
-        return fail(str(e))
-    dfA["group"] = assign_groups(dfA)
-    checks["repro_A"] = check_repro(dfA, ref, args)
-    if not checks["repro_A"]["ok"]:
-        return fail("undefended IoU vs --reference_csv on half A")
-    v, d_img, used = build_vector(dfA, H)
-    rand = (R * np.linalg.norm(v, axis=-1, keepdims=True)).astype(np.float32)
-    want = len(A) * N_PER_IMAGE
-    checks["split"].update(vector_boxes=used, vector_images=len(d_img), vector_boxes_expected=want)
-    if full and used != want:
-        checks["split"]["ok"] = False
-        return fail(f"vector averaged {used} boxes, expected {want}")
-    sha = hashlib.sha256(np.ascontiguousarray(v).tobytes() + np.ascontiguousarray(rand).tobytes()).hexdigest()
-    checks["vector_sha256"] = sha
-    np.savez_compressed(out / "vector.npz", v=v, rand=rand, d_img=d_img, images_A=np.asarray(sorted(dfA.image_name.unique())),
-                        states_A=H.astype(np.float32), undef_A=dfA.undef_iou.to_numpy(np.float32),
-                        group_A=dfA.group.to_numpy().astype(str), site=site.id)
+    if args.vector:
+        # the frozen vector of a finished run: pass 1 is not repeated
+        A_full = split_halves(index["COCO"], args.split_seed)[0]
+        got = load_vector(Path(args.vector), site.id, A_full, checks)
+        if got is None:
+            return fail(f"--vector {args.vector}")
+        v, rand, H = got
+        dfA = None
+        checks["vector_sha256"] = vector_sha(v, rand)
+        checks["split"]["vector_boxes"] = f"{len(H)} (from {args.vector})"
+    else:
+        # pass 1: half A -> the vector
+        print(f"\npass 1: half A ({len(A)} COCO images), states at {site.id}", flush=True)
+        try:
+            dfA, H, R = collect_source(runner, site, root, A, index["COCO"], checks, args.seed)
+        except CheckFailed as e:
+            return fail(str(e))
+        dfA["group"] = assign_groups(dfA)
+        checks["repro_A"] = check_repro(dfA, ref, args)
+        if not checks["repro_A"]["ok"]:
+            return fail("undefended IoU vs --reference_csv on half A")
+        v, d_img, used = build_vector(dfA, H)
+        rand = (R * np.linalg.norm(v, axis=-1, keepdims=True)).astype(np.float32)
+        want = len(A) * N_PER_IMAGE
+        checks["split"].update(vector_boxes=used, vector_images=len(d_img), vector_boxes_expected=want)
+        if full and used != want:
+            checks["split"]["ok"] = False
+            return fail(f"vector averaged {used} boxes, expected {want}")
+        checks["vector_sha256"] = vector_sha(v, rand)
+        np.savez_compressed(out / "vector.npz", v=v, rand=rand, d_img=d_img,
+                            images_A=np.asarray(sorted(dfA.image_name.unique())), states_A=H.astype(np.float32),
+                            undef_A=dfA.undef_iou.to_numpy(np.float32), group_A=dfA.group.to_numpy().astype(str),
+                            site=site.id)
     st, vmeta = vector_stats(v, rand, H, args.alphas, args.cs_vectors)
     st.to_csv(out / "vector_stats.csv", index=False)
     checks["vector"] = vmeta
@@ -579,7 +698,7 @@ def run(args) -> int:
 
     # pass 2: test images, frozen v
     Vt = {site.id: {"dm": torch.as_tensor(v, device=device), "dm_rand": torch.as_tensor(rand, device=device)}}
-    parts = [dfA]
+    parts = [dfA] if dfA is not None else []
     for ds, half, stems in targets:
         print(f"\npass 2: {ds}{' half ' + half if half != '-' else ''} ({len(stems)} images), "
               f"alpha {', '.join(f'{a:g}' for a in args.alphas)}", flush=True)
@@ -618,13 +737,17 @@ def run(args) -> int:
     rr = pd.concat(refs, ignore_index=True) if refs else pd.DataFrame()
     if not rr.empty:
         rr.to_csv(out / "reference_rows.csv", index=False)
+    a_star, scores = choose_alpha(tables, args.select_alpha_on, args.alphas)
+    if scores is not None:
+        scores.to_csv(out / "alpha_select.csv", index=False)
 
-    md = summary_md(args, site, A, B, st, vmeta, tables, rr, checks, df)
+    md = summary_md(args, site, A, B, st, vmeta, tables, rr, checks, df, a_star, scores)
     (out / "summary.md").write_text(md, encoding="utf-8")
     enc = sys.stdout.encoding or "utf-8"            # a cp1251 console has no α / Δ / −
     print("\n" + md.encode(enc, "replace").decode(enc))
     meta = {"model": f"SAM {args.model_type}", "checkpoint": Path(args.checkpoint_path).name, "site": site.id,
-            "tokens": args.tokens, "alphas": args.alphas, "datasets": datasets, "boxes": int(len(df)),
+            "tokens": args.tokens, "alphas": args.alphas, "alpha_star": a_star, "datasets": datasets,
+            "boxes": int(len(df)),
             "device": torch.cuda.get_device_name(device) if device.type == "cuda" else str(device),
             "torch": torch.__version__, "args": vars(args), "minutes": round((time.time() - t0) / 60, 1),
             "created": time.strftime("%Y-%m-%d %H:%M")}
@@ -633,15 +756,33 @@ def run(args) -> int:
     return 0
 
 
-def summary_md(args, site, A, B, st, vmeta, tables, rr, checks, df) -> str:
+def summary_md(args, site, A, B, st, vmeta, tables, rr, checks, df, a_star=None, scores=None) -> str:
+    src = (f"взят готовым из `{args.vector}` (посчитан на половине A COCO, {len(A)} картинок), sha256 "
+           f"`{checks['vector_sha256'][:12]}`" if args.vector else
+           f"посчитан на половине A COCO ({len(A)} картинок, {int((df.half == 'A').sum())} боксов)")
     L = [f"# Steering SAM-1 {args.model_type} на боксах user study (`{args.use}`)", "",
-         f"Вектор: DM top50 − bottom50 внутри картинки, узел `{site.id}`, токены `{args.tokens}`, "
-         f"посчитан на половине A COCO ({len(A)} картинок, {int((df.half == 'A').sum())} боксов), "
-         f"заморожен; α = {', '.join(f'{a:g}' for a in args.alphas)} (α = 1 — заранее выбранная конфигурация, "
-         "остальные — меньшие дозы того же вектора, ничего не подбиралось на тесте). "
+         f"Вектор: DM top50 − bottom50 внутри картинки, узел `{site.id}`, токены `{args.tokens}`, {src}, "
+         f"заморожен; α = {', '.join(f'{a:g}' for a in args.alphas)}. α = 1 — заранее выбранная конфигурация; "
+         "лучшая α по тестовой таблице — оптимистичная оценка, честный перенос — α*, выбранная на других наборах. "
          "Группы — по undefended IoU внутри картинки (12 / 13). Δ — к undefended, CI — бутстреп по картинкам "
-         f"({args.n_boot}). ↑/↓ — доля боксов с изменением IoU больше {args.updown_eps:g}.", "",
-         "## Вектор", "",
+         f"({args.n_boot}). ↑/↓ — доля боксов с изменением IoU больше {args.updown_eps:g}."]
+    if a_star is not None:
+        sel = [n for n in args.select_alpha_on if n in tables]
+        L += ["", "## Выбор α", "",
+              f"α* = **{a_star:g}**: наибольший средний Δ IoU (all) на {', '.join(sel)} (наборы с равным весом).", "",
+              "| α | " + " | ".join(sel) + " | среднее |", "|---|" + "---|" * (len(sel) + 1)]
+        for r in scores.to_dict("records"):
+            mark = " ←" if r["chosen"] else ""
+            L.append(f"| {r['alpha']:g}{mark} | " + " | ".join(f"{r[n]:+.4f}" for n in sel) + f" | {r['score']:+.4f} |")
+        rest = [n for n in tables if n not in sel]
+        if rest:
+            show = list(dict.fromkeys([1.0, a_star])) if 1.0 in args.alphas else [a_star]
+            L += ["", f"## Перенос на {', '.join(_name(n) for n in rest)}: α = "
+                  f"{' и α* = '.join(f'{a:g}' for a in show)}", "", md_transfer(tables, sel, show)]
+    L += ["", "## Δ IoU (DM) по всем α", ""]
+    for g in GROUPS:
+        L += [f"**{g}**", "", md_overview(tables, args.alphas, g), ""]
+    L += ["## Вектор", "",
          f"‖v‖ = {vmeta['whole']['v_norm']:.4f}, средняя ‖h‖ на A = {vmeta['whole']['h_norm_mean']:.2f}, "
          f"доза α=1: {vmeta['whole']['v_over_h']:.2%}."]
     cs = vmeta["critical_shifts"]
@@ -658,7 +799,7 @@ def summary_md(args, site, A, B, st, vmeta, tables, rr, checks, df) -> str:
                  + " | ".join(f"{r[f'dose_{_a(a)}']:.4f}" for a in args.alphas)
                  + (f" | {r.cos_cs_dm:+.3f} |" if "cos_cs_dm" in st else " |"))
     for name, (t, s) in tables.items():
-        L += ["", f"## {name}: {s.image_name.nunique()} картинок, {len(s)} боксов", "", md_table(t)]
+        L += ["", f"## {_name(name)}: {s.image_name.nunique()} картинок, {len(s)} боксов", "", md_table(t)]
         sub = rr[rr.dataset == name] if not rr.empty else rr
         if not sub.empty:
             L += ["", "Сравнение (head-select работает в режиме multimask — другое решение, не прямой бейзлайн):",
@@ -692,7 +833,10 @@ def parse_args(argv=None):
     p.add_argument("--root", required=True, help="user study FOR_TEST (images/, masks/, user_masks/)")
     p.add_argument("--use", default="m", help="user mask kinds: m (mobile), p, or pm")
     p.add_argument("--datasets", nargs="*", default=["Berkeley", "GrabCut"], choices=[d for d in DATASETS if d != "COCO"],
-                   help="test subsets besides COCO half B")
+                   help=f"test subsets besides COCO half B; medical: {' '.join(MEDICAL)}")
+    p.add_argument("--vector", default="", help="vector.npz of a finished run: use its frozen v and rand, skip pass 1")
+    p.add_argument("--select_alpha_on", nargs="*", default=["COCO_B", "Berkeley", "GrabCut"],
+                   help="tables alpha* is chosen on, then carried over to the others")
     p.add_argument("--checkpoint_path", required=True, help="sam_vit_b_01ec64.pth")
     p.add_argument("--model_type", default="vit_b")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
