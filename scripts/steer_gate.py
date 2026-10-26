@@ -424,11 +424,7 @@ class Methods:
             ("α-селектор, логистическая регрессия",
              make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=5000)).fit(Xw, best)),
             ("α-селектор, GBM", make_gbm(self.seed, classifier=True).fit(Xw, best))])
-        bx = self._bx(D)
-        self.lin = [make_pipeline(StandardScaler(), LinearRegression()).fit(np.hstack([bx, alpha_x(D, a)]),
-                                                                            W[:, j + 1] - W[:, 0])
-                    for j, a in enumerate(self.alphas)]
-        self.gbm = make_gbm(self.seed).fit(*long_xy(D, self.alphas, self.fs))
+        self.reg = GainRegressors(self.alphas, self.fs, self.seed).fit(D)
         return self
 
     def choose(self, D: pd.DataFrame) -> "OrderedDict[str, np.ndarray]":
@@ -438,12 +434,37 @@ class Methods:
         Xw = self._wide(D)
         for name, m in self.sel.items():
             cols[name] = m.predict(Xw).astype(int)
-        bx = self._bx(D)
-        P = np.column_stack([m.predict(np.hstack([bx, alpha_x(D, a)])) for m, a in zip(self.lin, self.alphas)])
-        cols["α-регрессор, линейная регрессия"] = np.where(P.max(1) > 0, P.argmax(1) + 1, 0)
-        P = self.gbm.predict(long_xy(D, self.alphas, self.fs)[0]).reshape(len(self.alphas), n).T
-        cols["α-регрессор, GBM"] = np.where(P.max(1) > 0, P.argmax(1) + 1, 0)
+        reg = self.reg.choose(D)
+        cols["α-регрессор, линейная регрессия"] = reg["lin"]
+        cols["α-регрессор, GBM"] = reg["gbm"]
         return cols
+
+
+class GainRegressors:
+    """The gain of every alpha, regressed from the features a box shows
+    without its GT: one linear regression per alpha, and one GBM on the long
+    table (box x alpha). choose() -> the column of iou_matrix to take: the
+    alpha with the largest predicted gain, 0 (no steering) if none is > 0."""
+
+    def __init__(self, alphas, fs: str = "out", seed: int = 0):
+        self.alphas, self.fs, self.seed = list(alphas), fs, seed
+
+    def fit(self, D: pd.DataFrame) -> "GainRegressors":
+        W = iou_matrix(D, self.alphas)
+        bx = D[BOX_FEATS[self.fs]].to_numpy(float)
+        self.lin = [make_pipeline(StandardScaler(), LinearRegression()).fit(np.hstack([bx, alpha_x(D, a)]),
+                                                                            W[:, j + 1] - W[:, 0])
+                    for j, a in enumerate(self.alphas)]
+        self.gbm = make_gbm(self.seed).fit(*long_xy(D, self.alphas, self.fs))
+        return self
+
+    def choose(self, D: pd.DataFrame) -> dict:
+        n = len(D)
+        bx = D[BOX_FEATS[self.fs]].to_numpy(float)
+        P = {"lin": np.column_stack([m.predict(np.hstack([bx, alpha_x(D, a)]))
+                                     for m, a in zip(self.lin, self.alphas)]),
+             "gbm": self.gbm.predict(long_xy(D, self.alphas, self.fs)[0]).reshape(len(self.alphas), n).T}
+        return {k: np.where(p.max(1) > 0, p.argmax(1) + 1, 0) for k, p in P.items()}
 
 
 def boot_samples(d: np.ndarray, images: np.ndarray, n_boot: int, seed: int) -> np.ndarray:
@@ -467,14 +488,30 @@ def methods_table(D: pd.DataFrame, ref: pd.DataFrame | None, args) -> pd.DataFra
     for t in tests:
         Dt = D[D.table == t].reset_index(drop=True)
         W = iou_matrix(Dt, alphas)
-        rows = OrderedDict([("undef", (W[:, 0], W[:, 0]))])
-        if ref is not None:
-            e = Dt[KEY].merge(ref, on=KEY, how="left")
-            rows["grad"] = (e.grad_final_iou.to_numpy(float), e.undefended_iou.to_numpy(float))
+        rows = base_rows(Dt, ref)
         for name, c in M.choose(Dt).items():
             rows[name] = (W[np.arange(len(Dt)), c], W[:, 0])
         per[t] = (Dt, rows)
+    return score_blocks(per, args)
 
+
+def base_rows(Dt: pd.DataFrame, ref: pd.DataFrame | None) -> "OrderedDict[str, tuple]":
+    """undef, and grad from the reference csv on the same boxes (against the
+    csv's own undefended IoU)."""
+    u = Dt.undef_iou.to_numpy(float)
+    rows = OrderedDict([("undef", (u, u))])
+    if ref is not None:
+        e = Dt[KEY].merge(ref, on=KEY, how="left")
+        rows["grad"] = (e.grad_final_iou.to_numpy(float), e.undefended_iou.to_numpy(float))
+    return rows
+
+
+def score_blocks(per: "OrderedDict[str, tuple]", args) -> pd.DataFrame:
+    """per: block -> (boxes, {method: (iou, undef iou)}), the same methods in
+    every block. Per block, method and group: IoU, delta with a 95% image
+    bootstrap CI, %; then the mean over the blocks (all / natural / medical),
+    each block weighted equally, its CI from bootstraps within each block."""
+    tests = list(per)
     out = []
     samples = {}                                       # (table, method, group) -> bootstrap means of d
     for ti, (t, (Dt, rows)) in enumerate(per.items()):
@@ -495,8 +532,8 @@ def methods_table(D: pd.DataFrame, ref: pd.DataFrame | None, args) -> pd.DataFra
     means = [(f"среднее по {len(tests)} test", tests), (f"среднее, натуральные ({len(natural)})", natural),
              (f"среднее, медицина ({len(medical)})", medical)]
     macro = []
-    for label, ts in means:
-        if not ts:
+    for i, (label, ts) in enumerate(means):
+        if len(ts) < 2 or (i > 0 and ts == tests):    # a mean of one block, or a repeat of the overall one
             continue
         for name in per[tests[0]][1]:
             for g in GROUPS:
@@ -534,12 +571,24 @@ def md_methods(T: pd.DataFrame, D: pd.DataFrame, args) -> str:
          "- *grad* — градиентная доводка бокса по IoU-голове (`samfull_m.csv`, те же боксы).", "",
          "Ячейка — IoU и прирост к undef в %; Δ — к undef с 95% CI (бутстреп по картинкам; для средних — внутри "
          "каждого набора). Группы — по undef IoU внутри картинки (12 худших / 13 лучших из 25). "
-         "Жирным — лучший метод в колонке внутри блока.", "",
-         "| набор | метод | all | bottom50 | top50 | Δ all [95% CI] |", "|---|---|---|---|---|---|"]
+         "Жирным — лучший метод в колонке внутри блока.", ""]
+    n_img = {t: D[D.table == t].image_name.nunique() for t in set(D.table)}
+    return "\n".join(L) + "\n" + md_blocks(T, n_img)
+
+
+def block_title(block: str, n_img: dict) -> str:
+    if block not in n_img:
+        return f"**{block}**"
+    return f"**{'COCO (половина B)' if block == 'COCO_B' else _name(block)}**, {n_img[block]} изобр."
+
+
+def md_blocks(T: pd.DataFrame, n_img: dict) -> str:
+    """score_blocks' rows as one sequential table: IoU (% to undef) per group,
+    and the delta over all boxes with its CI; bold = the best method of a
+    column within its block."""
+    L = ["| набор | метод | all | bottom50 | top50 | Δ all [95% CI] |", "|---|---|---|---|---|---|"]
     for block, B in T.groupby("block", sort=False):
-        n_img = D[D.table == block].image_name.nunique() if block in set(D.table) else None
-        title = (f"**{'COCO (половина B)' if block == 'COCO_B' else _name(block)}**, {n_img} изобр."
-                 if n_img else f"**{block}**")
+        title = block_title(block, n_img)
         best = {g: B[(B.group == g) & (B.method != "undef")].iou.max() for g in GROUPS}
         for i, (name, s) in enumerate(B.groupby("method", sort=False)):
             s = s.set_index("group")
