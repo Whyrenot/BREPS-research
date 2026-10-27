@@ -22,7 +22,19 @@ EXPERIMENTS
   3  a vector per dataset   --own_train images of every dataset with all their
                             annotations (COCO: drawn from half A) give the
                             dataset its own vector, scored on the rest of the
-                            dataset (COCO: half B) against the COCO A vector
+                            dataset (COCO: half B) against the COCO A vector,
+                            and against COCO vectors of as many images
+                            (--coco_sub_draws draws from half A, scored on every
+                            test table; draw 0 is the own COCO draw)
+  5  one vector for all     the own draws of every dataset pooled into one vector
+                            (each image weighted equally, so each dataset too),
+                            scored on every dataset's own test images; and per
+                            dataset the pool of the OTHER datasets' draws
+                            (leave one dataset out: an unseen domain) (--pool)
+  4  tight GT box positive  the state of SAM's forward on the tight bbox of the
+                            GT mask (the ideal box, best_box of build_user_cases)
+                            as a positive: tight / bottom50, top50 + tight /
+                            bottom50, tight / all 25 user boxes (--tight)
   For every vector: fixed alphas (--fixed_alphas), alpha* (one alpha for all
   boxes: the best mean gain over the vector's training boxes, none included),
   and steer_gate's gain regressors (linear, GBM; features without the GT)
@@ -94,8 +106,20 @@ class Variant:
         self.train, self.folds = list(train), folds
 
     def split(self, iou: np.ndarray, grp: np.ndarray, case: np.ndarray):
-        """-> (pos, neg) boolean masks over the boxes of one image."""
+        """-> (pos, neg) boolean masks over the user boxes of one image, and
+        whether the tight GT box is a positive too."""
         top, bot = grp == "top50", grp == "bottom50"
+        none = np.zeros(len(iou), bool)
+        if self.rule == "tight":
+            return none, bot, True
+        if self.rule == "tight_top":
+            return top, bot, True
+        if self.rule == "tight_all":
+            return none, ~none, True
+        pos, neg = self._split_user(iou, top, bot, case)
+        return pos, neg, False
+
+    def _split_user(self, iou, top, bot, case):
         if self.rule == "halves":
             return top, bot
         if self.rule == "extreme":
@@ -111,17 +135,18 @@ class Variant:
         raise ValueError(self.rule)
 
     def fit(self, states: dict):
-        """states: stem -> (H, iou, grp, case). Sets d_img per used image, the
-        vector and its fold vectors."""
+        """states: stem -> (H, iou, grp, case, h_tight). Sets d_img per used
+        image, the vector and its fold vectors."""
         self.d, self.n_pos, self.n_neg, self.skipped = OrderedDict(), 0, 0, []
         for stem in self.train:
-            H, iou, grp, case = states[stem]
-            pos, neg = self.split(iou, grp, case)
-            if not pos.any() or not neg.any():
+            H, iou, grp, case, h_tight = states[stem]
+            pos, neg, tight = self.split(iou, grp, case)
+            P = np.concatenate([H[pos], h_tight[None]]) if tight else H[pos]
+            if len(P) == 0 or not neg.any():
                 self.skipped.append(stem)
                 continue
-            self.d[stem] = H[pos].mean(0) - H[neg].mean(0)
-            self.n_pos += int(pos.sum())
+            self.d[stem] = P.mean(0) - H[neg].mean(0)
+            self.n_pos += len(P)
             self.n_neg += int(neg.sum())
         if not self.d:                                # nothing to estimate from: the variant is dropped
             self.v = None
@@ -140,6 +165,11 @@ class Variant:
         return self.v, "eval"
 
 
+def draw_images(pool, n: int, key) -> list:
+    rng = np.random.default_rng(key)
+    return sorted(pool[i] for i in rng.choice(len(pool), size=n, replace=False))
+
+
 def build_variants(args, A, index) -> tuple:
     """-> (variants on COCO A, {dataset: own variant}, own test stems per dataset)."""
     fA = assign_folds(A, min(args.folds, len(A)), args.seed)
@@ -149,6 +179,18 @@ def build_variants(args, A, index) -> tuple:
     t = args.pos_thr
     va.append(Variant("pos", f"лучшие с IoU > {t:g} / 12 худших", "pos", A, fA, thr=t))
     va.append(Variant("posneg", f"лучшие с IoU > {t:g} / худшие с IoU < {t:g}", "posneg", A, fA, thr=t))
+    if args.tight:
+        va.append(Variant("tight", "tight bbox GT / 12 худших", "tight", A, fA))
+        va.append(Variant("tight_top", "13 лучших + tight bbox GT / 12 худших", "tight_top", A, fA))
+        va.append(Variant("tight_all", "tight bbox GT / все 25 разметок", "tight_all", A, fA))
+    # COCO-n: n images of half A with all their annotations, the COCO counterpart of a dataset's
+    # own vector; draw 0 is the own COCO draw itself, the others show what the draw does
+    n = args.own_train
+    for j in range(args.coco_sub_draws):
+        key = [args.seed, 17, list(SUS.DATASETS).index("COCO")] if j == 0 else [args.seed, 23, j]
+        tr = draw_images(sorted(A), n, key)
+        va.append(Variant(f"coco{n}_d{j}", f"COCO A, {n} изобр. (выборка {j})", "halves", tr,
+                          assign_folds(tr, min(args.folds, len(tr)), args.seed)))
     own, own_test = OrderedDict(), OrderedDict()
     for ds in ["COCO", *args.datasets]:
         pool = sorted(A) if ds == "COCO" else sorted(index[ds])
@@ -156,13 +198,26 @@ def build_variants(args, A, index) -> tuple:
             print(f"[warn] {ds}: {len(pool)} images, need > {args.own_train} for its own vector -- skipped",
                   flush=True)
             continue
-        rng = np.random.default_rng([args.seed, 17, list(SUS.DATASETS).index(ds)])
-        train = sorted(pool[i] for i in rng.choice(len(pool), size=args.own_train, replace=False))
+        train = draw_images(pool, args.own_train, [args.seed, 17, list(SUS.DATASETS).index(ds)])
         f = assign_folds(train, min(args.folds, len(train)), args.seed)
         own[ds] = Variant(f"own_{ds}", f"свой вектор ({args.own_train} изобр.)", "halves", train, f)
         table = "COCO_B" if ds == "COCO" else ds
         own_test[table] = (ds, train)
-    return va, own, own_test
+    pooled = []
+    if args.pool and len(own) >= 2:
+        table_of = {ds: ("COCO_B" if ds == "COCO" else ds) for ds in own}
+        tr = [s for v in own.values() for s in v.train]
+        pv = Variant("pool", f"общий вектор ({len(own)} наборов × {args.own_train} изобр.)", "halves", tr,
+                     assign_folds(tr, min(args.folds, len(tr)), args.seed))
+        pv.scope = set(table_of.values())
+        pooled.append(pv)
+        for ds in own:
+            tr = [s for d, v in own.items() if d != ds for s in v.train]
+            pv = Variant(f"lodo_{ds}", f"общий вектор без {ds}", "halves", tr,
+                         assign_folds(tr, min(args.folds, len(tr)), args.seed))
+            pv.scope = {table_of[ds]}
+            pooled.append(pv)
+    return va, own, own_test, pooled
 
 
 # ---------------------------------------------------------------------------
@@ -213,8 +268,8 @@ def gpu_pass(args, checks: dict):
     datasets = list(dict.fromkeys(["COCO", *args.datasets]))
     index = SUS.index_study(root, args.use, datasets)
     A, B = SUS.split_halves(index["COCO"], args.split_seed)
-    va, own, own_test = build_variants(args, A, index)
-    variants = va + list(own.values())
+    va, own, own_test, pooled = build_variants(args, A, index)
+    variants = va + list(own.values()) + pooled
 
     device = torch.device(args.device)
     predictor = SUS.load_predictor(args.checkpoint_path, args.model_type, device)
@@ -233,7 +288,11 @@ def gpu_pass(args, checks: dict):
         base["image_name"] = stem
         grp = SUS.assign_groups(base).to_numpy()
         case = base[KEY].astype(str).agg("|".join, axis=1).to_numpy()
-        states[stem] = (H, base.undef_iou.to_numpy(), grp, case)
+        # the tight GT box: the same best_box for every case of the image (build_user_cases)
+        tb = torch.as_tensor(np.asarray(cases[0]["best_box"], np.float32)[None], device=device)
+        buf = []
+        runner.forward(tb, record={site.id: lambda t, ctx: buf.append(feature_of(site, t, ctx).cpu())})
+        states[stem] = (H, base.undef_iou.to_numpy(), grp, case, torch.cat(buf).numpy()[0])
         if (i + 1) % 10 == 0 or i + 1 == len(train_imgs):
             print(f"  [{i + 1}/{len(train_imgs)}] ({time.time() - t0:.0f}s)", flush=True)
     for v in variants:
@@ -247,7 +306,9 @@ def gpu_pass(args, checks: dict):
     va = [v for v in va if v.v is not None]
     own = OrderedDict((d, v) for d, v in own.items() if v.v is not None)
     own_test = OrderedDict((t, x) for t, x in own_test.items() if x[0] in own)
-    variants = va + list(own.values())
+    pooled = [v for v in pooled if v.v is not None]
+    variants = va + list(own.values()) + pooled
+    own_train_all = {s for v in own.values() for s in v.train}
     if args.vector:
         ref_v = np.load(args.vector)["v"]
         all_v = va[0].v
@@ -270,6 +331,10 @@ def gpu_pass(args, checks: dict):
             # the COCO A images outside the draw are neither
             if ov is not None and (stem in ov.folds or table != "COCO_A"):
                 use.append((ov, *ov.vector_for(stem)))
+            # a pooled vector: on its training images (cross-fitted) and on the test images of its datasets
+            for pv in pooled:
+                if stem in pv.folds or (table in pv.scope and stem not in own_train_all):
+                    use.append((pv, *pv.vector_for(stem)))
             cases, boxes, gt = SUS.load_image_cases(predictor, root, stem, index[ds][stem], device)
             b, m0, base, _ = base_forward(runner, site, cases, boxes, gt, checks, f"{table}/{stem}", record=False)
             base.insert(0, "image_name", stem)
@@ -318,7 +383,7 @@ def variant_methods(Dtr: pd.DataFrame, alphas, fixed, seed: int):
 
 def analyse(D: pd.DataFrame, ref, args, own_test: dict) -> tuple:
     alphas, fixed = list(args.alphas), [a for a in args.fixed_alphas if a in args.alphas]
-    va_names = [v for v in dict.fromkeys(D.variant) if not v.startswith("own_")]
+    va_names = [v for v in dict.fromkeys(D.variant) if not v.startswith(("own_", "pool", "lodo_"))]
     label = dict(D[["variant", "label"]].drop_duplicates().to_numpy()) if "label" in D else {}
     fitted, a_star = {}, {}
     for v in dict.fromkeys(D.variant):
@@ -444,6 +509,8 @@ def run(args) -> int:
         np.savez_compressed(out / "vectors.npz", **{f"{v.name}/v": v.v for v in variants},
                             **{f"{v.name}/fold{k}": f for v in variants for k, f in v.v_fold.items()})
         (out / "own_test.json").write_text(json.dumps(own_test, indent=1), encoding="utf-8")
+        (out / "meta.json").write_text(json.dumps({"args": vars(args), "rows": int(len(D))}, indent=2,
+                                                  default=SUS._json_default), encoding="utf-8")
         St = vector_stats(variants, {})
         St.to_csv(out / "vector_stats.csv", index=False)
         base = D[D.variant == "all"].drop_duplicates(KEY)
@@ -493,6 +560,12 @@ def parse_args(argv=None):
                    help="experiment 1: the k worst / k best boxes per image (3 ~ a tenth of 25)")
     p.add_argument("--pos_thr", type=float, default=0.85, help="experiment 2: IoU a positive must exceed")
     p.add_argument("--own_train", type=int, default=10, help="experiment 3: training images per dataset")
+    p.add_argument("--coco_sub_draws", type=int, default=5,
+                   help="experiment 3: COCO A vectors of --own_train images (draw 0 = the own COCO draw), "
+                        "scored on every test table, the like-for-like comparator of a dataset's own vector")
+    p.add_argument("--tight", type=int, default=1, help="1 = the vectors with the tight GT box as a positive")
+    p.add_argument("--pool", type=int, default=1,
+                   help="1 = one vector from every dataset's own draw, and the leave-one-dataset-out ones")
     p.add_argument("--folds", type=int, default=5)
     p.add_argument("--split_seed", type=int, default=0)
     p.add_argument("--seed", type=int, default=0)
