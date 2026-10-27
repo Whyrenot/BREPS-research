@@ -283,8 +283,10 @@ def own_vs_coco_sub(pk: Picks, vdir: Path, args) -> tuple:
     if not draws:
         raise SystemExit(f"no coco{n}_d* variants in {vdir}: rerun steer_variants with --coco_sub_draws")
     T3 = pd.read_csv(vdir / "table_exp3.csv")
-    per, check = OrderedDict(), {}
+    per, check, comp = OrderedDict(), {}, {}
     for t, (ds, _) in own_test.items():
+        # a COCO draw that IS the own vector (COCO: draw 0) is no comparator for it
+        comp[t] = [d for d in draws if not np.array_equal(pk.vec[d], pk.vec[f"own_{ds}"])]
         own = pk.on(t, f"own_{ds}")
         own = own[own.role == "eval"].reset_index(drop=True)
         P = own[["image_name", "group", "undef_iou"]].rename(columns={"undef_iou": "undef"})
@@ -294,17 +296,18 @@ def own_vs_coco_sub(pk: Picks, vdir: Path, args) -> tuple:
             if not (sb.undef_iou.to_numpy() == own.undef_iou.to_numpy()).all():
                 raise SystemExit(f"{t}: {d} and own_{ds} rows are not the same boxes")
             P[d] = sb.pick.to_numpy()
-        P["coco_sub"] = P[draws].mean(1)
+        P["coco_sub"] = P[comp[t]].mean(1)
         P["coco25"] = pk.on(t, "all", own).pick.to_numpy()
         per[t] = P
         ref = T3[(T3.block == t) & (T3.method == f"свой вектор ({n} изобр.): {pk.method}") & (T3.group == "all")].iou
         check[t] = float(abs(P.own.mean() - ref.iloc[0])) if len(ref) else None
-    cos = {t: float(np.mean([pk.cos(f"own_{ds}", d) for d in draws])) for t, (ds, _) in own_test.items()}
+    cos = {t: float(np.mean([pk.cos(f"own_{ds}", d) for d in comp[t]])) for t, (ds, _) in own_test.items()}
 
     def extra(block, g, s, ts):
         # the own vector's gain over each COCO draw alone: how much the draw matters
         own_m = np.mean([per[t][per[t].group == g].own.mean() for t in ts])
-        dg = [(own_m / np.mean([per[t][per[t].group == g][d].mean() for t in ts]) - 1) * 100 for d in draws]
+        ds_ = [d for d in draws if all(d in comp[t] for t in ts)]    # comparators of every table of the block
+        dg = [(own_m / np.mean([per[t][per[t].group == g][d].mean() for t in ts]) - 1) * 100 for d in ds_]
         return {"cos_sub": cos.get(block, np.nan), "draw_min": min(dg), "draw_max": max(dg)}
 
     T = compare_blocks(per, ["coco_sub", "own", "coco25"], "coco_sub", args, extra)
@@ -610,7 +613,9 @@ def run(a) -> int:
                "тестовых картинках набора (40; COCO — 25 картинок половины B). Проценты в столбцах методов — к undef; "
                f"«свой к COCO-{n_sub}» — прирост IoU своего вектора в % от IoU COCO-{n_sub}, парный бутстреп по "
                f"картинкам; последний столбец — тот же прирост против каждой выборки COCO-{n_sub} отдельно. cos — по "
-               f"всему тензору 7 × 256, среднее по выборкам. ¹ Для COCO свой вектор — это выборка 0 COCO-{n_sub}.", "",
+               f"всему тензору 7 × 256, среднее по выборкам. ¹ Для COCO свой вектор — это выборка 0 COCO-{n_sub}, "
+               f"поэтому COCO-{n_sub} здесь — среднее по остальным выборкам (1–{n_draws - 1}), а разброс в средних "
+               f"по наборам — по выборкам 1–{n_draws - 1}.", "",
                md_table2(T2, n_draws, n_sub), ""]
     if T3 is not None:
         md += ["## 3. CatBoost-селектор без и со steering-кандидатами", "",
