@@ -34,7 +34,8 @@ EXPERIMENTS
   4  tight GT box positive  the state of SAM's forward on the tight bbox of the
                             GT mask (the ideal box, best_box of build_user_cases)
                             as a positive: tight / bottom50, top50 + tight /
-                            bottom50, tight / all 25 user boxes (--tight)
+                            bottom50, tight / all 25 user boxes, tight / the one
+                            worst user box (--tight)
   For every vector: fixed alphas (--fixed_alphas), alpha* (one alpha for all
   boxes: the best mean gain over the vector's training boxes, none included),
   and steer_gate's gain regressors (linear, GBM; features without the GT)
@@ -116,6 +117,10 @@ class Variant:
             return top, bot, True
         if self.rule == "tight_all":
             return none, ~none, True
+        if self.rule == "tight_worst":                # the k worst user boxes, ties by the case key
+            neg = none.copy()
+            neg[np.lexsort((case, iou))[:self.k]] = True
+            return none, neg, True
         pos, neg = self._split_user(iou, top, bot, case)
         return pos, neg, False
 
@@ -183,6 +188,7 @@ def build_variants(args, A, index) -> tuple:
         va.append(Variant("tight", "tight bbox GT / 12 худших", "tight", A, fA))
         va.append(Variant("tight_top", "13 лучших + tight bbox GT / 12 худших", "tight_top", A, fA))
         va.append(Variant("tight_all", "tight bbox GT / все 25 разметок", "tight_all", A, fA))
+        va.append(Variant("tight_worst", "tight bbox GT / 1 худшая", "tight_worst", A, fA, k=1))
     # COCO-n: n images of half A with all their annotations, the COCO counterpart of a dataset's
     # own vector; draw 0 is the own COCO draw itself, the others show what the draw does
     n = args.own_train

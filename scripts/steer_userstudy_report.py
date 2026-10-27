@@ -19,6 +19,9 @@ from finished runs (no GPU, no refit of CatBoost).
             full-halves COCO A vector, every test set              <- steer_variants
   table 5   one vector for all: the pool of every dataset's own draw, and the
             pool without the dataset at hand, against its own vector <- steer_variants
+  table 6   COCO half B: the tight-GT-box-minus-worst-box vector against the
+            full-halves one, under every way of choosing alpha     <- steer_variants
+  A part whose inputs a run lacks is skipped (and listed at the end).
   table 3   per dataset: the CatBoost selector without and with the steering
             candidates, bottom50 / top50, % to undefended; the gain in % of the
             CatBoost without steering, paired CI                  <- selector_steer
@@ -206,15 +209,15 @@ class Picks:
         z = np.load(vdir / "vectors.npz")
         self.vec = {k[:-2]: z[k] for k in z.files if k.endswith("/v")}
 
-    def on(self, table: str, variant: str, keys: pd.DataFrame | None = None) -> pd.DataFrame:
+    def on(self, table: str, variant: str, keys: pd.DataFrame | None = None, method: str | None = None) -> pd.DataFrame:
         """The variant's rows of a table (in the order of `keys` when given),
-        with the IoU its method picks as column `pick`."""
+        with the IoU its method (--method unless given) picks as column `pick`."""
         Dt = self.D[(self.D.table == table) & (self.D.variant == variant)]
         if keys is not None:
             Dt = Dt.set_index(KEY).loc[pd.MultiIndex.from_frame(keys[KEY])].reset_index()
         Dt = Dt.reset_index(drop=True)
         W = G.iou_matrix(Dt, self.alphas)
-        return Dt.assign(pick=W[np.arange(len(Dt)), self.fitted[variant](Dt)[self.method]])
+        return Dt.assign(pick=W[np.arange(len(Dt)), self.fitted[variant](Dt)[method or self.method]])
 
     def cos(self, a: str, b: str) -> float:
         x, y = self.vec[a].ravel(), self.vec[b].ravel()
@@ -332,7 +335,8 @@ def md_table2(T: pd.DataFrame, n_draws: int, n: int) -> str:
 
 TIGHT = OrderedDict([("all", "13 лучших / 12 худших (базовый)"), ("tight", "tight bbox GT / 12 худших"),
                      ("tight_top", "13 лучших + tight bbox GT / 12 худших"),
-                     ("tight_all", "tight bbox GT / все 25 разметок")])
+                     ("tight_all", "tight bbox GT / все 25 разметок"),
+                     ("tight_worst", "tight bbox GT / 1 худшая")])
 
 
 def tight_vs_base(pk: Picks, args) -> pd.DataFrame | None:
@@ -465,6 +469,57 @@ def md_table3(T: pd.DataFrame) -> str:
     return "\n".join(L)
 
 
+WORST = OrderedDict([("all", "13 лучших / 12 худших (прошлый)"), ("ext1", "1 лучшая / 1 худшая"),
+                     ("tight_worst", "tight bbox GT / 1 худшая")])
+
+
+def tight_worst_coco(pk: Picks, args) -> pd.DataFrame | None:
+    """Table 6: on COCO half B, the tight-box-minus-worst-box vector against the
+    full-halves one (and the best-minus-worst one), under every way of
+    choosing alpha."""
+    vs = [v for v in WORST if v in pk.fitted]
+    if "tight_worst" not in vs or "COCO_B" not in set(pk.D.table):
+        return None
+    base = pk.on("COCO_B", "all")
+    fixed = [a for a in pk.meta["fixed_alphas"] if a in pk.alphas]
+    methods = [f"α = {a:g}" for a in fixed] + ["α* (подобрана на обучении)", "регрессор α, линейная",
+                                                "регрессор α, GBM"]
+    out = []
+    for m in methods:
+        P = base[["image_name", "group", "undef_iou"]].rename(columns={"undef_iou": "undef"})
+        for v in vs:
+            P[v] = pk.on("COCO_B", v, base, method=m).pick.to_numpy()
+        T = compare_blocks(OrderedDict([("COCO_B", P)]), vs, "all", args)
+        out.append(T.assign(method=m))
+    T = pd.concat(out, ignore_index=True)
+    for v in vs:
+        T[f"cos_{v}"] = pk.cos(v, "all")
+        T[f"norm_{v}"] = pk.norm_ratio(v, "all")
+    return T
+
+
+def md_table6(T: pd.DataFrame) -> str:
+    vs = [v for v in WORST if v in T.columns]
+    L = ["| выбор α | вектор (позитив / негатив) | bottom50 | top50 | к прошлому, b50 [95% CI] "
+         "| к прошлому, t50 [95% CI] |", "|" + "---|" * 6]
+    first = T.iloc[0]
+    for m, B in T.groupby("method", sort=False):
+        s = B.set_index("group")
+        b, t = s.loc["bottom50"], s.loc["top50"]
+        if m == T.method.iloc[0]:
+            L.append(f"| — | undef | {b.undef:.4f} | {t.undef:.4f} | | |")
+        for i, v in enumerate(vs):
+            gb = gt = "—"
+            if v != "all":
+                gb = f"{b[v + '_gain']:+.2f}% [{b[v + '_lo']:+.2f}, {b[v + '_hi']:+.2f}]"
+                gt = f"{t[v + '_gain']:+.2f}% [{t[v + '_lo']:+.2f}, {t[v + '_hi']:+.2f}]"
+            L.append(f"| {m if i == 0 else ''} | {WORST[v]} | {b[v]:.4f} ({b[v + '_pct']:+.2f}%) | "
+                     f"{t[v]:.4f} ({t[v + '_pct']:+.2f}%) | {gb} | {gt} |")
+    geo = ", ".join(f"{WORST[v]}: cos {first['cos_' + v]:+.2f}, ‖v‖ ×{first['norm_' + v]:.2f}"
+                    for v in vs if v != "all")
+    return "\n".join(L) + f"\n\nГеометрия против прошлого вектора — {geo}."
+
+
 def prev_run_diff(vdir: Path, prev: Path):
     """Max |IoU difference| over the table_exp12 rows two runs share."""
     if not (prev / "table_exp12.csv").is_file():
@@ -480,84 +535,96 @@ def prev_run_diff(vdir: Path, prev: Path):
 # ---------------------------------------------------------------------------
 
 def run(a) -> int:
+    """Every part whose inputs the run has; the rest is skipped and said so."""
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     vdir, sdir = Path(a.variants_dir), Path(a.selector_dir)
     method_label = {"регрессор α, GBM": "выбор α по боксу: GBM-регрессор выигрыша",
                     "регрессор α, линейная": "выбор α по боксу: линейный регрессор выигрыша",
                     "α* (подобрана на обучении)": "одна α*, подобранная на обучении"}.get(a.method, a.method)
+    skipped, checks, check2 = [], {}, {}
 
     F = figure_data(pd.read_csv(vdir / "table_exp12.csv"), a.method)
-    F.to_csv(out / "fig_annotations.csv", index=False)
-    plot_figure(F, out / "fig_annotations.png", method_label)
+    if len(F) and F.panel.nunique():
+        F.to_csv(out / "fig_annotations.csv", index=False)
+        plot_figure(F, out / "fig_annotations.png", method_label)
+    else:
+        F, _ = None, skipped.append("1 (нет средних по натуральным / медицинским наборам)")
 
     pk = Picks(vdir, a.method)
-    T2, check2, n_draws, n_sub = own_vs_coco_sub(pk, vdir, a)
-    T2.to_csv(out / "table_own_vector.csv", index=False)
-    T3, check3 = table3(sdir, a)
-    T3.to_csv(out / "table_catboost.csv", index=False)
-    T4 = tight_vs_base(pk, a)
-    if T4 is not None:
-        T4.to_csv(out / "table_tight.csv", index=False)
-    T5 = universal(pk, vdir, a)
-    if T5 is not None:
-        T5.to_csv(out / "table_universal.csv", index=False)
+    T2 = None
+    try:
+        T2, check2, n_draws, n_sub = own_vs_coco_sub(pk, vdir, a)
+        T2.to_csv(out / "table_own_vector.csv", index=False)
+    except SystemExit as e:
+        skipped.append(f"2 ({e})")
+    T3 = None
+    if (sdir / "per_case.csv").is_file():
+        T3, checks["table3_vs_selector_table_max_abs"] = table3(sdir, a)
+        T3.to_csv(out / "table_catboost.csv", index=False)
+    else:
+        skipped.append(f"3 (нет {sdir / 'per_case.csv'})")
+    T4, T5, T6 = tight_vs_base(pk, a), universal(pk, vdir, a), tight_worst_coco(pk, a)
+    for name, T in (("table_tight.csv", T4), ("table_universal.csv", T5), ("table_tight_worst_coco.csv", T6)):
+        if T is not None:
+            T.to_csv(out / name, index=False)
     own_err = [v for k, v in check2.items() if not k.startswith("own_COCO") and v is not None]
-    checks = {"table2_own_vs_table_exp3_max_abs": max(own_err) if own_err else None,
-              "own_COCO_vs_coco_draw0_max_abs": check2.get("own_COCO_vs_draw0_max_abs"),
-              "table3_vs_selector_table_max_abs": check3}
+    checks["table2_own_vs_table_exp3_max_abs"] = max(own_err) if own_err else None
+    checks["own_COCO_vs_coco_draw0_max_abs"] = check2.get("own_COCO_vs_draw0_max_abs")
     if a.prev_variants_dir:
         checks["table_exp12_vs_prev_run_max_abs"] = prev_run_diff(vdir, Path(a.prev_variants_dir))
-    (out / "checks.json").write_text(json.dumps({**checks, "table2_detail": check2}, indent=2), encoding="utf-8")
+    (out / "checks.json").write_text(json.dumps({**checks, "table2_detail": check2, "skipped": skipped}, indent=2),
+                                     encoding="utf-8")
     bad = [k for k, v in checks.items() if v is not None and v > 1e-6]
     if bad:
         print(f"CHECK FAILED: the report does not reproduce its sources: {checks}", file=sys.stderr)
         return 1
 
-    fig_rows = ["| набор | разметок на картинку | bottom50 | top50 |", "|---|---|---|---|"]
-    for panel, P in F.groupby("panel", sort=False):
-        nm = "натуральные" if panel == "natural" else "медицина"
-        u = P.groupby("group").undef.first()
-        fig_rows.append(f"| {nm} | undef | {u['bottom50']:.4f} | {u['top50']:.4f} |")
-        for var, _, tick in K_POINTS:
-            s = P[P.variant == var].set_index("group")
-            fig_rows.append(f"| {nm} | {tick.splitlines()[0]} | {s.loc['bottom50', 'iou']:.4f} "
-                            f"({s.loc['bottom50', 'pct']:+.2f}%) | {s.loc['top50', 'iou']:.4f} "
-                            f"({s.loc['top50', 'pct']:+.2f}%) |")
-
-    md = ["# Steering SAM-1 на user study: число разметок, свой вектор, CatBoost", "",
+    md = ["# Steering SAM-1 на user study", "",
           "Steering: к токенам декодера SAM-1 vit_b после `L2.norm2` (LayerNorm `norm2` второго two-way блока, "
           "после cross-attention «токены → картинка») прибавляется вектор h' = h + α·v на всех 7 токенах "
           "(IoU, 4 mask, 2 prompt). Вектор — разность средних хороших и плохих разметок внутри картинки, "
           "усреднённая по обучающим картинкам. α выбирается по боксу GBM-регрессором выигрыша IoU "
           "(признаки без GT), обученным на картинках вектора. Группы — 12 худших (bottom50) и 13 лучших (top50) "
-          "из 25 разметок картинки по undef IoU. CI — 95%, бутстреп по картинкам.", "",
-          "## 1. Сколько разметок на картинку нужно для вектора", "",
-          "Вектор по 25 картинкам COCO A из k лучших и k худших разметок каждой картинки; тест — COCO (половина B), "
-          "Berkeley, GrabCut и ACDC, BUID, MedScribble целиком; среднее по наборам с равным весом.", "",
-          "![IoU от числа разметок](fig_annotations.png)", "", "\n".join(fig_rows), "",
-          f"## 2. Свой вектор на набор против вектора COCO по тем же {n_sub} картинкам", "",
-          f"Свой вектор — {n_sub} случайных картинок набора со всеми разметками; COCO-{n_sub} — {n_sub} случайных "
-          f"картинок половины A COCO со всеми разметками, {n_draws} разных выборок, в столбцах COCO-{n_sub} — среднее "
-          f"IoU по выборкам (ожидаемое качество вектора COCO из {n_sub} картинок). Всё на одних и тех же тестовых "
-          "картинках набора (40; COCO — 25 картинок половины B). Проценты в столбцах методов — к undef; "
-          f"«свой к COCO-{n_sub}» — прирост IoU своего вектора в % от IoU COCO-{n_sub}, парный бутстреп по картинкам; "
-          f"последний столбец — тот же прирост против каждой выборки COCO-{n_sub} отдельно. cos — по всему тензору "
-          f"7 × 256, среднее по выборкам. ¹ Для COCO свой вектор — это выборка 0 COCO-{n_sub}.", "",
-          md_table2(T2, n_draws, n_sub), "",
-          "## 3. CatBoost-селектор без и со steering-кандидатами", "",
-          "Пул без steering — undef, 16 BoN и 11 точек grad; со steering — плюс 8 кандидатов: вектор COCO A "
-          "(25 картинок) при α = 1, 2, 3, 4, 6, 8, 12, 16; какую α (или не-steering кандидата) взять, решает сам "
-          "CatBoost (α — признак кандидата). CatBoost YetiRank, 5 фолдов по картинкам, все 12 500 разметок, каждая "
-          "оценена вне фолда. Проценты в столбцах — к undef; «выигрыш» — IoU со steering в % от IoU без steering, "
-          "парный бутстреп.", "",
-          md_table3(T3), ""]
+          "из 25 разметок картинки по undef IoU. CI — 95%, бутстреп по картинкам.", ""]
+    if F is not None:
+        fig_rows = ["| набор | разметок на картинку | bottom50 | top50 |", "|---|---|---|---|"]
+        for panel, P in F.groupby("panel", sort=False):
+            nm = "натуральные" if panel == "natural" else "медицина"
+            u = P.groupby("group").undef.first()
+            fig_rows.append(f"| {nm} | undef | {u['bottom50']:.4f} | {u['top50']:.4f} |")
+            for var, _, tick in K_POINTS:
+                s = P[P.variant == var].set_index("group")
+                fig_rows.append(f"| {nm} | {tick.splitlines()[0]} | {s.loc['bottom50', 'iou']:.4f} "
+                                f"({s.loc['bottom50', 'pct']:+.2f}%) | {s.loc['top50', 'iou']:.4f} "
+                                f"({s.loc['top50', 'pct']:+.2f}%) |")
+        md += ["## 1. Сколько разметок на картинку нужно для вектора", "",
+               "Вектор по 25 картинкам COCO A из k лучших и k худших разметок каждой картинки; тест — COCO "
+               "(половина B), Berkeley, GrabCut и ACDC, BUID, MedScribble целиком; среднее по наборам с равным весом.",
+               "", "![IoU от числа разметок](fig_annotations.png)", "", "\n".join(fig_rows), ""]
+    if T2 is not None:
+        md += [f"## 2. Свой вектор на набор против вектора COCO по тем же {n_sub} картинкам", "",
+               f"Свой вектор — {n_sub} случайных картинок набора со всеми разметками; COCO-{n_sub} — {n_sub} случайных "
+               f"картинок половины A COCO со всеми разметками, {n_draws} разных выборок, в столбцах COCO-{n_sub} — "
+               f"среднее IoU по выборкам (ожидаемое качество вектора COCO из {n_sub} картинок). Всё на одних и тех же "
+               "тестовых картинках набора (40; COCO — 25 картинок половины B). Проценты в столбцах методов — к undef; "
+               f"«свой к COCO-{n_sub}» — прирост IoU своего вектора в % от IoU COCO-{n_sub}, парный бутстреп по "
+               f"картинкам; последний столбец — тот же прирост против каждой выборки COCO-{n_sub} отдельно. cos — по "
+               f"всему тензору 7 × 256, среднее по выборкам. ¹ Для COCO свой вектор — это выборка 0 COCO-{n_sub}.", "",
+               md_table2(T2, n_draws, n_sub), ""]
+    if T3 is not None:
+        md += ["## 3. CatBoost-селектор без и со steering-кандидатами", "",
+               "Пул без steering — undef, 16 BoN и 11 точек grad; со steering — плюс 8 кандидатов: вектор COCO A "
+               "(25 картинок) при α = 1, 2, 3, 4, 6, 8, 12, 16; какую α (или не-steering кандидата) взять, решает "
+               "сам CatBoost (α — признак кандидата). CatBoost YetiRank, 5 фолдов по картинкам, все 12 500 разметок, "
+               "каждая оценена вне фолда. Проценты в столбцах — к undef; «выигрыш» — IoU со steering в % от IoU без "
+               "steering, парный бутстреп.", "", md_table3(T3), ""]
     if T4 is not None:
         md += ["## 4. Tight bbox GT как позитивный пример", "",
                "Все векторы — по 25 картинкам COCO A. Позитив «tight bbox GT» — состояние декодера на tight bbox "
-               "маски GT (идеальный бокс). Тест — COCO (половина B), Berkeley, GrabCut, ACDC, BUID, MedScribble "
-               "целиком. Проценты у IoU — к undef; «к базовому» — прирост IoU в % от базового вектора (13 лучших / "
-               "12 худших), парный бутстреп по картинкам.", "", md_table4(T4), ""]
+               "маски GT (идеальный бокс). Тест — все тестовые наборы прогона. Проценты у IoU — к undef; "
+               "«к базовому» — прирост IoU в % от базового вектора (13 лучших / 12 худших), парный бутстреп по "
+               "картинкам.", "", md_table4(T4), ""]
     if T5 is not None:
         md += ["## 5. Один вектор для всех наборов", "",
                "На тестовых картинках каждого набора (как в п. 2): свой вектор набора (10 картинок); общий вектор — "
@@ -567,6 +634,15 @@ def run(a) -> int:
                "выбирает GBM-регрессор, обученный на картинках вектора. Проценты у IoU — к undef; «к своему» — "
                "прирост в % от своего вектора, парный бутстреп; cos и отношение норм — со своим вектором набора.", "",
                md_long(T5, UNIVERSAL, "own", "своему", "cos со своим"), ""]
+    if T6 is not None:
+        md += ["## 6. COCO: tight bbox GT против одной худшей разметки", "",
+               "Векторы по 25 картинкам COCO A, тест — 25 картинок половины B (625 разметок). «tight bbox GT / "
+               "1 худшая» — разность состояния декодера на tight bbox маски GT и на худшей разметке картинки; "
+               "«прошлый» — 13 лучших / 12 худших. Для каждого способа выбора α (фиксированные, одна α*, "
+               f"регрессоры; сетка α = {', '.join(f'{x:g}' for x in pk.alphas)}) — IoU (% к undef) и прирост к "
+               "прошлому вектору в %, парный бутстреп по картинкам.", "", md_table6(T6), ""]
+    if skipped:
+        md += ["Не посчитано в этом прогоне: " + "; ".join(skipped) + ".", ""]
     text = "\n".join(md)
     (out / "report.md").write_text(text, encoding="utf-8")
     enc = sys.stdout.encoding or "utf-8"
