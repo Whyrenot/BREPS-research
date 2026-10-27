@@ -136,6 +136,67 @@ def pick(d: pd.DataFrame, by: np.ndarray) -> pd.Series:
     return pd.Series(t.target_iou.loc[idx].to_numpy(), index=idx.index)
 
 
+TIE = 1e-6            # IoUs this close are the same mask, for precision@1
+NEAR = 0.01           # "near-best": within this much IoU of the pool's best
+
+
+def ranking(d: pd.DataFrame, s: np.ndarray, task: str) -> pd.DataFrame:
+    """Per case: did the top-1 candidate of the selector (and of argmax f_pred)
+    hit the pool's best mask -- exactly (ties: any best candidate counts) or
+    within NEAR -- the IoU it gave up (regret), and the precision@1 a random
+    pick would get (number of best candidates / pool size)."""
+    t = d[["case", "target_iou", "f_pred"]].assign(_s=s)
+    g = t.groupby("case", sort=False)
+    best = g.target_iou.max()
+    top = t.loc[g._s.idxmax()].set_index("case").target_iou
+    fp = t.loc[g.f_pred.idxmax()].set_index("case").target_iou
+    n_best = (t.target_iou >= t.case.map(best) - TIE).groupby(t.case, sort=False).sum()
+    return pd.DataFrame({f"p1_{task}": (top >= best - TIE).astype(float), f"near_{task}": (top >= best - NEAR).astype(float),
+                         f"regret_{task}": best - top, f"p1fp_{task}": (fp >= best - TIE).astype(float),
+                         f"p1rand_{task}": n_best / g.size(), f"pool_{task}": g.size()})
+
+
+RANK_COLS = [("p1", "P@1 CatBoost"), ("near", "P@1 ±0.01"), ("p1fp", "P@1 argmax f_pred"),
+             ("p1rand", "P@1 случайный"), ("regret", "недобор до оракула, IoU")]
+
+
+def ranking_report(per_case: pd.DataFrame, tasks) -> pd.DataFrame:
+    nat = ~per_case.dataset.isin(MEDICAL)
+    blocks = [(ds, per_case.dataset == ds) for ds in sorted(per_case.dataset.unique())]
+    blocks += [(f"все {per_case.dataset.nunique()} наборов", pd.Series(True, index=per_case.index)),
+               (f"натуральные ({per_case[nat].dataset.nunique()})", nat), (f"медицина ({per_case[~nat].dataset.nunique()})", ~nat)]
+    rows = []
+    for name, m in blocks:
+        for g in GROUPS:
+            s = per_case[m.to_numpy() & ((per_case.group == g).to_numpy() if g != "all" else True)]
+            for task in tasks:
+                r = {"block": name, "group": g, "task": task, "n": len(s), "pool": float(s[f"pool_{task}"].mean())}
+                r.update({k: float(s[f"{k}_{task}"].mean()) for k, _ in RANK_COLS})
+                rows.append(r)
+    return pd.DataFrame(rows)
+
+
+def md_ranking(K: pd.DataFrame) -> str:
+    L = ["# Насколько хорошо CatBoost ранжирует кандидатов (precision@1)", "",
+         f"P@1 — доля разметок, где кандидат №1 по скорингу CatBoost (вне фолда) — лучшая маска пула по GT IoU "
+         f"(при равенстве IoU с точностью {TIE:g} засчитывается любой из лучших); «±{NEAR:g}» — выбранная маска "
+         f"не хуже лучшей больше чем на {NEAR:g} IoU; «случайный» — ожидаемая P@1 случайного выбора (число лучших "
+         "кандидатов / размер пула); недобор — средняя разница IoU оракула и выбранной маски. "
+         "t4 — undef + 16 BoN + 11 точек grad (28 кандидатов), t4s — плюс 8 кандидатов steering (36).", "",
+         "| набор | группа | пул | " + " | ".join(lbl for _, lbl in RANK_COLS) + " |",
+         "|---|---|---|" + "---|" * len(RANK_COLS)]
+    for (block, g), s in K.groupby(["block", "group"], sort=False):
+        s = s.set_index("task")
+        cells = []
+        for k, _ in RANK_COLS:
+            fmt = (lambda v: f"{v:.4f}") if k == "regret" else (lambda v: f"{v:.1%}")
+            cells.append(" / ".join(fmt(s.loc[t, k]) for t in s.index))
+        L.append(f"| {block if g == 'all' else ''} | {g} | " + " / ".join(f"{s.loc[t, 'pool']:.0f}" for t in s.index)
+                 + " | " + " | ".join(cells) + " |")
+    L += ["", f"В каждой ячейке через «/»: {' / '.join(K.task.unique())}."]
+    return "\n".join(L) + "\n"
+
+
 def boot_ci(d: np.ndarray, images: np.ndarray, n_boot: int, seed: int):
     codes, img = np.unique(images, return_inverse=True)
     S = np.bincount(img, weights=d, minlength=len(codes))
@@ -231,6 +292,7 @@ def run(a) -> int:
             per_case["fpred_t4"] = pick(d, d.f_pred.to_numpy())
         s = oof_scores(d, cols, folds, a, out, task)
         per_case[f"cb_{task}"] = pick(d, s)
+        per_case = per_case.join(ranking(d, s, task))
         methods.append(f"cb_{task}")
         labels[f"cb_{task}"] = TASK_LABEL[task]
         if "steer" in TASKS[task][0]:
@@ -250,8 +312,12 @@ def run(a) -> int:
     text = md(R, labels, checks, a)
     (out / "summary.md").write_text(text, encoding="utf-8")
     (out / "checks.json").write_text(json.dumps(checks, indent=2), encoding="utf-8")
+    K = ranking_report(per_case, a.tasks)
+    K.to_csv(out / "ranking.csv", index=False)
+    rank_md = md_ranking(K)
+    (out / "ranking.md").write_text(rank_md, encoding="utf-8")
     enc = sys.stdout.encoding or "utf-8"
-    print("\n" + text.encode(enc, "replace").decode(enc))
+    print("\n" + (text + "\n" + rank_md).encode(enc, "replace").decode(enc))
     return 0
 
 
