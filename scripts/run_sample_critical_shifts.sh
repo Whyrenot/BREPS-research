@@ -10,9 +10,9 @@
 # failed. Re-running the same command resumes. SAM-3 re-execs itself into the
 # sam3 conda env (heatmaps/env_dispatch.py). Run from the pishugin-breps env.
 #
-#   CKPT_SAM21=/.../MODEL_CHECKPOINTS/SAM2.1/sam2.1_hiera_<size>.pt \
-#   bash scripts/run_sample_critical_shifts.sh
+#   CUDA_VISIBLE_DEVICES=5,7 bash scripts/run_sample_critical_shifts.sh
 #
+#   SMOKE=1 ...                   one image per subset, no replacement, out dir *_smoke
 #   MODELS="SAM3" ...             only some models
 #   CUDA_VISIBLE_DEVICES=0,1 ...  the GPUs torchrun uses (default: all)
 #   N_IMAGES=5 OUT=... ...        fewer images / another output dir
@@ -22,13 +22,22 @@ cd "$(dirname "$0")/.."
 ROOT=${ROOT:-/home/jovyan/shares/SR006.nfs2/pishugin/user_study/FOR_TEST}
 CKPTS=${CKPTS:-/home/jovyan/shares/SR006.nfs2/pishugin/temp/rclicks/MODEL_CHECKPOINTS}
 CKPT_SAM=${CKPT_SAM:-$CKPTS/SAM/sam_vit_b_01ec64.pth}
-CKPT_SAM21=${CKPT_SAM21:-}          # required for SAM2.1: the size is in the file name
+CKPT_SAM21=${CKPT_SAM21:-$CKPTS/SAM2.1/sam2.1_hiera_base_plus.pt}  # the size is read from the file name
 CKPT_SAM3=${CKPT_SAM3:-}            # "" = the builder takes the weights from the HF cache
 MODELS=${MODELS:-"SAM SAM2.1 SAM3"}
-OUT=${OUT:-exp_res/critical_shifts_sample}
-N_IMAGES=${N_IMAGES:-20}
+SMOKE=${SMOKE:-0}
 BATCH=${BATCH:-512}
 status=0
+
+extra=()
+if [ "$SMOKE" = "1" ]; then
+    N_IMAGES=${N_IMAGES:-1}
+    OUT=${OUT:-exp_res/critical_shifts_sample_smoke}
+    extra=(--max_tried 1)
+else
+    N_IMAGES=${N_IMAGES:-20}
+    OUT=${OUT:-exp_res/critical_shifts_sample}
+fi
 
 run() {  # model, extra args...
     local model=$1 ckpt
@@ -40,13 +49,14 @@ run() {  # model, extra args...
     esac
     python scripts/sample_critical_shifts.py --model_name "$model" --root "$ROOT" \
         --checkpoint_path "$ckpt" --out_dir "$OUT/$model" \
-        --n_images "$N_IMAGES" --batch_size "$BATCH" "$@"
+        --n_images "$N_IMAGES" --batch_size "$BATCH" "${extra[@]}" "$@"
 }
 
 for model in $MODELS; do
     case "$model" in
-        SAM|SAM3) ;;
-        SAM2.1) [ -n "$CKPT_SAM21" ] || { echo "SAM2.1: set CKPT_SAM21"; exit 1; } ;;
+        SAM3)   ;;
+        SAM)    [ -f "$CKPT_SAM" ] || { echo "SAM: no checkpoint $CKPT_SAM"; exit 1; } ;;
+        SAM2.1) [ -f "$CKPT_SAM21" ] || { echo "SAM2.1: no checkpoint $CKPT_SAM21"; exit 1; } ;;
         *)      echo "unknown model $model"; exit 1 ;;
     esac
 done

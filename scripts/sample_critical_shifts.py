@@ -93,10 +93,11 @@ def image_order(stems: list[str], seed: int) -> list[str]:
     return [str(s) for s in np.random.default_rng(seed).permutation(sorted(stems))]
 
 
-def plan(order: list[str], n_cases: dict[str, int], n_images: int, nproc: int):
+def plan(order: list[str], n_cases: dict[str, int], n_images: int, nproc: int, max_tried: int = 0):
     """(selected, next_round). selected: the images with >= 1 case, in order,
     among the tried prefix of the order; next_round: the untried images to
-    compute next, [] once n_images are selected or nothing is left."""
+    compute next, [] once n_images are selected, nothing is left or
+    max_tried (> 0) images have been tried."""
     selected = []
     for s in order:
         if s not in n_cases:
@@ -106,6 +107,8 @@ def plan(order: list[str], n_cases: dict[str, int], n_images: int, nproc: int):
             if len(selected) == n_images:
                 return selected, []
     untried = [s for s in order if s not in n_cases]
+    if max_tried > 0:
+        untried = untried[:max(0, max_tried - (len(order) - len(untried)))]
     if not untried:
         return selected, []
     need = n_images - len(selected)
@@ -264,7 +267,7 @@ def main() -> None:
 
         rnd = 0
         while True:
-            selected, nxt = plan(order, n_cases, args.n_images, nproc)
+            selected, nxt = plan(order, n_cases, args.n_images, nproc, args.max_tried)
             if not nxt:
                 break
             rnd += 1
@@ -290,7 +293,8 @@ def main() -> None:
                      "without_cases": sum(n_cases[s] == 0 for s in tried), "skipped_by_comp_hw": len(skipped),
                      "selected": len(selected), "cases": len(sel_cases), "short": len(selected) < args.n_images})
         if len(selected) < args.n_images:
-            print(f"[warn] {name}: only {len(selected)} of {len(order)} images have a critical shift")
+            print(f"[warn] {name}: {len(selected)} images with a critical shift after trying "
+                  f"{len(tried)} of {len(order)}")
 
     all_cases.sort(key=lambda c: c["iou_drop"], reverse=True)
     (out_dir / "critical_shifts_all.json").write_text(json.dumps(all_cases, indent=4))
@@ -311,6 +315,8 @@ def parse_args():
     p.add_argument("--datasets", default=",".join(DATASETS), help="comma-separated subsets")
     p.add_argument("--n_images", type=int, default=20, help="images with >= 1 critical shift per subset")
     p.add_argument("--seed", type=int, default=0, help="seed of the image order (same for every model)")
+    p.add_argument("--max_tried", type=int, default=0,
+                   help="stop a subset after this many tried images, found or not (smoke: 1); 0 = no cap")
     p.add_argument("--dist_thresh", type=float, default=10.0, help="find_critical_shifts, 1024 frame")
     p.add_argument("--iou_drop_thresh", type=float, default=0.75, help="find_critical_shifts")
     p.add_argument("--max_cases", type=int, default=5, help="find_critical_shifts, per image")
