@@ -270,13 +270,23 @@ def build(args) -> int:
     pd.DataFrame(site_rows).to_csv(out_dir / "table_sites.csv", index=False)
 
     expect = None
-    if meta["model_name"] == "SAM" and fixed:
+    # only a full run has the 25-image A vector of steer_user_study
+    if meta["model_name"] == "SAM" and fixed and not meta["args"].get("limit_images"):
         expect = {}
         for ds, want in EXPECT_SAM1.items():
             if ds in dsets:
                 got = stats[0][ds]["fixed"]["dm"]["all"]["d"]
                 expect[ds] = {"want": want, "got": got, "ok": abs(got - want) <= 5e-4}
     refs = reference_table(R, args.reference_csv or meta["args"].get("reference_csv", ""))
+    # head-select of this very run (the mm1 baseline; both csvs list the boxes in one order)
+    p0, p1 = R["per"][0], R["per"][1]
+    hs = p1.base_iou.to_numpy()
+    for ds in dsets:
+        for g in GROUPS:
+            m = (p0.key.to_numpy() == ds) & group_mask(p0, g)
+            base = p0.base_iou.to_numpy()[m].mean()
+            refs.setdefault(0, {}).setdefault(ds, {}).setdefault(g, {})["head-select (этот прогон)"] = {
+                "iou": float(hs[m].mean()), "pct": float((hs[m].mean() - base) / base * 100)}
 
     G = {mm: {ds: {} for ds in dsets} for mm in MODES}
     for r in grid.itertuples(index=False):

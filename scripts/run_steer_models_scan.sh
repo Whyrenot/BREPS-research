@@ -16,7 +16,10 @@ cd "$(dirname "$0")/.."
 ROOT=${ROOT:-/home/jovyan/shares/SR006.nfs2/pishugin/user_study/FOR_TEST}
 CKPTS=${CKPTS:-/home/jovyan/shares/SR006.nfs2/pishugin/temp/rclicks/MODEL_CHECKPOINTS}
 CKPT_SAM=${CKPT_SAM:-$CKPTS/SAM/sam_vit_b_01ec64.pth}
-CKPT_SAM21=${CKPT_SAM21:-$CKPTS/SAM2.1/sam2.1_hiera_base_plus.pt}   # the checkpoint of results/sam21full_m.csv
+CKPT_SAM21=${CKPT_SAM21:-$CKPTS/SAM2.1/sam2.1_hiera_base_plus.pt}
+# results/sam21full_m.csv was run on hiera_large, so it is no reference for
+# base_plus: no repro check / comparison rows unless a base_plus csv is given
+REF_SAM21=${REF_SAM21:-}
 CKPT_SAM3=${CKPT_SAM3:-}            # "" = the builder downloads / reuses facebook/sam3 from the HF cache
 MODELS=${MODELS:-"SAM SAM2.1 SAM3"}
 SMOKE=${SMOKE:-0}
@@ -32,7 +35,7 @@ fi
 for model in $MODELS; do
     case "$model" in
         SAM)    ckpt=$CKPT_SAM;   ref=results/samfull_m.csv ;;
-        SAM2.1) ckpt=$CKPT_SAM21; ref=results/sam21full_m.csv ;;
+        SAM2.1) ckpt=$CKPT_SAM21; ref=$REF_SAM21 ;;
         SAM3)   ckpt=$CKPT_SAM3;  ref=results/sam3full_m.csv ;;
         *)      echo "unknown model $model"; status=1; continue ;;
     esac

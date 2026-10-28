@@ -115,10 +115,10 @@ Example
         --checkpoint_path /.../MODEL_CHECKPOINTS/SAM/sam_vit_b_01ec64.pth \\
         --reference_csv results/samfull_m.csv --out_dir exp_res/steer_scan_SAM
 
-    # SAM-2.1: base_plus, the checkpoint that produced results/sam21full_m.csv
+    # SAM-2.1 base_plus (results/sam21full_m.csv is hiera_large: no reference)
     CUDA_VISIBLE_DEVICES=0 python scripts/steer_models_scan.py --model_name SAM2.1 \\
         --root /.../FOR_TEST --checkpoint_path /.../MODEL_CHECKPOINTS/SAM2.1/sam2.1_hiera_base_plus.pt \\
-        --reference_csv results/sam21full_m.csv --out_dir exp_res/steer_scan_SAM2.1
+        --out_dir exp_res/steer_scan_SAM2.1
 
     # SAM-3: re-execs itself into the sam3 env (heatmaps/env_dispatch.py)
     CUDA_VISIBLE_DEVICES=0 python scripts/steer_models_scan.py --model_name SAM3 \\
