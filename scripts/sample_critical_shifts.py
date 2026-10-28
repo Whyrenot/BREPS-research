@@ -147,9 +147,19 @@ def run_round(args, stems, imgs, masks, out: Path, nproc: int) -> None:
     shutil.rmtree(rd)
 
 
+def _comp_hw_masks(img: Path, predictor, boxes: np.ndarray, device: torch.device, batch_size: int):
+    """(masks (N, H, W) bool, CSV boxes (N, 4)) from comp_hw's own path."""
+    out = list(CH.multi_bbox_inference(str(img), predictor, boxes, rank=device, batch_size=batch_size))
+    m = torch.cat([r["masks"] for r in out]).bool().cpu()
+    return m.reshape(len(boxes), *m.shape[-2:]), torch.cat([r["boxes"].cpu().float() for r in out])
+
+
 def check_model(args, img: Path, mask: Path, device: torch.device) -> None:
-    """comp_hw's batched path against the predictor's own predict() on the
-    same pixel boxes (the tight GT box + 7 grid boxes), then a timing."""
+    """comp_hw's path against the predictor's own predict() on the same pixel
+    boxes (the tight GT box + 7 grid boxes), one box per call and as one
+    batch, then a timing. One box per call must match: that is the box
+    frame. A batch may differ a little where the model is unsure of a box
+    (batch-dependent TF32 / cuDNN kernels), not more."""
     predictor = CH.load_model(model_name=args.model_name, model_type=args.model_type,
                               checkpoint=args.checkpoint_path, device=device)
     gt = cv2.imread(str(mask), cv2.IMREAD_GRAYSCALE)
@@ -164,28 +174,38 @@ def check_model(args, img: Path, mask: Path, device: torch.device) -> None:
     boxes = np.concatenate([np.array([[cmin, rmin, cmax, rmax]], dtype=np.int32),
                             grid[rng.choice(len(grid), 7, replace=False)]])
 
-    res = next(CH.multi_bbox_inference(str(img), predictor, boxes, rank=device, batch_size=len(boxes)))
-    m_batch = res["masks"].reshape(len(boxes), *res["masks"].shape[-2:]).bool().cpu()
-    frame_err = (res["boxes"].cpu().float()
-                 - CH.boxes_to_1024(torch.as_tensor(boxes), tuple(m_batch.shape[-2:]))).abs().max().item()
-    agree = []
+    m_batch, csv_boxes = _comp_hw_masks(img, predictor, boxes, device, len(boxes))
+    m_one, _ = _comp_hw_masks(img, predictor, boxes, device, 1)
+    frame_err = (csv_boxes - CH.boxes_to_1024(torch.as_tensor(boxes), tuple(m_batch.shape[-2:]))).abs().max().item()
+    m_pub = []
     with torch.inference_mode():
-        for b, mb in zip(boxes, m_batch):
+        for b in boxes:
             m, _, _ = predictor.predict(point_coords=None, point_labels=None,
                                         box=b.astype(np.float32), multimask_output=False)
-            agree.append(_iou(mb, torch.from_numpy(np.asarray(m[0]) > 0)))
+            m_pub.append(torch.from_numpy(np.asarray(m[0]) > 0))
+    agree_one = [_iou(a, b) for a, b in zip(m_one, m_pub)]
+    agree = [_iou(a, b) for a, b in zip(m_batch, m_pub)]
     gt_t = torch.from_numpy(gt)
     tight_iou = _iou(m_batch[0], gt_t) if m_batch.shape[-2:] == gt_t.shape else float("nan")
-    print(f"[check] {args.model_name} on {img.name}: batched vs predict() mask IoU min {min(agree):.4f} "
+    print(f"[check] {args.model_name} on {img.name} (TF32 matmul "
+          f"{'on' if torch.backends.cuda.matmul.allow_tf32 else 'off'}): mask IoU vs predict(), one box per call "
+          f"min {min(agree_one):.4f}; batch of {len(boxes)} min {min(agree):.4f} "
           f"(all: {', '.join(f'{a:.3f}' for a in agree)}); CSV frame vs SAM-1 1024 frame max err "
           f"{frame_err:.2e}; tight GT box IoU {tight_iou:.3f}")
-    if min(agree) < 0.98 or frame_err > 1e-3:
-        raise SystemExit(f"[check] {args.model_name}: the batched heatmap path disagrees with the model's "
-                         f"own predict() -- not running the heatmaps")
+    if min(agree_one) < 0.995 or frame_err > 1e-3 or min(agree) < 0.95:
+        raise SystemExit(f"[check] {args.model_name}: comp_hw's path disagrees with the model's own predict() "
+                         f"-- not running the heatmaps")
+    if min(agree) < 0.98:
+        print("[check] warning: one box per call matches predict(), a batch slightly less: batch-dependent "
+              "numerics, not the box frame")
     if not tight_iou > 0.5:
         print(f"[check] warning: the tight GT box gives IoU {tight_iou:.3f} on {img.name}")
 
-    n_t = min(len(grid), 3 * args.batch_size)
+    # one untimed batch first: the first big batch picks kernels and grows the allocator
+    n_t = min(len(grid), 4 * args.batch_size)
+    warm = grid[rng.choice(len(grid), min(len(grid), args.batch_size), replace=False)]
+    for _ in CH.multi_bbox_inference(str(img), predictor, warm, rank=device, batch_size=args.batch_size):
+        pass
     sub = grid[rng.choice(len(grid), n_t, replace=False)]
     gt_dev = gt_t.to(device)[None, None]
     torch.cuda.synchronize(device)

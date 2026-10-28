@@ -335,9 +335,15 @@ def load_sam3_model(
     env (scripts/sample_critical_shifts.py does)."""
     from heatmaps.comp_hw_smoothed import load_sam3_model as _load_sam3_model
 
-    return _load_sam3_model(
+    predictor = _load_sam3_model(
         checkpoint=checkpoint, device=device, model_type=model_type
     )
+    # sam3.model_builder turns TF32 matmuls on at import (Ampere and newer).
+    # With them a box's mask depends on the batch it is computed in (IoU down
+    # to 0.96 against predict() on the same box), so the heatmaps run SAM3
+    # with fp32 matmuls, as SAM-1 / SAM2.1 run in pishugin-breps.
+    torch.backends.cuda.matmul.allow_tf32 = False
+    return predictor
 
 
 def load_model(model_name: str, **kwargs):
