@@ -413,7 +413,7 @@ def multi_bbox_inference(
     predictor.model.eval()
     indice = 0
 
-    for bboxes in transformed_boxes.split(batch_size, dim=0):
+    def predict(bboxes):
         if hasattr(predictor, "predict_torch"):
             masks, scores, _ = predictor.predict_torch(
                 point_coords=None,
@@ -421,19 +421,36 @@ def multi_bbox_inference(
                 boxes=bboxes.to(rank),
                 multimask_output=False,
             )
-            boxes_1024 = bboxes
-        else:
-            # SAM2ImagePredictor (SAM2.1, SAM-HQ2) and SAM3's port of it have
-            # no public batched call; their private _predict takes a batch of
-            # boxes in the model's own frame and repeats the cached image
-            # embedding across it (as refine_box_iou_grad._predict_boxes_batched).
-            model_boxes = predictor._transforms.transform_boxes(
-                bboxes.to(rank), normalize=True, orig_hw=orig_hw
-            ).reshape(-1, 4)
-            masks, scores, _ = predictor._predict(
-                None, None, boxes=model_boxes, multimask_output=False
-            )
-            boxes_1024 = boxes_to_1024(bboxes, orig_hw)
+            return masks, scores, bboxes
+        # SAM2ImagePredictor (SAM2.1, SAM-HQ2) and SAM3's port of it have
+        # no public batched call; their private _predict takes a batch of
+        # boxes in the model's own frame and repeats the cached image
+        # embedding across it (as refine_box_iou_grad._predict_boxes_batched).
+        model_boxes = predictor._transforms.transform_boxes(
+            bboxes.to(rank), normalize=True, orig_hw=orig_hw
+        ).reshape(-1, 4)
+        masks, scores, _ = predictor._predict(
+            None, None, boxes=model_boxes, multimask_output=False
+        )
+        return masks, scores, boxes_to_1024(bboxes, orig_hw)
+
+    while indice < transformed_boxes.size(0):
+        bboxes = transformed_boxes[indice : indice + batch_size]
+        out = None
+        try:
+            out = predict(bboxes)
+        except torch.cuda.OutOfMemoryError:
+            if batch_size == 1:
+                raise
+        if out is None:
+            # The GPUs are shared: another job can take the memory mid-run.
+            # Halve the batch for the rest of this image instead of dying
+            # (outside the except block, so the failed call's tensors are free).
+            torch.cuda.empty_cache()
+            batch_size = max(1, batch_size // 2)
+            logger.warning(f"CUDA out of memory, batch size -> {batch_size}")
+            continue
+        masks, scores, boxes_1024 = out
 
         yield {
             "indice": indice,

@@ -78,6 +78,9 @@ DATASETS = OrderedDict([("COCO", "COCO_MVal_"), ("Berkeley", "Berkeley_"), ("Gra
                         ("DAVIS", "DAVIS_"), ("PASCAL", "PASCAL_"), ("ADE20K", "ADE20K_"), ("TETRIS", "TETRIS_"),
                         ("ACDC", "ACDC_"), ("BUID", "BUID_"), ("MedScribble", "MedScribble_")])
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+# a round that fails (on a shared GPU: usually another job's memory) is rerun
+ROUND_ATTEMPTS = 3
+RETRY_WAIT_S = 120
 
 
 def index_dir(d: Path) -> dict[str, Path]:
@@ -143,7 +146,16 @@ def run_round(args, stems, imgs, masks, out: Path, nproc: int) -> None:
            "--output_dir", str(out), "--model_name", args.model_name, "--model_type", args.model_type,
            "--checkpoint_path", args.checkpoint_path, "--batch_size", str(args.batch_size),
            "--continue_from"]
-    subprocess.run(cmd, check=True)
+    for attempt in range(1, ROUND_ATTEMPTS + 1):
+        rc = subprocess.run(cmd).returncode
+        if rc == 0:
+            break
+        if attempt == ROUND_ATTEMPTS:
+            raise RuntimeError(f"comp_hw failed {ROUND_ATTEMPTS} times on this round (exit {rc})")
+        # images finished before the failure keep their CSVs (--continue_from)
+        print(f"[warn] comp_hw failed (exit {rc}), attempt {attempt}/{ROUND_ATTEMPTS}; "
+              f"retrying in {RETRY_WAIT_S} s", flush=True)
+        time.sleep(RETRY_WAIT_S)
     shutil.rmtree(rd)
 
 
