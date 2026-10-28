@@ -1,4 +1,6 @@
 import os
+import sys
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -7,6 +9,12 @@ import torch
 import torch.distributed as dist
 from loguru import logger
 from tqdm import tqdm
+
+# SAM3 is loaded through heatmaps.comp_hw_smoothed / heatmaps.sam3_adapter,
+# which need the repo root importable when this file is run as a script.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 
 def generate_random_bboxes(
@@ -97,6 +105,20 @@ def mask_to_boundary(mask: np.ndarray, dilation_ratio: float = 0.02) -> np.ndarr
     mask_erode = new_mask_erode[1 : h + 1, 1 : w + 1]
 
     return mask - mask_erode
+
+
+def boxes_to_1024(boxes: torch.Tensor, orig_hw: tuple[int, int]) -> torch.Tensor:
+    """Pixel boxes -> SAM-1's ResizeLongestSide(1024) frame (same arithmetic
+    as its apply_boxes_torch). Every res_final CSV is written in this frame,
+    whatever the model: draw_heatmaps.py maps boxes back from it and
+    find_critical_shifts' --dist_thresh is measured in it."""
+    old_h, old_w = orig_hw
+    scale = 1024 / max(old_h, old_w)
+    new_h, new_w = int(old_h * scale + 0.5), int(old_w * scale + 0.5)
+    out = boxes.to(torch.float32).clone()
+    out[:, [0, 2]] *= new_w / old_w
+    out[:, [1, 3]] *= new_h / old_h
+    return out
 
 
 def mask_to_polygon(mask: np.ndarray, dilation_coeff: float = 0.0) -> tuple[int, int, int, int]:
@@ -307,12 +329,14 @@ def load_sam3_model(
     device: torch.device,
     model_type: str = "vit_b",
 ):
-    """NOT YET WIRED IN -- see heatmaps/comp_hw_smoothed.load_sam3_model for
-    why (different predictor API, unconfirmed prompt_encoder/mask_decoder
-    access needed for gradient-based box optimisation)."""
-    raise NotImplementedError(
-        "SAM3 is not wired into load_model() yet -- see "
-        "heatmaps/comp_hw_smoothed.load_sam3_model for details."
+    """SAM3's SAM2ImagePredictor-compatible interactive predictor, built
+    exactly as in heatmaps/comp_hw_smoothed.load_sam3_model (see there).
+    Only import-safe inside the ``sam3`` conda env: run torchrun from that
+    env (scripts/sample_critical_shifts.py does)."""
+    from heatmaps.comp_hw_smoothed import load_sam3_model as _load_sam3_model
+
+    return _load_sam3_model(
+        checkpoint=checkpoint, device=device, model_type=model_type
     )
 
 
@@ -373,11 +397,12 @@ def multi_bbox_inference(
     rank: int,
     batch_size: int = 8,
 ):
-    _, transformed_boxes = prepare_input(
+    image, transformed_boxes = prepare_input(
         image_path=image_path,
         predictor=predictor,
         all_bboxes=all_bboxes_list,
     )
+    orig_hw = image.shape[:2]
 
     predictor.model.eval()
     indice = 0
@@ -390,23 +415,45 @@ def multi_bbox_inference(
                 boxes=bboxes.to(rank),
                 multimask_output=False,
             )
+            boxes_1024 = bboxes
         else:
-            masks, scores, _ = predictor.predict_batch_single_image(
-                point_coords_batch=None,
-                point_labels_batch=None,
-                box_batch=bboxes.to(rank),
-                multimask_output=False,
+            # SAM2ImagePredictor (SAM2.1, SAM-HQ2) and SAM3's port of it have
+            # no public batched call; their private _predict takes a batch of
+            # boxes in the model's own frame and repeats the cached image
+            # embedding across it (as refine_box_iou_grad._predict_boxes_batched).
+            model_boxes = predictor._transforms.transform_boxes(
+                bboxes.to(rank), normalize=True, orig_hw=orig_hw
+            ).reshape(-1, 4)
+            masks, scores, _ = predictor._predict(
+                None, None, boxes=model_boxes, multimask_output=False
             )
-            masks = torch.stack(masks).squeeze(0)
+            boxes_1024 = boxes_to_1024(bboxes, orig_hw)
 
         yield {
             "indice": indice,
             "masks": masks,
             "scores": scores,
-            "boxes": bboxes,
+            "boxes": boxes_1024,
         }
 
         indice += bboxes.size(0)
+
+
+_PREDICTORS: dict = {}
+
+
+def _cached_predictor(args, device: torch.device):
+    """One model per process instead of one per image: set_image() resets
+    the predictor, and building SAM3 alone takes tens of seconds."""
+    key = (args.model_name, args.model_type, args.checkpoint_path, str(device))
+    if key not in _PREDICTORS:
+        _PREDICTORS[key] = load_model(
+            model_name=args.model_name,
+            model_type=args.model_type,
+            checkpoint=args.checkpoint_path,
+            device=device,
+        )
+    return _PREDICTORS[key]
 
 
 def evaluate_mask(args, device: torch.device, rank: int):
@@ -462,12 +509,7 @@ def evaluate_mask(args, device: torch.device, rank: int):
 
     batch_size = args.batch_size
 
-    predictor = load_model(
-        model_name=args.model_name,
-        model_type=args.model_type,
-        checkpoint=args.checkpoint_path,
-        device=device,
-    )
+    predictor = _cached_predictor(args, device)
 
     gt_masks = (
         torch.from_numpy(mask)
@@ -553,9 +595,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model_name",
         type=str,
-        choices=["SAM", "SAM2.1", "SAM-HQ", "MobileSAM", "MedSAM"],
+        choices=["SAM", "SAM2.1", "SAM-HQ", "SAM-HQ2", "SAM3", "MobileSAM", "MedSAM"],
         default="SAM",
-        help="model name to use",
+        help="model name to use (SAM-HQ, SAM-HQ2, SAM3: launch torchrun from "
+             "that model's conda env, see heatmaps/env_dispatch.MODEL_ENV)",
     )
     parser.add_argument(
         "--random_boxes",

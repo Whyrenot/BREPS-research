@@ -14,6 +14,10 @@ Parameters description:
 
 Caution: Heatmaps calculation uses a lot of gpu resources, running W\*H forward calls of the model. User is advised to adjust batch_size and nproc_per_node params.
 
+`--model_name SAM2.1` / `SAM3` run the boxes in batches through the predictor's private `_predict` (SAM2ImagePredictor and SAM3's port of it have no public batched call). SAM3 only imports inside the `sam3` conda env: launch torchrun from that env. The `bbox` column of every CSV is in SAM-1's 1024 frame (longest side 1024) whatever the model, so `draw_heatmaps.py` and `scripts/find_critical_shifts.py` treat all models alike.
+
+Critical shifts on a random 20-images-per-subset sample of the user study, for SAM, SAM2.1 and SAM3 in a row: `scripts/run_sample_critical_shifts.sh` (see `scripts/sample_critical_shifts.py`).
+
 ## Heatmap visualisation
 
 Running the script above will produce "res_final_{image stem}.csv" tables that contain bbox coordinates and IoU@BBox metric obtained from model prediction from respective bbox prompt.

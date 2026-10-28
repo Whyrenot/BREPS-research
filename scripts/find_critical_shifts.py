@@ -5,9 +5,15 @@ import ast
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from scipy.spatial import cKDTree
 from tqdm import tqdm
 
 def find_critical_shift(csv_path, dist_thresh=10.0, iou_drop_thresh=0.75, max_cases=5):
+    # Neighbours come from a KD-tree (Chebyshev metric) instead of a pass over
+    # every box per base box, which is O(N^2) on a full w x h grid. The tree
+    # only pre-filters with a slightly larger radius; the exact test below is
+    # the original one, on candidates in ascending index order, so the result
+    # (ties included) is the same as the full scan.
     try:
         df = pd.read_csv(csv_path)
         if df.empty:
@@ -28,18 +34,21 @@ def find_critical_shift(csv_path, dist_thresh=10.0, iou_drop_thresh=0.75, max_ca
         
         found_cases = []
         used_bad_indices = set()
-        
+        tree = cKDTree(bboxes)
+        radius = dist_thresh * (1 + 1e-9) + 1e-9
+
         for idx in base_indices:
             base_iou = ious[idx]
             base_box = bboxes[idx]
-            
-            diffs = np.max(np.abs(bboxes - base_box), axis=1)
+
+            cand = np.sort(np.asarray(tree.query_ball_point(base_box, r=radius, p=np.inf), dtype=np.int64))
+            diffs = np.max(np.abs(bboxes[cand] - base_box), axis=1)
             close_mask = (diffs > 0) & (diffs <= dist_thresh)
-            
+
             if not close_mask.any():
                 continue
-                
-            close_indices = np.where(close_mask)[0]
+
+            close_indices = cand[close_mask]
             close_indices = [ci for ci in close_indices if ci not in used_bad_indices]
             if not close_indices:
                 continue
