@@ -885,7 +885,8 @@ def load_item(dec: Decoder, root: Path, dataset: str, half: str, stem: str, recs
     rows = [{"dataset": dataset, "image_name": stem, "kind": c["kind"], "user": c["user"],
              "attempt": c["attempt"], "half": half, "fold": fold} for c in cases]
     return {"stem": stem, "dataset": dataset, "half": half, "fold": fold, "rows": rows,
-            "boxes": boxes, "b": dec.model_boxes(boxes), "gt": gt}
+            "boxes": boxes, "b": dec.model_boxes(boxes), "gt": gt,
+            "best_box": cases[0]["best_box"] if cases else None}       # the GT's tight box, 1024 frame
 
 
 def score_modes(dec: Decoder, low_all, iou_all, gt):
