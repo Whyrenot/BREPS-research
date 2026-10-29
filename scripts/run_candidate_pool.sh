@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
-# The paper's candidate pool for SAM-1, SAM-2.1 and SAM-3, one after the other on
-# one GPU (scripts/build_candidate_pool.py -> exp_res/pool_<model>/pool.csv.gz,
-# per_box.csv.gz, rows.csv.gz): undef, head-select, grad 30 steps with and
-# without multimask, BoN with centre noise with and without multimask, steering
-# at L2.norm3 at every alpha with and without multimask. Each model needs its
-# finished scan (exp_res/steer_scan_<model>: the steering vector). SAM-3
-# re-execs itself into the sam3 conda env. A failing model does not stop the next.
+# The paper's candidate pool for SAM-1, SAM-2.1 and SAM-3 (scripts/build_candidate_pool.py
+# -> exp_res/pool_<model>/pool.csv.gz, per_box.csv.gz, rows.csv.gz): undef,
+# head-select, grad 30 steps with and without multimask, BoN with centre noise
+# with and without multimask, steering at L2.norm3 at every alpha with and
+# without multimask. Each model needs its finished scan (exp_res/steer_scan_<model>:
+# the steering vector). SAM-3 re-execs itself into the sam3 conda env.
 #
-#   CUDA_VISIBLE_DEVICES=0 bash scripts/run_candidate_pool.sh
+# Models run one after the other; each model's images are split over the GPUs
+# of GPUS, one process per GPU (shard_<i>/), merged on the CPU afterwards.
+# A failing model does not stop the next.
+#
+#   GPUS="0 1 2 3 4 5 6 7" bash scripts/run_candidate_pool.sh
 #   MODELS="SAM3" ...   only some models;  SMOKE=1 ...  2 images per half / subset, out dirs *_smoke
+#   THREADS=4 ...       CPU threads per process (the mask features run on the CPU)
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -20,6 +24,9 @@ CKPT_SAM3=${CKPT_SAM3:-}
 REF_SAM21=${REF_SAM21:-}          # results/sam21full_m.csv is hiera_large: no reference for base_plus
 MODELS=${MODELS:-"SAM SAM2.1 SAM3"}
 SITE=${SITE:-L2.norm3}
+GPUS=${GPUS:-${CUDA_VISIBLE_DEVICES:-0}}
+GPUS=${GPUS//,/ }                 # "0,1,2" or "0 1 2"
+THREADS=${THREADS:-4}
 SMOKE=${SMOKE:-0}
 status=0
 
@@ -29,6 +36,8 @@ if [ "$SMOKE" = "1" ]; then
     extra=(--limit_images 2)
     suffix="_smoke"
 fi
+read -r -a gpus <<< "$GPUS"
+n=${#gpus[@]}
 
 for model in $MODELS; do
     case "$model" in
@@ -41,10 +50,24 @@ for model in $MODELS; do
     if [ ! -f "$scan/vectors.npz" ]; then echo "$model: no scan in $scan"; status=1; continue; fi
     out=exp_res/pool_${model}${suffix}
     mkdir -p "$out"
-    echo "=== $model pool $(date)"
-    python scripts/build_candidate_pool.py --model_name "$model" --root "$ROOT" --checkpoint_path "$ckpt" \
-        --scan_dir "$scan" --site "$SITE" --reference_csv "$ref" --out_dir "$out" "${extra[@]}" 2>&1 | tee "$out/run.log"
-    [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "$model pool FAILED"; status=1; }
+    echo "=== $model pool on GPUs ${gpus[*]} $(date)"
+    pids=()
+    for i in "${!gpus[@]}"; do
+        mkdir -p "$out/shard_$i"
+        CUDA_VISIBLE_DEVICES=${gpus[$i]} OMP_NUM_THREADS=$THREADS MKL_NUM_THREADS=$THREADS \
+            python scripts/build_candidate_pool.py --model_name "$model" --root "$ROOT" --checkpoint_path "$ckpt" \
+            --scan_dir "$scan" --site "$SITE" --reference_csv "$ref" --shard "$i" --n_shards "$n" \
+            --out_dir "$out/shard_$i" "${extra[@]}" > "$out/shard_$i/run.log" 2>&1 &
+        pids+=($!)
+    done
+    failed=0
+    for i in "${!pids[@]}"; do
+        wait "${pids[$i]}" || { echo "$model shard $i FAILED (see $out/shard_$i/run.log)"; failed=1; }
+    done
+    if [ "$failed" -ne 0 ]; then status=1; continue; fi
+    echo "=== $model merge $(date)"
+    python scripts/build_candidate_pool.py --merge --out_dir "$out" 2>&1 | tee "$out/merge.log"
+    [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "$model merge FAILED"; status=1; }
 done
 
 echo "=== done $(date), status $status"

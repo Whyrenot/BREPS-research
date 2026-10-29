@@ -351,6 +351,8 @@ def run(args) -> int:
     lim = (lambda xs: list(xs)[:args.limit_images]) if args.limit_images > 0 else list
     plan = [("COCO", "A", s) for s in lim(A)] + [("COCO", "B", s) for s in lim(B)]
     plan += [(d, "-", s) for d in datasets[1:] for s in lim(index[d].keys())]
+    # one process per GPU: every n-th image (images are independent; groups are inside an image)
+    plan = plan[args.shard::args.n_shards]
 
     fh = gzip.open(out / "pool.csv.gz", "wt", newline="", encoding="utf-8")
     writer, per_box, mm_rows, seen, n_pool, steps_ck = None, [], [], set(), 0, None
@@ -460,12 +462,102 @@ def parse_args(argv=None):
     p.add_argument("--repro_tol", type=float, default=1e-3)
     p.add_argument("--keep_tf32", action="store_true")
     p.add_argument("--limit_images", type=int, default=0, help="per half / subset, for a smoke run")
+    p.add_argument("--shard", type=int, default=0, help="this process's part of the images (one per GPU)")
+    p.add_argument("--n_shards", type=int, default=1)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--out_dir", required=True)
     return p.parse_args(argv)
 
 
+# ---------------------------------------------------------------------------
+# Merging the shards of a multi-GPU run (CPU)
+# ---------------------------------------------------------------------------
+
+def merge_shards(out: Path, reference_csv: str | None) -> int:
+    """<out>/shard_<i>/ -> <out>/pool.csv.gz, per_box.csv.gz, rows.csv.gz,
+    checks.json (counters summed, maxima taken, the reference / group checks
+    redone on the merged boxes), meta.json."""
+    import shutil
+    import steer_models_scan as SMS
+    shards = sorted(out.glob("shard_*"), key=lambda p: int(p.name.split("_")[1]))
+    if not shards:
+        raise SystemExit(f"no shard_* under {out}")
+    metas = [json.loads((s / "meta.json").read_text(encoding="utf-8")) if (s / "meta.json").is_file() else None
+             for s in shards]
+    n = (metas[0] or {}).get("args", {}).get("n_shards", len(shards))
+    missing = [s.name for s, m in zip(shards, metas) if m is None]
+    if missing or len(shards) != n:
+        raise SystemExit(f"{len(shards)} shard dirs for n_shards {n}; unfinished: {missing}")
+    header = None
+    with gzip.open(out / "pool.csv.gz", "wt", newline="", encoding="utf-8") as fo:
+        for s in shards:
+            with gzip.open(s / "pool.csv.gz", "rt", newline="", encoding="utf-8") as fi:
+                h = fi.readline()
+                if header is None:
+                    header = h
+                    fo.write(h)
+                elif h != header:
+                    raise SystemExit(f"{s}: pool columns differ from {shards[0]}")
+                shutil.copyfileobj(fi, fo)
+    dt = {"image_name": str, "kind": str, "user": str, "attempt": str, "half": str}
+    PB = pd.concat([pd.read_csv(s / "per_box.csv.gz", dtype=dt) for s in shards], ignore_index=True)
+    PB[["kind", "user", "attempt"]] = PB[["kind", "user", "attempt"]].fillna("")
+    PB.to_csv(out / "per_box.csv.gz", index=False, float_format="%.6f")
+    D = pd.concat([pd.read_csv(s / "rows.csv.gz", dtype=dt) for s in shards], ignore_index=True)
+    D.to_csv(out / "rows.csv.gz", index=False, float_format="%.6f")
+
+    cs = [json.loads((s / "checks.json").read_text(encoding="utf-8")) for s in shards]
+    checks = {"shards": len(shards), "tf32": cs[0].get("tf32"), "scan": cs[0].get("scan")}
+    for k, counters in (("zero_dose", ("forwards", "bit_exact")), ("own_forward", ("compared", "bit_exact"))):
+        checks[k] = {f: sum(c[k][f] for c in cs) for f in counters}
+        checks[k]["failures"] = sum((c[k]["failures"] for c in cs), [])
+        checks[k]["ok"] = all(c[k]["ok"] for c in cs)
+    checks["zero_dose_multi"] = checks["zero_dose"]
+    for k in ("public_api", "public_single"):
+        checks[k] = {"compared": sum(c[k]["compared"] for c in cs),
+                     "max_abs_iou_diff": max(c[k]["max_abs_iou_diff"] for c in cs),
+                     "where": sum((c[k]["where"] for c in cs), [])}
+        for f in ("n_over_1e-4", "n_over_1e-3"):
+            if f in cs[0][k]:
+                checks[k][f] = sum(c[k][f] for c in cs)
+    checks["repo_equivalence"] = {k: {"compared": sum(c["repo_equivalence"][k]["compared"] for c in cs),
+                                      "max_abs_iou_diff": max(c["repo_equivalence"][k]["max_abs_iou_diff"] for c in cs)}
+                                  for k in cs[0]["repo_equivalence"]}
+    gcount = PB.groupby(["image_name", "group"]).size().unstack(fill_value=0)
+    bad = int((~((gcount.get("bottom50", 0) == 12) & (gcount.get("top50", 0) == 13))).sum())
+    checks["groups"] = {"images": int(len(gcount)), "n_images_not_12_13": bad, "ok": bad == 0}
+    a0 = metas[0]["args"]
+    ref = SMS.read_reference(reference_csv if reference_csv is not None else a0.get("reference_csv", ""), a0["use"])
+    for key, col, ref_col in (("repro", "undef_iou", "undefended_iou"), ("repro_headsel", "hsel_iou", "headsel_iou")):
+        r = SMS.repro(PB, ref, col, ref_col, a0["repro_tol"])
+        if r.get("available"):
+            r["max_abs_diff"], r["frac_over"] = r["max_abs"], r["frac_over_tol"]
+        checks[key] = r
+    (out / "checks.json").write_text(json.dumps(checks, indent=1, default=SMS._json_default), encoding="utf-8")
+    meta = dict(metas[0])
+    meta.update({"boxes": int(len(PB)), "pool_rows": int(sum(m["pool_rows"] for m in metas)),
+                 "candidates_per_box": float(PB.n_candidates.mean()), "shards": len(shards),
+                 "seconds": max(m["seconds"] for m in metas), "seconds_per_shard": [m["seconds"] for m in metas]})
+    meta["args"] = {**a0, "shard": None}
+    (out / "meta.json").write_text(json.dumps(meta, indent=1, default=SMS._json_default), encoding="utf-8")
+    eq = checks["repo_equivalence"]
+    print(f"merged {len(shards)} shards -> {out}: {len(PB)} boxes, {meta['pool_rows']} candidates; zero dose "
+          f"{checks['zero_dose']['bit_exact']}/{checks['zero_dose']['forwards']} ok {checks['zero_dose']['ok']}, "
+          f"own forward ok {checks['own_forward']['ok']}; vs repo: "
+          + ", ".join(f"{k} {v['max_abs_iou_diff']:.3g} ({v['compared']})" for k, v in eq.items())
+          + f"; groups off {bad}", flush=True)
+    return 0 if checks["zero_dose"]["ok"] and checks["own_forward"]["ok"] and bad == 0 else 2
+
+
 def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if "--merge" in argv:
+        m = argparse.ArgumentParser(description="merge the shards of a multi-GPU run (CPU)")
+        m.add_argument("--merge", action="store_true")
+        m.add_argument("--out_dir", required=True)
+        m.add_argument("--reference_csv", default=None, help="default: the run's own")
+        ma = m.parse_args(argv)
+        return merge_shards(Path(ma.out_dir), ma.reference_csv)
     args = parse_args(argv)
     maybe_dispatch_to_env(args.model_name, __file__)
     return run(args)
