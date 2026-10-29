@@ -127,6 +127,41 @@ def readable(csv: Path) -> bool:
         return False
 
 
+def _cases_path(csv: Path) -> Path:
+    return csv.with_name(csv.stem + ".cases.json")
+
+
+def save_cached(csv: Path, params: dict, found: list, skipped: bool = False) -> None:
+    """The image's critical shifts next to its CSV, so a resumed run does not
+    re-read the CSV (~8 s for a full grid). Tied to the CSV's size and mtime
+    and to the find parameters."""
+    rec = {"params": params, "skipped": skipped, "cases": found}
+    if not skipped:
+        st = csv.stat()
+        rec.update(csv_size=st.st_size, csv_mtime_ns=st.st_mtime_ns)
+    tmp = _cases_path(csv).with_suffix(".tmp")
+    tmp.write_text(json.dumps(rec))
+    tmp.replace(_cases_path(csv))
+
+
+def load_cached(csv: Path, params: dict):
+    """The record save_cached wrote, or None if it is missing or stale."""
+    try:
+        rec = json.loads(_cases_path(csv).read_text())
+    except (OSError, ValueError):
+        return None
+    if rec.get("params") != params:
+        return None
+    if rec.get("skipped"):
+        return None if csv.exists() else rec
+    if not csv.exists():
+        return None
+    st = csv.stat()
+    if (rec.get("csv_size"), rec.get("csv_mtime_ns")) != (st.st_size, st.st_mtime_ns):
+        return None
+    return rec
+
+
 def _iou(a: torch.Tensor, b: torch.Tensor) -> float:
     union = (a | b).sum().item()
     return (a & b).sum().item() / union if union else 1.0
@@ -281,24 +316,34 @@ def main() -> None:
         def csv_of(s):
             return Path(CH.get_output_path(str(out), imgs[s].name, random_boxes=False))
 
-        def evaluate(s):
-            csv = csv_of(s)
-            if not csv.exists():  # comp_hw skipped it (empty / unreadable mask)
-                n_cases[s], cases[s] = 0, []
+        def record(s, found, was_skipped):
+            cases[s], n_cases[s] = found, len(found)
+            if was_skipped:
                 skipped.append(s)
-                return
-            if not readable(csv):
-                raise RuntimeError(f"{csv}: unreadable right after comp_hw")
-            cases[s] = find_critical_shift(csv, **params)
-            n_cases[s] = len(cases[s])
 
-        for s in order:  # resume
-            if csv_of(s).exists():
-                if readable(csv_of(s)):
-                    evaluate(s)
-                else:
-                    print(f"[resume] {csv_of(s)} is cut off, recomputing")
-                    csv_of(s).unlink()
+        def evaluate(s, after_round: bool):
+            """Cases of image s: from its .cases.json if that matches the CSV,
+            else from the CSV (and cached). Resuming, an image without either
+            stays untried; after a round, no CSV = comp_hw skipped it."""
+            csv = csv_of(s)
+            c = load_cached(csv, params)
+            if c is not None:
+                record(s, c.get("cases", []), c.get("skipped", False))
+            elif csv.exists():
+                if not readable(csv):
+                    if after_round:
+                        raise RuntimeError(f"{csv}: unreadable right after comp_hw")
+                    print(f"[resume] {csv} is cut off, recomputing")
+                    csv.unlink()
+                    return
+                record(s, find_critical_shift(csv, **params), False)
+                save_cached(csv, params, cases[s])
+            elif after_round:  # comp_hw skipped it (empty / unreadable mask)
+                record(s, [], True)
+                save_cached(csv, params, [], skipped=True)
+
+        for s in order:  # resume: images an earlier run finished are not recomputed
+            evaluate(s, after_round=False)
         if n_cases:
             print(f"[resume] {name}: {len(n_cases)} images already computed")
 
@@ -313,7 +358,7 @@ def main() -> None:
             t0 = time.time()
             run_round(args, nxt, imgs, masks, out, nproc)
             for s in nxt:
-                evaluate(s)
+                evaluate(s, after_round=True)
             print(f"=== round {rnd} took {(time.time() - t0) / 60:.1f} min; cases per image: "
                   + ", ".join(f"{s}={n_cases[s]}" for s in nxt), flush=True)
 

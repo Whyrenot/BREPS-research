@@ -748,9 +748,13 @@ if __name__ == "__main__":
             logger.warning(f"Failed to process item: {args.image_path}")
             continue
 
+        # Written under a temporary name and renamed: a run killed mid-write
+        # leaves no CSV that --continue_from would take for a finished image.
+        tmp_path = output_path + ".tmp"
         pd.DataFrame(results[args.image_path]).to_csv(
-            output_path,
+            tmp_path,
             index=False,
         )
+        os.replace(tmp_path, output_path)
 
     dist.destroy_process_group()
