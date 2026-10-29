@@ -13,6 +13,8 @@
 #   GPUS="0 1 2 3 4 5 6 7" bash scripts/run_candidate_pool.sh
 #   MODELS="SAM3" ...   only some models;  SMOKE=1 ...  2 images per half / subset, out dirs *_smoke
 #   THREADS=4 ...       CPU threads per process (the mask features run on the CPU)
+#   USE=mp ...          the mobile and the desktop annotations (default m: mobile only); the out
+#                       dirs get TAG (default _mp), so the mobile pools are left alone
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -28,6 +30,8 @@ GPUS=${GPUS:-${CUDA_VISIBLE_DEVICES:-0}}
 GPUS=${GPUS//,/ }                 # "0,1,2" or "0 1 2"
 THREADS=${THREADS:-4}
 SMOKE=${SMOKE:-0}
+USE=${USE:-m}
+TAG=${TAG-$([ "$USE" = "m" ] && echo "" || echo "_$USE")}
 status=0
 
 extra=()
@@ -48,15 +52,15 @@ for model in $MODELS; do
     esac
     scan=exp_res/steer_scan_${model}
     if [ ! -f "$scan/vectors.npz" ]; then echo "$model: no scan in $scan"; status=1; continue; fi
-    out=exp_res/pool_${model}${suffix}
+    out=exp_res/pool_${model}${TAG}${suffix}
     mkdir -p "$out"
-    echo "=== $model pool on GPUs ${gpus[*]} $(date)"
+    echo "=== $model pool (--use $USE) on GPUs ${gpus[*]} -> $out $(date)"
     pids=()
     for i in "${!gpus[@]}"; do
         mkdir -p "$out/shard_$i"
         CUDA_VISIBLE_DEVICES=${gpus[$i]} OMP_NUM_THREADS=$THREADS MKL_NUM_THREADS=$THREADS \
             python scripts/build_candidate_pool.py --model_name "$model" --root "$ROOT" --checkpoint_path "$ckpt" \
-            --scan_dir "$scan" --site "$SITE" --reference_csv "$ref" --shard "$i" --n_shards "$n" \
+            --scan_dir "$scan" --site "$SITE" --use "$USE" --reference_csv "$ref" --shard "$i" --n_shards "$n" \
             --out_dir "$out/shard_$i" "${extra[@]}" > "$out/shard_$i/run.log" 2>&1 &
         pids+=($!)
     done

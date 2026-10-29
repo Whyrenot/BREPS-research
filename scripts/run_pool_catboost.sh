@@ -12,6 +12,8 @@
 #   TRANSFER_FROM=SAM3 ...     also apply the SAM3 selectors to the other MODELS (after training them all)
 #   TASK_TYPE=CPU THREADS=32 ...    on the CPU
 #   SMOKE=1 ...                exp_res/pool_<model>_smoke, 2 folds, 50 iterations, out dirs *_smoke
+#   TAG=_mp ...                the pools of another annotation set: pool_<model>_mp -> cb_<model>_mp,
+#                              cb_<src>_on_<model>_mp
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -22,6 +24,7 @@ TASK_TYPE=${TASK_TYPE:-GPU}
 THREADS=${THREADS:--1}
 ITER=${ITER:-800}
 SMOKE=${SMOKE:-0}
+TAG=${TAG:-}
 status=0
 
 extra=(--task_type "$TASK_TYPE" --threads "$THREADS")
@@ -36,27 +39,27 @@ extra+=(--iterations "$ITER")
 export CUDA_VISIBLE_DEVICES=$GPU
 
 for model in $MODELS; do
-    pool=exp_res/pool_${model}${suffix}
-    out=exp_res/cb_${model}${suffix}
+    pool=exp_res/pool_${model}${TAG}${suffix}
+    out=exp_res/cb_${model}${TAG}${suffix}
     if [ ! -f "$pool/pool.csv.gz" ]; then echo "$model: no merged pool in $pool"; status=1; continue; fi
     mkdir -p "$out"
-    echo "=== $model CatBoost $(date)"
+    echo "=== $model CatBoost $pool -> $out $(date)"
     python scripts/train_pool_catboost.py --pool_dir "$pool" --out_dir "$out" --devices 0 "${extra[@]}" \
         2>&1 | tee "$out/run.log"
     [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "$model CatBoost FAILED"; status=1; }
 done
 
 if [ -n "$TRANSFER_FROM" ]; then
-    src=exp_res/cb_${TRANSFER_FROM}${suffix}
+    src=exp_res/cb_${TRANSFER_FROM}${TAG}${suffix}
     for model in $MODELS; do
         [ "$model" = "$TRANSFER_FROM" ] && continue
-        pool=exp_res/pool_${model}${suffix}
-        out=exp_res/cb_${TRANSFER_FROM}_on_${model}${suffix}
+        pool=exp_res/pool_${model}${TAG}${suffix}
+        out=exp_res/cb_${TRANSFER_FROM}_on_${model}${TAG}${suffix}
         if [ ! -f "$src/model_full.cbm" ] || [ ! -f "$pool/pool.csv.gz" ]; then
             echo "transfer $TRANSFER_FROM -> $model: need $src/model_full.cbm and $pool/pool.csv.gz"; status=1; continue
         fi
         mkdir -p "$out"
-        echo "=== transfer $TRANSFER_FROM -> $model $(date)"
+        echo "=== transfer $TRANSFER_FROM -> $model $pool -> $out $(date)"
         python scripts/train_pool_catboost.py --apply_model "$src" --pool_dir "$pool" --out_dir "$out" --devices 0 \
             "${extra[@]}" 2>&1 | tee "$out/run.log"
         [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "transfer $TRANSFER_FROM -> $model FAILED"; status=1; }

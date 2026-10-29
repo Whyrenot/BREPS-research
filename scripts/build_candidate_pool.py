@@ -3,7 +3,8 @@ build_candidate_pool.py
 =======================
 Every candidate mask of the paper for one model, in one GPU pass, with the
 features the CatBoost selector is trained on: SAM-1, SAM-2.1 or SAM-3 on the
-user study (--use m, all ten subsets, 12 500 boxes). Everything after it -- the
+user study (--use m: the mobile annotations, all ten subsets, 12 500 boxes; --use mp: the
+mobile and the desktop ones). Everything after it -- the
 selector, the tables, the per-box file of all methods -- runs on a CPU.
 
 CANDIDATES per box (the tight bbox of the user's mask, 1024 frame)
@@ -55,7 +56,8 @@ CHECKS (* stop the run)
     of every subset), as steer_models_scan
   the batched ascent vs refine_boxes_multistart one box at a time, and BoN vs
   refine_box_iou_grad.best_of_n_batched (--check_boxes boxes of the first image of
-  every subset; max |dIoU| reported); undef / hsel vs --reference_csv; groups 12 / 13.
+  every subset; max |dIoU| reported); undef / hsel vs --reference_csv (with --use mp only the
+  m boxes have a reference); groups: round(n / 2) / the rest inside every image (12 / 13 for m).
   TF32 matmuls are off (sam3 turns them on at import).
 
     CUDA_VISIBLE_DEVICES=0 python scripts/build_candidate_pool.py --model_name SAM2.1 \\
@@ -286,6 +288,19 @@ def method_summary(PB: pd.DataFrame, alphas) -> str:
     return "\n".join(L)
 
 
+def group_check(PB: pd.DataFrame) -> dict:
+    """bottom50 / top50 inside every image as selector_data.image_groups cuts
+    them: the round(n / 2) worst annotations of the image's n are bottom50
+    (12 / 13 for the 25 mobile ones; --use mp has about twice as many)."""
+    c = PB.groupby(["image_name", "group"]).size().unstack(fill_value=0)
+    n = c.get("bottom50", 0) + c.get("top50", 0)
+    want = (n * 0.5).round().astype(int)            # numpy rounds half to even, as round() in image_groups
+    off = int((c.get("bottom50", 0) != want).sum())
+    sizes = n.value_counts().sort_index()
+    return {"images": int(len(c)), "n_images_off": off, "n_images_not_12_13": off,
+            "annotations_per_image": {int(k): int(v) for k, v in sizes.items()}, "ok": off == 0}
+
+
 def check_against_repo(ctx, item, bon: dict, grad: dict, a, checks: dict):
     """The batched ascent and BoN vs the repo's own one-box functions."""
     import refine_box_iou_grad as R
@@ -420,9 +435,8 @@ def run(args) -> int:
     D = pd.concat(mm_rows, ignore_index=True)
     D["group"] = SUS.assign_groups(D.rename(columns={"tok0_iou0": "undef_iou"})).to_numpy()
     D.to_csv(out / "rows.csv.gz", index=False, float_format="%.6f")
-    gcount = PB.groupby(["image_name", "group"]).size().unstack(fill_value=0)
-    bad = int((~((gcount.get("bottom50", 0) == 12) & (gcount.get("top50", 0) == 13))).sum())
-    checks["groups"] = {"images": int(len(gcount)), "n_images_not_12_13": bad, "ok": bad == 0}
+    checks["groups"] = group_check(PB)
+    bad = checks["groups"]["n_images_off"]
     ref = SMS.read_reference(args.reference_csv, args.use)
     for key, col, ref_col in (("repro", "undef_iou", "undefended_iou"), ("repro_headsel", "hsel_iou", "headsel_iou")):
         r = SMS.repro(PB, ref, col, ref_col, args.repro_tol)
@@ -541,9 +555,8 @@ def merge_shards(out: Path, reference_csv: str | None) -> int:
     checks["repo_equivalence"] = {k: {"compared": sum(c["repo_equivalence"][k]["compared"] for c in cs),
                                       "max_abs_iou_diff": max(c["repo_equivalence"][k]["max_abs_iou_diff"] for c in cs)}
                                   for k in cs[0]["repo_equivalence"]}
-    gcount = PB.groupby(["image_name", "group"]).size().unstack(fill_value=0)
-    bad = int((~((gcount.get("bottom50", 0) == 12) & (gcount.get("top50", 0) == 13))).sum())
-    checks["groups"] = {"images": int(len(gcount)), "n_images_not_12_13": bad, "ok": bad == 0}
+    checks["groups"] = group_check(PB)
+    bad = checks["groups"]["n_images_off"]
     a0 = metas[0]["args"]
     ref = SMS.read_reference(reference_csv if reference_csv is not None else a0.get("reference_csv", ""), a0["use"])
     for key, col, ref_col in (("repro", "undef_iou", "undefended_iou"), ("repro_headsel", "hsel_iou", "headsel_iou")):

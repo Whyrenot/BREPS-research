@@ -417,8 +417,8 @@ def apply(P: pd.DataFrame, X: pd.DataFrame, src: Path, a, checks: dict) -> np.nd
 
 def per_box(P: pd.DataFrame, score: np.ndarray, astar: dict) -> pd.DataFrame:
     """One row per box: every method's IoU, CatBoost's pick, the oracle."""
-    T = P[KEY + ["case", "key", "dataset", "group", "cand_kind", "cand_id", "method_slot", "target_iou", "f_pred",
-                 "f_steer_alpha"]].assign(score=score)
+    T = P[KEY + ["case", "key", "dataset", "group", "cand_kind", "cand_id", "method_slot", "step", "target_iou",
+                 "f_pred", "f_steer_alpha"]].assign(score=score)
     gb = T.groupby("case", sort=False)
     B = gb[KEY + ["key", "dataset", "group"]].first()
     B["oracle"] = gb.target_iou.max()
@@ -438,7 +438,15 @@ def per_box(P: pd.DataFrame, score: np.ndarray, astar: dict) -> pd.DataFrame:
     B["cb_kind"] = T.cand_kind.loc[i].to_numpy()
     B["cb_cand_id"] = T.cand_id.loc[i].to_numpy()
     B["cb_alpha"] = T.f_steer_alpha.loc[i].to_numpy()
+    B["cb_step"] = T.step.loc[i].to_numpy()
     B["cb_score"] = T.score.loc[i].to_numpy()
+    # how sure the ranking is: the top score minus the runner-up's
+    S = T[["case", "score"]].sort_values(["case", "score"], ascending=[True, False], kind="mergesort")
+    second = S[S.groupby("case", sort=False).cumcount().to_numpy() == 1].set_index("case").score
+    B["cb_margin"] = B.cb_score - second.reindex(B.index)
+    i = gb.target_iou.idxmax()
+    B["oracle_kind"] = T.cand_kind.loc[i].to_numpy()
+    B["oracle_cand_id"] = T.cand_id.loc[i].to_numpy()
     return B.reset_index()
 
 
@@ -507,7 +515,8 @@ def picks(B: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def summary_md(T: pd.DataFrame, K: pd.DataFrame, meta: dict, astar: dict, checks: dict, a, src_meta=None) -> str:
+def summary_md(T: pd.DataFrame, K: pd.DataFrame, meta: dict, astar: dict, checks: dict, a, src_meta=None,
+               T_kind: pd.DataFrame | None = None) -> str:
     def fmt(x, nd=2, sign=True):
         return "—" if x is None or not np.isfinite(x) else (f"{x:+.{nd}f}" if sign else f"{x:.{nd}f}")
 
@@ -530,9 +539,12 @@ def summary_md(T: pd.DataFrame, K: pd.DataFrame, meta: dict, astar: dict, checks
         L.append(f"Селекторы обучены на пуле {src_meta.get('model_name', '?')} (`{a.apply_model}`), применены к пулу "
                  f"{model} ({'модель фолда, в котором картинка была тестовой: ни картинка, ни кандидаты этой модели в обучении не участвовали' if a.apply_with == 'fold' else 'одна модель на всех картинках источника'}).")
     st = ", ".join(f"{'один выход' if mm == 0 else 'multimask'} α* = {v['alpha']:g}" for mm, v in astar.items())
+    kinds = T_kind["ann"].unique().tolist() if T_kind is not None else []
     L += ["", f"Steering α* выбрана на боксах COCO A по среднему IoU: {st or '—'}. Группы — внутри картинки по IoU "
-          "одного выхода, 12 / 13. % — прирост к undef; «CatBoost к методу» — прирост CatBoost в % от метода, 95% CI "
-          "парным бутстрепом по картинкам; для блоков — среднее по наборам.", ""]
+          "одного выхода: худшая половина разметок картинки — bottom50, остальные — top50 (12 / 13 при 25 разметках"
+          + ("; разметки m и p ранжируются вместе" if len(kinds) > 1 else "") + "). % — прирост к undef; «CatBoost к "
+          "методу» — прирост CatBoost в % от метода, 95% CI парным бутстрепом по картинкам; для блоков — среднее по "
+          "наборам.", ""]
     for g in ("bottom50", "top50", "all"):
         L += [f"## {g}: IoU (% к undef)", "",
               "| блок | " + " | ".join(LABEL[m] for m in METHODS if m in set(T.method)) + " |",
@@ -558,7 +570,23 @@ def summary_md(T: pd.DataFrame, K: pd.DataFrame, meta: dict, astar: dict, checks
                 star = "*" if np.isfinite(r.cb_gain_lo) and (r.cb_gain_lo > 0 or r.cb_gain_hi < 0) else ""
                 cells.append(f"{fmt(r.cb_gain_pct)}{star} [{fmt(r.cb_gain_lo)}, {fmt(r.cb_gain_hi)}]")
             L.append(f"| {name} | {g} | " + " | ".join(cells) + " |")
-    L += ["", "\\* — CI не захватывает 0.", "", "## Что выбирает CatBoost", "",
+    L += ["", "\\* — CI не захватывает 0.", ""]
+    if len(kinds) > 1:
+        cols = [m for m in METHODS if m in set(T_kind.method) and m != "argmax_pred"]
+        L += ["## По типу разметки (m — мобильная, p — с ПК): IoU undef и % к нему", "",
+              "Одна и та же модель CatBoost (обучена на всех разметках), строки — подвыборки боксов.", "",
+              "| разметка | блок | группа | n | " + " | ".join(LABEL[m] for m in cols) + " |",
+              "|---|---|---|---|" + "---|" * len(cols)]
+        for ann in kinds:
+            for name in [n for n in ("натуральные", "медицина", "все") if n in set(T_kind.block)]:
+                for g in GROUPS:
+                    s = T_kind[(T_kind.ann == ann) & (T_kind.block == name) & (T_kind.group == g)].set_index("method")
+                    if s.empty:
+                        continue
+                    cells = [f"{s.loc[m, 'iou']:.4f}" if m == "undef" else fmt(s.loc[m, "pct_undef"]) for m in cols]
+                    L.append(f"| {ann} | {name} | {g} | {int(s.n_boxes.iloc[0])} | " + " | ".join(cells) + " |")
+        L.append("")
+    L += ["## Что выбирает CatBoost", "",
           "| блок | P@1 | в пределах 0.01 от лучшего | regret | P@1 max pred IoU | " +
           " | ".join(c[5:] for c in K.columns if c.startswith("pick_")) + " |",
           "|---|---|---|---|---|" + "---|" * len([c for c in K.columns if c.startswith("pick_")])]
@@ -620,8 +648,11 @@ def run(a) -> int:
     del X
     B = per_box(P, s, astar)
     B.to_csv(out / "per_box.csv.gz", index=False, float_format="%.6f")
-    T = table(B, a)
-    T.to_csv(out / "table.csv", index=False)
+    kinds = sorted(set(B.kind))
+    T = table(B, a).assign(ann="+".join(kinds))
+    T_kind = pd.concat([T] + ([table(B[B.kind == k].reset_index(drop=True), a).assign(ann=k) for k in kinds]
+                              if len(kinds) > 1 else []), ignore_index=True)
+    T_kind.to_csv(out / "table.csv", index=False)
     K = picks(B)
     K.to_csv(out / "picks.csv", index=False)
     meta_out = {"script": "train_pool_catboost.py", "created": time.strftime("%Y-%m-%d %H:%M"), "args": vars(a),
@@ -632,7 +663,7 @@ def run(a) -> int:
                 "seconds": round(time.time() - t0)}
     (out / "meta.json").write_text(json.dumps(meta_out, indent=1, default=_json_default), encoding="utf-8")
     (out / "checks.json").write_text(json.dumps(checks, indent=1, default=_json_default), encoding="utf-8")
-    text = summary_md(T, K, meta, astar, checks, a, src_meta)
+    text = summary_md(T, K, meta, astar, checks, a, src_meta, T_kind)
     (out / "summary.md").write_text(text, encoding="utf-8")
     print(f"done in {(time.time() - t0) / 60:.1f} min -> {out}", flush=True)
     en = {"натуральные": "natural", "медицина": "medical", "все": "all subsets"}
@@ -640,6 +671,12 @@ def run(a) -> int:
         r = T[(T.block == name) & (T.group == "bottom50")].set_index("method")
         print(f"  {en.get(name, name)}, bottom50, % to undef: " + ", ".join(f"{m} {r.loc[m, 'pct_undef']:+.2f}"
                                                             for m in METHODS if m in r.index and m != "undef"), flush=True)
+    if len(kinds) > 1:
+        for k in kinds:
+            r = T_kind[(T_kind.ann == k) & (T_kind.block == "все") & (T_kind.group == "all")].set_index("method")
+            if len(r):
+                print(f"  kind {k}, all subsets, all boxes ({int(r.n_boxes.iloc[0])}), % to undef: catboost "
+                      f"{r.loc['catboost', 'pct_undef']:+.2f}, oracle {r.loc['oracle', 'pct_undef']:+.2f}", flush=True)
     return 0
 
 
