@@ -9,6 +9,8 @@
 #   CUDA_VISIBLE_DEVICES=0 bash scripts/run_steer_models_scan.sh
 #
 #   MODELS="SAM2.1" ...      only some models
+#   ALPHAS=0.5,1,...,32 ...  another alpha grid (default: the scan's 0.5,1,2,4,8,12,16)
+#   SUFFIX=_a32 ...          appended to the out dirs (e.g. for another grid)
 #   SMOKE=1 ...              2 images per half / subset, alphas 1 and 4, out dirs *_smoke
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -25,11 +27,13 @@ MODELS=${MODELS:-"SAM SAM2.1 SAM3"}
 SMOKE=${SMOKE:-0}
 status=0
 
+ALPHAS=${ALPHAS:-}
 extra=()
-suffix=""
+suffix=${SUFFIX:-}
+[ -n "$ALPHAS" ] && extra=(--alphas "$ALPHAS")
 if [ "$SMOKE" = "1" ]; then
     extra=(--limit_images 2 --alphas 1,4)
-    suffix="_smoke"
+    suffix="${suffix}_smoke"
 fi
 
 for model in $MODELS; do
@@ -39,11 +43,16 @@ for model in $MODELS; do
         SAM3)   ckpt=$CKPT_SAM3;  ref=results/sam3full_m.csv ;;
         *)      echo "unknown model $model"; status=1; continue ;;
     esac
+    # sam3full_m.csv was made one box per call with TF32 matmuls on (sam3 turns
+    # them on at import); this scan decodes a whole image per call in fp32, so
+    # boxes near the threshold differ: the mean must agree, a few boxes may not
+    rep=()
+    [ "$model" = "SAM3" ] && rep=(--repro_max_frac 0.2)
     out=exp_res/steer_scan_${model}${suffix}
     mkdir -p "$out"
     echo "=== $model scan $(date)"
     python scripts/steer_models_scan.py --model_name "$model" --root "$ROOT" --checkpoint_path "$ckpt" \
-        --reference_csv "$ref" --out_dir "$out" "${extra[@]}" 2>&1 | tee "$out/run.log"
+        --reference_csv "$ref" --out_dir "$out" "${rep[@]}" "${extra[@]}" 2>&1 | tee "$out/run.log"
     if [ "${PIPESTATUS[0]}" -ne 0 ]; then echo "$model scan FAILED"; status=1; continue; fi
     echo "=== $model report $(date)"
     python scripts/steer_models_report.py --run_dir "$out" --reference_csv "$ref" 2>&1 | tee "$out/report.log"

@@ -979,10 +979,14 @@ function drawChecks() {
   ul.append(li(o.ok ? "ok" : "fail", "свой проход декодера (predict_masks + выбор головы модели) = MaskDecoder.forward бит в бит: " + o.bit_exact + "/" + o.compared));
   const p = c.public_api || {};
   ul.append(li(p.max_abs_iou_diff <= 1e-4 && !(p.where || []).length ? "ok" : "warn", "публичный predict / predict_torch на тех же боксах: max |ΔIoU| " + (ok(p.max_abs_iou_diff) ? p.max_abs_iou_diff.toExponential(1) : "—") + " (" + p.compared + " боксов)" + (p.where && p.where.length ? "; " + p.where.slice(0, 4).join("; ") : "")));
+  const q = c.public_single;
+  if (q) ul.append(li(q.max_abs_iou_diff <= 1e-3 && !(q.where || []).length ? "ok" : "warn", "публичный predict по одному боксу (кадр бокса; остаток — зависимость от батча): max |ΔIoU| " + (ok(q.max_abs_iou_diff) ? q.max_abs_iou_diff.toExponential(1) : "—") + ", " + q["n_over_1e-3"] + "/" + q.compared + " боксов > 1e-3" + (q.where && q.where.length ? "; " + q.where.slice(0, 4).join("; ") : "")));
+  const tf = c.tf32;
+  if (tf) ul.append(li(tf.matmul_run ? "warn" : "ok", "TF32 в матричных умножениях: после загрузки модели " + tf.matmul_after_load + ", в прогоне " + tf.matmul_run + "; cuDNN TF32 " + tf.cudnn));
   for (const [k, lab] of [["repro_A", "COCO A, один выход против reference csv (стоп-проверка)"], ["repro_mm0", "все боксы, один выход против undefended_iou"], ["repro_mm1", "все боксы, head-select против headsel_iou"]]) {
     const r = c[k]; if (!r) continue;
     if (!r.available) { ul.append(li("warn", lab + ": reference csv не задан")); continue; }
-    ul.append(li(r.frac_over_tol <= 0.05 ? "ok" : "warn", lab + ": max |Δ| " + (ok(r.max_abs) ? r.max_abs.toExponential(1) : "—") + ", " + r.n_over_tol + "/" + r.matched + " боксов > " + r.tol + "; среднее " + f3(r.mean_ours) + " против " + f3(r.mean_ref)));
+    ul.append(li((r.ok != null ? r.ok : r.frac_over_tol <= 0.05) ? "ok" : "warn", lab + ": max |Δ| " + (ok(r.max_abs) ? r.max_abs.toExponential(1) : "—") + ", " + r.n_over_tol + "/" + r.matched + " боксов > " + r.tol + "; среднее " + f3(r.mean_ours) + " против " + f3(r.mean_ref)));
   }
   const br = c.baseline_repeat || {};
   ul.append(li(br.max_abs_iou_diff === 0 ? "ok" : "warn", "COCO A закодирован заново для второго прохода: max |ΔIoU| " + br.max_abs_iou_diff + " (" + br.images + " картинок)"));

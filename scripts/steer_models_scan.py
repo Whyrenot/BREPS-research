@@ -83,10 +83,14 @@ CHECKS (checks.json; the ones marked * stop the run)
     head choice) equals mask_decoder.forward() bit for bit, both modes
   * hooks: every hooked module fires exactly once per forward
   * repro: multimask=False IoU on half A matches --reference_csv
-    (undefended_iou): at most --repro_max_frac boxes off by > --repro_tol.
-    A wrong checkpoint fails here, before the expensive pass
+    (undefended_iou): at most --repro_max_frac boxes off by > --repro_tol and
+    the mean within --repro_mean_tol. A wrong checkpoint fails here, before
+    the expensive pass
     public API: the predictor's own predict / predict_torch gives the same
-    masks (reported); mm1 vs the csv's headsel_iou (reported)
+    masks on the same batch, and one box per call (the box frame; what is left
+    is batch-dependent numerics) (reported); mm1 vs the csv's headsel_iou (reported)
+    TF32: sam3 turns TF32 matmuls on at import, and masks then depend on the
+    batch; they are switched off for every model (--keep_tf32 keeps them)
     baseline repeat: half A re-encoded for pass 2 gives the same IoUs
     oracle cut: patching prompt_tok reproduces the best box's IoU on every box
     graph: every decoder module that fires is drawn in graph.json
@@ -197,6 +201,9 @@ class Decoder:
         self.stab_delta = float(getattr(self.md, "dynamic_multimask_stability_delta", math.nan))
         self.stab_thresh = float(getattr(self.md, "dynamic_multimask_stability_thresh", math.nan))
         self.training = bool(self.md.training)
+        # sam2 keeps the flag only on the head (MLP.sigmoid_output)
+        self.iou_sigmoid = bool(getattr(self.md, "iou_prediction_use_sigmoid",
+                                        getattr(self.md.iou_prediction_head, "sigmoid_output", False)))
         self._pm_kw = set(inspect.signature(self.md.predict_masks).parameters)
         self._fw_kw = set(inspect.signature(self.md.forward).parameters)
         with torch.inference_mode():
@@ -220,7 +227,7 @@ class Decoder:
                 "dynamic_multimask_via_stability": self.dynamic, "stability_delta": self.stab_delta,
                 "stability_thresh": self.stab_thresh, "decoder_training": self.training,
                 "mask_threshold": self.thr,
-                "iou_prediction_use_sigmoid": bool(getattr(self.md, "iou_prediction_use_sigmoid", False)),
+                "iou_prediction_use_sigmoid": self.iou_sigmoid,
                 "use_high_res_features": bool(getattr(self.md, "use_high_res_features", False))}
 
     def model_boxes(self, boxes_1024: np.ndarray) -> torch.Tensor:
@@ -807,7 +814,7 @@ def graph_spec(dec: Decoder) -> dict:
     node("upscaled", "2x conv. trans.", I, ro + (1 if sam2 else 0),
          f"{md}.output_upscaling" + ("  (+ feat_s1, + feat_s0)" if sam2 else ""), key=f"{md}.output_upscaling")
     node("iou_scores", "IoU scores", S, ro + 1, f"{md}.iou_prediction_head -> iou_pred ({n})"
-         + (", sigmoid" if getattr(dec.md, "iou_prediction_use_sigmoid", False) else ""),
+         + (", sigmoid" if dec.iou_sigmoid else ""),
          key=f"{md}.iou_prediction_head")
     node("hyper", f"{n} MLPs -> dynamic classifiers", Tl, ro + 1, f"{md}.output_hypernetworks_mlps.0–{n - 1}",
          key=f"{md}.output_hypernetworks_mlps")
@@ -940,6 +947,20 @@ def check_official(dec: Decoder, item: dict, low_all, iou_all, base: dict, check
             p["n_over_1e-4"] += int((np.abs(iou_pub - base[mm][0]) > 1e-4).sum())
             if d > 1e-4:
                 p["where"].append(f"{item['dataset']}/{item['stem']}/mm{mm}: {d:.3g}")
+            # one box per call, as the reference csvs were made: the box frame
+            # must match exactly; what is left is batch-dependent numerics (TF32)
+            q = checks["public_single"]
+            try:
+                one = torch.stack([dec.public(item["boxes"][j:j + 1], bool(mm))[0] for j in range(len(item["boxes"]))])
+            except Exception as e:
+                q["where"].append(f"{item['dataset']}/{item['stem']}/mm{mm}: {type(e).__name__}: {e}")
+                continue
+            dd = np.abs(batch_iou(one.to(item["gt"].device), item["gt"]).cpu().numpy() - base[mm][0])
+            q["compared"] += len(dd)
+            q["max_abs_iou_diff"] = max(q["max_abs_iou_diff"], float(dd.max()))
+            q["n_over_1e-3"] += int((dd > 1e-3).sum())
+            if dd.max() > 1e-3:
+                q["where"].append(f"{item['dataset']}/{item['stem']}/mm{mm}: {dd.max():.3g}")
 
 
 def base_pass(runner: Runner, dec: Decoder, sites, item: dict, checks: dict, full_checks: bool):
@@ -1058,12 +1079,23 @@ def run(args) -> int:
     datasets = list(dict.fromkeys(["COCO", *args.datasets]))
     checks = {"zero_dose": {"forwards": 0, "bit_exact": 0, "ok": True, "failures": []},
               "own_forward": {"compared": 0, "bit_exact": 0, "ok": True, "failures": []},
-              "public_api": {"compared": 0, "max_abs_iou_diff": 0.0, "n_over_1e-4": 0, "where": []}}
+              "public_api": {"compared": 0, "max_abs_iou_diff": 0.0, "n_over_1e-4": 0, "where": []},
+              "public_single": {"compared": 0, "max_abs_iou_diff": 0.0, "n_over_1e-3": 0, "where": []}}
 
     predictor = load_model(model_name=args.model_name, model_type=args.model_type,
                            checkpoint=args.checkpoint_path, device=device)
     for prm in predictor.model.parameters():
         prm.requires_grad_(False)
+    # sam3.model_builder turns TF32 matmuls on at import (Ampere and newer), and
+    # a box's mask then depends on the batch it is decoded in. Every model runs
+    # with fp32 matmuls, as SAM-1 / SAM-2.1 do in pishugin-breps (heatmaps/
+    # comp_hw.load_sam3_model does the same, commit 7829071); cuDNN keeps torch's default.
+    tf32 = {"matmul_after_load": bool(torch.backends.cuda.matmul.allow_tf32),
+            "cudnn": bool(torch.backends.cudnn.allow_tf32)}
+    if not args.keep_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = False
+    tf32["matmul_run"] = bool(torch.backends.cuda.matmul.allow_tf32)
+    checks["tf32"] = tf32
     dec = Decoder(predictor)
     if dec.training:
         raise CheckFailed("mask decoder is in training mode: the stability fallback would be off")
@@ -1073,7 +1105,8 @@ def run(args) -> int:
     spec = graph_spec(dec)
     print(f"{args.model_name}: {dec.layout()['decoder']}, {dec.T} tokens {dec.token_names}, grid {dec.emb_hw}, "
           f"frame {dec.frame:g}, fallback {dec.dynamic} (thr {dec.stab_thresh:g}); {len(sites)} sites, "
-          f"{len(cfgs)} configs", flush=True)
+          f"{len(cfgs)} configs; TF32 matmul {tf32['matmul_after_load']} after load -> {tf32['matmul_run']}, "
+          f"cuDNN {tf32['cudnn']}", flush=True)
 
     root = Path(args.root)
     recs = SUS.index_study(root, args.use, datasets)
@@ -1120,12 +1153,14 @@ def run(args) -> int:
     if r.get("available"):
         print(f"repro A vs {args.reference_csv}: max |d| {r['max_abs']:.3g}, {r['n_over_tol']}/{r['matched']} boxes "
               f"> {args.repro_tol:g}; mean ours {r['mean_ours']:.4f} vs ref {r['mean_ref']:.4f}", flush=True)
-        r["ok"] = bool(r["matched"] == r["boxes"] and r["frac_over_tol"] <= args.repro_max_frac)
+        r["mean_tol"], r["max_frac"] = args.repro_mean_tol, args.repro_max_frac
+        r["ok"] = bool(r["matched"] == r["boxes"] and r["frac_over_tol"] <= args.repro_max_frac
+                       and abs(r["mean_ours"] - r["mean_ref"]) <= args.repro_mean_tol)
         if not r["ok"] and not args.allow_repro_fail:
             (out / "checks.json").write_text(json.dumps(checks, indent=1, default=_json_default), encoding="utf-8")
             raise CheckFailed("multimask=False IoU on half A does not match the reference csv "
-                              f"({r['n_over_tol']}/{r['matched']} boxes off): wrong checkpoint or frame? "
-                              "--allow_repro_fail to go on anyway")
+                              f"({r['n_over_tol']}/{r['matched']} boxes off, mean {r['mean_ours']:.4f} vs "
+                              f"{r['mean_ref']:.4f}): wrong checkpoint or frame? --allow_repro_fail to go on anyway")
 
     # --- vectors, doses, probes ---------------------------------------------------
     R = random_directions(sites, feats_A, args.seed)
@@ -1263,7 +1298,8 @@ def run(args) -> int:
     print(f"done in {time.time() - t_start:.0f}s -> {out}; checks: zero dose "
           f"{checks['zero_dose']['bit_exact']}/{checks['zero_dose']['forwards']}, own forward "
           f"{checks['own_forward']['bit_exact']}/{checks['own_forward']['compared']}, public API max |dIoU| "
-          f"{checks['public_api']['max_abs_iou_diff']:.3g}, baseline repeat "
+          f"{checks['public_api']['max_abs_iou_diff']:.3g} (one box per call "
+          f"{checks['public_single']['max_abs_iou_diff']:.3g}), baseline repeat "
           f"{checks['baseline_repeat']['max_abs_iou_diff']:.3g}, oracle cut "
           f"{checks['oracle_cut_prompt_tok']['max_abs_iou_vs_best']:.3g}", flush=True)
     return 0
@@ -1294,6 +1330,9 @@ def parse_args(argv=None):
     p.add_argument("--probe_iters", type=int, default=200)
     p.add_argument("--repro_tol", type=float, default=1e-3, help="|IoU - reference| counted as a mismatch")
     p.add_argument("--repro_max_frac", type=float, default=0.05, help="max share of mismatched boxes on half A")
+    p.add_argument("--repro_mean_tol", type=float, default=2e-3, help="max |mean IoU - reference mean| on half A")
+    p.add_argument("--keep_tf32", action="store_true",
+                   help="leave TF32 matmuls as the model loader set them (sam3 turns them on)")
     p.add_argument("--allow_repro_fail", action="store_true", help="record a failed repro check and go on")
     p.add_argument("--limit_images", type=int, default=0, help="per half / subset, for a smoke run; 0 = all")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
