@@ -16,6 +16,9 @@
 #   MODELS="SAM3" ...             only some models
 #   CUDA_VISIBLE_DEVICES=0,1 ...  the GPUs torchrun uses (default: all)
 #   N_IMAGES=5 OUT=... ...        fewer images / another output dir
+#   MAX_TRIED=30                  images tried per subset at most, found or not
+#   GRID_STEP=2 GRID_STEP_FROM=600  every 2nd px of box w / h on images whose
+#                                 longest side is >= 600 px (GRID_STEP=1: every box)
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -27,17 +30,20 @@ CKPT_SAM3=${CKPT_SAM3:-}            # "" = the builder takes the weights from th
 MODELS=${MODELS:-"SAM SAM2.1 SAM3"}
 SMOKE=${SMOKE:-0}
 BATCH=${BATCH:-512}
+GRID_STEP=${GRID_STEP:-2}
+GRID_STEP_FROM=${GRID_STEP_FROM:-600}
 status=0
 
-extra=()
 if [ "$SMOKE" = "1" ]; then
     N_IMAGES=${N_IMAGES:-1}
+    MAX_TRIED=${MAX_TRIED:-1}
     OUT=${OUT:-exp_res/critical_shifts_sample_smoke}
-    extra=(--max_tried 1)
 else
     N_IMAGES=${N_IMAGES:-20}
+    MAX_TRIED=${MAX_TRIED:-30}
     OUT=${OUT:-exp_res/critical_shifts_sample}
 fi
+extra=(--max_tried "$MAX_TRIED" --grid_step "$GRID_STEP" --grid_step_from "$GRID_STEP_FROM")
 
 run() {  # model, extra args...
     local model=$1 ckpt

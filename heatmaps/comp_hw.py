@@ -59,28 +59,23 @@ def generate_bounding_boxes(
     width: int,
     max_h: int,
     max_w: int,
+    step: int = 1,
 ) -> np.ndarray:
-    bboxes: list[tuple[int, int, int, int]] = []
-
-    for h in range(max_h + 1):
-        for w in range(max_w + 1):
-            xmin = x - w // 2
-            xmax = x + (w + 1) // 2
-            ymin = y - h // 2
-            ymax = y + (h + 1) // 2
-
-            xmin_clipped = int(np.clip(xmin, 0, width - 1))
-            xmax_clipped = int(np.clip(xmax, 0, width - 1))
-            ymin_clipped = int(np.clip(ymin, 0, height - 1))
-            ymax_clipped = int(np.clip(ymax, 0, height - 1))
-
-            bboxes.append(
-                (xmin_clipped, ymin_clipped, xmax_clipped, ymax_clipped)
-            )
-
-    bboxes_arr = np.stack(bboxes).astype(np.int32)
-    bboxes_arr = np.unique(bboxes_arr, axis=0)
-    return bboxes_arr
+    """Every box centred at (x, y) with height 0..max_h and width 0..max_w,
+    in steps of `step` px, clipped to the image; duplicates dropped (sorted)."""
+    h, w = np.meshgrid(
+        np.arange(0, max_h + 1, step), np.arange(0, max_w + 1, step), indexing="ij"
+    )
+    bboxes_arr = np.stack(
+        [
+            np.clip(x - w // 2, 0, width - 1),
+            np.clip(y - h // 2, 0, height - 1),
+            np.clip(x + (w + 1) // 2, 0, width - 1),
+            np.clip(y + (h + 1) // 2, 0, height - 1),
+        ],
+        axis=-1,
+    ).reshape(-1, 4).astype(np.int32)
+    return np.unique(bboxes_arr, axis=0)
 
 
 def get_bbox_from_mask(mask: np.ndarray) -> tuple[int, int, int, int]:
@@ -479,6 +474,11 @@ def _cached_predictor(args, device: torch.device):
     return _PREDICTORS[key]
 
 
+def grid_step_for(args, height: int, width: int) -> int:
+    """--grid_step for images whose longest side is >= --grid_step_from, 1 below."""
+    return args.grid_step if max(height, width) >= args.grid_step_from else 1
+
+
 def evaluate_mask(args, device: torch.device, rank: int):
     mask = cv2.imread(args.mask_path, cv2.IMREAD_GRAYSCALE)
     if mask is None:
@@ -515,6 +515,7 @@ def evaluate_mask(args, device: torch.device, rank: int):
             seed=424242,
         )
     else:
+        step = grid_step_for(args, height, width)
         all_bboxes = generate_bounding_boxes(
             width=width,
             height=height,
@@ -522,7 +523,9 @@ def evaluate_mask(args, device: torch.device, rank: int):
             y=bbox_center[1],
             max_h=height * 2,
             max_w=width * 2,
+            step=step,
         )
+        logger.info(f"{len(all_bboxes)} boxes, grid step {step} px")
 
     local_boxes = all_bboxes
     results: dict[str, list[dict]] = {
@@ -628,6 +631,20 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help="sample random boxes instead of centered grid",
+    )
+    parser.add_argument(
+        "--grid_step",
+        type=int,
+        default=1,
+        help="box width/height step of the grid in px (1 = every box); "
+             "only for images whose longest side is >= --grid_step_from",
+    )
+    parser.add_argument(
+        "--grid_step_from",
+        type=int,
+        default=0,
+        help="longest image side in px (after the >1024 resize) from which "
+             "--grid_step applies; 0 = every image",
     )
     parser.add_argument(
         "--continue_from",

@@ -5,11 +5,13 @@ Critical shifts on a representative sample of the user study, for one model.
 
 For each FOR_TEST subset (the 10 of steer_user_study.DATASETS, medical
 included) the images are put in a fixed random order (--seed). Each image gets
-the full w x h IoU heatmap (heatmaps/comp_hw.py under torchrun) and up to
+the w x h IoU heatmap (heatmaps/comp_hw.py under torchrun; every --grid_step
+px of box width / height on images from --grid_step_from px) and up to
 --max_cases critical shifts (find_critical_shifts.find_critical_shift, its
 default thresholds). An image without a single critical shift is passed over
 and the next one in the order is taken, until --n_images images of the subset
-have at least one -- or the subset runs out, which summary.csv reports.
+have at least one -- or the subset runs out, or --max_tried images were tried
+(medical subsets can have few); summary.csv reports the subsets left short.
 
 The order depends only on --seed and the subset's file names, so every model
 walks the same sequence; the selected images can still differ between models
@@ -145,6 +147,7 @@ def run_round(args, stems, imgs, masks, out: Path, nproc: int) -> None:
            "--images_dir", str(rd / "images"), "--masks_dir", str(rd / "masks"), "--mask_ext", ".png",
            "--output_dir", str(out), "--model_name", args.model_name, "--model_type", args.model_type,
            "--checkpoint_path", args.checkpoint_path, "--batch_size", str(args.batch_size),
+           "--grid_step", str(args.grid_step), "--grid_step_from", str(args.grid_step_from),
            "--continue_from"]
     for attempt in range(1, ROUND_ATTEMPTS + 1):
         rc = subprocess.run(cmd).returncode
@@ -181,7 +184,8 @@ def check_model(args, img: Path, mask: Path, device: torch.device) -> None:
     rmin, rmax, cmin, cmax = CH.get_bbox_from_mask(gt)
     H, W = gt.shape
     grid = CH.generate_bounding_boxes(x=(cmax - cmin) // 2 + cmin, y=(rmax - rmin) // 2 + rmin,
-                                      height=H, width=W, max_h=2 * H, max_w=2 * W)
+                                      height=H, width=W, max_h=2 * H, max_w=2 * W,
+                                      step=CH.grid_step_for(args, H, W))
     rng = np.random.default_rng(0)
     boxes = np.concatenate([np.array([[cmin, rmin, cmax, rmax]], dtype=np.int32),
                             grid[rng.choice(len(grid), 7, replace=False)]])
@@ -266,7 +270,8 @@ def main() -> None:
             return
 
     selection = {"model": args.model_name, "checkpoint": args.checkpoint_path, "seed": args.seed,
-                 "n_images": args.n_images, "find_params": params, "datasets": {}}
+                 "n_images": args.n_images, "max_tried": args.max_tried, "grid_step": args.grid_step,
+                 "grid_step_from": args.grid_step_from, "find_params": params, "datasets": {}}
     all_cases, rows = [], []
     for name in names:
         order, out = orders[name], out_dir / name
@@ -353,6 +358,10 @@ def parse_args():
     p.add_argument("--iou_drop_thresh", type=float, default=0.75, help="find_critical_shifts")
     p.add_argument("--max_cases", type=int, default=5, help="find_critical_shifts, per image")
     p.add_argument("--batch_size", type=int, default=512, help="comp_hw boxes per decoder call")
+    p.add_argument("--grid_step", type=int, default=1,
+                   help="comp_hw box width/height step in px for images from --grid_step_from")
+    p.add_argument("--grid_step_from", type=int, default=0,
+                   help="comp_hw: longest image side (px) from which --grid_step applies; 0 = all")
     p.add_argument("--nproc", type=int, default=0, help="torchrun processes; 0 = every visible GPU")
     p.add_argument("--no_check", action="store_true", help="skip the batched-path check")
     p.add_argument("--check_only", action="store_true", help="only the check and the timing")
