@@ -295,8 +295,12 @@ def make_folds(P: pd.DataFrame, k: int, seed: int) -> list:
 # ---------------------------------------------------------------------------
 
 def cb_params(a) -> dict:
+    # The learn-set metric (PFound for YetiRank) has no GPU kernel: CatBoost
+    # computes it on the CPU, by default every 5 iterations. It is only logged,
+    # so compute it when a log line is due.
     kw = dict(loss_function=a.loss, iterations=a.iterations, depth=a.depth, learning_rate=a.lr,
-              random_seed=a.seed, verbose=a.verbose, allow_writing_files=False, task_type=a.task_type)
+              random_seed=a.seed, verbose=a.verbose, allow_writing_files=False, task_type=a.task_type,
+              metric_period=a.verbose if a.verbose > 0 else a.iterations)
     if a.task_type == "GPU":
         kw["devices"] = a.devices
     else:
@@ -330,7 +334,7 @@ def check_gpu(a, checks: dict):
 
 def cfg_hash(spec: dict, a, folds) -> str:
     h = hashlib.sha256(json.dumps({"f": spec["features"], "p": {k: v for k, v in cb_params(a).items()
-                                                                if k not in ("verbose", "devices", "thread_count")},
+                                                                if k not in ("verbose", "metric_period", "devices", "thread_count")},
                                    "folds": folds}, sort_keys=True).encode())
     return h.hexdigest()[:16]
 
