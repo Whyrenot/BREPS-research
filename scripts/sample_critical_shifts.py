@@ -55,11 +55,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import multiprocessing
 import shutil
 import subprocess
 import sys
 import time
 from collections import OrderedDict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import cv2
@@ -321,29 +323,42 @@ def main() -> None:
             if was_skipped:
                 skipped.append(s)
 
-        def evaluate(s, after_round: bool):
-            """Cases of image s: from its .cases.json if that matches the CSV,
-            else from the CSV (and cached). Resuming, an image without either
-            stays untried; after a round, no CSV = comp_hw skipped it."""
-            csv = csv_of(s)
-            c = load_cached(csv, params)
-            if c is not None:
-                record(s, c.get("cases", []), c.get("skipped", False))
-            elif csv.exists():
-                if not readable(csv):
-                    if after_round:
-                        raise RuntimeError(f"{csv}: unreadable right after comp_hw")
-                    print(f"[resume] {csv} is cut off, recomputing")
-                    csv.unlink()
-                    return
-                record(s, find_critical_shift(csv, **params), False)
-                save_cached(csv, params, cases[s])
-            elif after_round:  # comp_hw skipped it (empty / unreadable mask)
-                record(s, [], True)
-                save_cached(csv, params, [], skipped=True)
+        def evaluate(stems, after_round: bool):
+            """Cases of these images: from their .cases.json if it matches the
+            CSV, else searched in the CSV (in parallel, then cached). Resuming,
+            an image without either stays untried; after a round, no CSV =
+            comp_hw skipped it."""
+            todo = []
+            for s in stems:
+                csv = csv_of(s)
+                c = load_cached(csv, params)
+                if c is not None:
+                    record(s, c.get("cases", []), c.get("skipped", False))
+                elif csv.exists():
+                    # comp_hw writes atomically now; a CSV of an older run may be cut off
+                    if not after_round and not readable(csv):
+                        print(f"[resume] {csv} is cut off, recomputing")
+                        csv.unlink()
+                    else:
+                        todo.append(s)
+                elif after_round:  # comp_hw skipped it (empty / unreadable mask)
+                    record(s, [], True)
+                    save_cached(csv, params, [], skipped=True)
+            if not todo:
+                return
+            t0 = time.time()
+            # spawn, not fork: this process has torch (and its threads) loaded
+            with ProcessPoolExecutor(max_workers=min(len(todo), args.find_workers),
+                                     mp_context=multiprocessing.get_context("spawn")) as ex:
+                futs = {ex.submit(find_critical_shift, str(csv_of(s)), **params): s for s in todo}
+                for k, f in enumerate(as_completed(futs), 1):
+                    s = futs[f]
+                    record(s, f.result(), False)
+                    save_cached(csv_of(s), params, cases[s])
+                    print(f"[find] {k}/{len(todo)} {s}: {n_cases[s]} cases ({time.time() - t0:.0f} s)",
+                          flush=True)
 
-        for s in order:  # resume: images an earlier run finished are not recomputed
-            evaluate(s, after_round=False)
+        evaluate(order, after_round=False)  # resume: images an earlier run finished are not recomputed
         if n_cases:
             print(f"[resume] {name}: {len(n_cases)} images already computed")
 
@@ -357,8 +372,7 @@ def main() -> None:
                   f"(selected so far {len(selected)}/{args.n_images}) {time.strftime('%H:%M:%S')}", flush=True)
             t0 = time.time()
             run_round(args, nxt, imgs, masks, out, nproc)
-            for s in nxt:
-                evaluate(s, after_round=True)
+            evaluate(nxt, after_round=True)
             print(f"=== round {rnd} took {(time.time() - t0) / 60:.1f} min; cases per image: "
                   + ", ".join(f"{s}={n_cases[s]}" for s in nxt), flush=True)
 
@@ -408,6 +422,8 @@ def parse_args():
     p.add_argument("--grid_step_from", type=int, default=0,
                    help="comp_hw: longest image side (px) from which --grid_step applies; 0 = all")
     p.add_argument("--nproc", type=int, default=0, help="torchrun processes; 0 = every visible GPU")
+    p.add_argument("--find_workers", type=int, default=8,
+                   help="CPU processes searching the CSVs of a round for critical shifts")
     p.add_argument("--no_check", action="store_true", help="skip the batched-path check")
     p.add_argument("--check_only", action="store_true", help="only the check and the timing")
     return p.parse_args()
