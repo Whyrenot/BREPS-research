@@ -272,6 +272,20 @@ def image_rows(ctx: dict, item: dict, res: dict, bon: dict, grad: dict, clean: f
     return pool, per_box, steps_ck
 
 
+def method_summary(PB: pd.DataFrame, alphas) -> str:
+    """Mean IoU of every method over all boxes / bottom50 / top50 (and % to undef)."""
+    cols = ["undef_iou", "hsel_iou"] + [f"{f}_mm{mm}_iou" for f in ("grad", "bon") for mm in MODES]
+    cols += [f"steer_mm{mm}_{_a(a)}_iou" for mm in MODES for a in alphas] + ["oracle_iou"]
+    cols = [c for c in cols if c in PB.columns]
+    L = [f"{'method':22s} {'all':>8s} {'bottom50':>9s} {'top50':>8s}   % to undef (all / b50 / t50)"]
+    base = {g: PB[PB.group == g].undef_iou.mean() if g != "all" else PB.undef_iou.mean() for g in ("all", "bottom50", "top50")}
+    for c in cols:
+        v = {g: (PB[PB.group == g][c].mean() if g != "all" else PB[c].mean()) for g in base}
+        L.append(f"{c[:-4]:22s} {v['all']:8.4f} {v['bottom50']:9.4f} {v['top50']:8.4f}   "
+                 + " / ".join(f"{(v[g] / base[g] - 1) * 100:+.2f}" for g in base))
+    return "\n".join(L)
+
+
 def check_against_repo(ctx, item, bon: dict, grad: dict, a, checks: dict):
     """The batched ascent and BoN vs the repo's own one-box functions."""
     import refine_box_iou_grad as R
@@ -387,9 +401,11 @@ def run(args) -> int:
             bw, bh = (bx[:, 2] - bx[:, 0]).clip(min=1e-3), (bx[:, 3] - bx[:, 1]).clip(min=1e-3)
             mm_rows.append(SMC.multimask_rows(item, res, alphas, bw * bh / float(ih * iw), np.log(bw / bh), table))
             P = pd.DataFrame(pb)
+            sa = _a(min(alphas, key=lambda x: abs(x - args.log_alpha)))
             print(f"[{table}] [{k + 1}/{len(plan)}] {stem}: undef {P.undef_iou.mean():.4f} hsel {P.hsel_iou.mean():.4f} "
                   f"grad {P.grad_mm0_iou.mean():.4f}/{P.grad_mm1_iou.mean():.4f} bon {P.bon_mm0_iou.mean():.4f}/"
-                  f"{P.bon_mm1_iou.mean():.4f} oracle {P.oracle_iou.mean():.4f}, {len(pool)} candidates "
+                  f"{P.bon_mm1_iou.mean():.4f} steer {sa} {P[f'steer_mm0_{sa}_iou'].mean():.4f}/"
+                  f"{P[f'steer_mm1_{sa}_iou'].mean():.4f} oracle {P.oracle_iou.mean():.4f}, {len(pool)} candidates "
                   f"({time.time() - t0:.0f}s)", flush=True)
             del item, res, bon, grad
     except SMS.CheckFailed as e:
@@ -420,6 +436,7 @@ def run(args) -> int:
             "boxes": int(len(PB)), "pool_rows": n_pool, "candidates_per_box": float(PB.n_candidates.mean()),
             "versions": SMS.package_versions(), "seconds": round(time.time() - t0)}
     (out / "meta.json").write_text(json.dumps(meta, indent=1, default=SMS._json_default), encoding="utf-8")
+    print(method_summary(PB, alphas), flush=True)
     eq = checks["repo_equivalence"]
     print(f"done in {(time.time() - t0) / 60:.1f} min -> {out}: {len(PB)} boxes, {n_pool} candidates; zero dose "
           f"{checks['zero_dose']['bit_exact']}/{checks['zero_dose']['forwards']}, own forward "
@@ -458,6 +475,7 @@ def parse_args(argv=None):
     p.add_argument("--batch", type=int, default=64, help="boxes per decoder pass")
     p.add_argument("--stride", type=int, default=4, help="feature masks, as dump_selector_data")
     p.add_argument("--check_boxes", type=int, default=3, help="boxes per subset checked against the repo's functions")
+    p.add_argument("--log_alpha", type=float, default=8.0, help="steering alpha shown in the per-image log line")
     p.add_argument("--reference_csv", default="")
     p.add_argument("--repro_tol", type=float, default=1e-3)
     p.add_argument("--keep_tf32", action="store_true")
@@ -540,6 +558,7 @@ def merge_shards(out: Path, reference_csv: str | None) -> int:
                  "seconds": max(m["seconds"] for m in metas), "seconds_per_shard": [m["seconds"] for m in metas]})
     meta["args"] = {**a0, "shard": None}
     (out / "meta.json").write_text(json.dumps(meta, indent=1, default=SMS._json_default), encoding="utf-8")
+    print(method_summary(PB, a0["alphas"]), flush=True)
     eq = checks["repo_equivalence"]
     print(f"merged {len(shards)} shards -> {out}: {len(PB)} boxes, {meta['pool_rows']} candidates; zero dose "
           f"{checks['zero_dose']['bit_exact']}/{checks['zero_dose']['forwards']} ok {checks['zero_dose']['ok']}, "
