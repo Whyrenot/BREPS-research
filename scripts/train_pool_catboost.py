@@ -539,6 +539,8 @@ def summary_md(T: pd.DataFrame, K: pd.DataFrame, meta: dict, astar: dict, checks
         L.append(f"Селекторы обучены на пуле {src_meta.get('model_name', '?')} (`{a.apply_model}`), применены к пулу "
                  f"{model} ({'модель фолда, в котором картинка была тестовой: ни картинка, ни кандидаты этой модели в обучении не участвовали' if a.apply_with == 'fold' else 'одна модель на всех картинках источника'}).")
     st = ", ".join(f"{'один выход' if mm == 0 else 'multimask'} α* = {v['alpha']:g}" for mm, v in astar.items())
+    if any("source" in v for v in astar.values()):
+        st += f" (заморожена из `{next(v['source'] for v in astar.values() if 'source' in v)}`)"
     kinds = T_kind["ann"].unique().tolist() if T_kind is not None else []
     L += ["", f"Steering α* выбрана на боксах COCO A по среднему IoU: {st or '—'}. Группы — внутри картинки по IoU "
           "одного выхода: худшая половина разметок картинки — bottom50, остальные — top50 (12 / 13 при 25 разметках"
@@ -573,7 +575,8 @@ def summary_md(T: pd.DataFrame, K: pd.DataFrame, meta: dict, astar: dict, checks
     L += ["", "\\* — CI не захватывает 0.", ""]
     if len(kinds) > 1:
         cols = [m for m in METHODS if m in set(T_kind.method) and m != "argmax_pred"]
-        L += ["## По типу разметки (m — мобильная, p — с ПК): IoU undef и % к нему", "",
+        L += ["## По типу бокса (`kind`: m — мобильная разметка, p — с ПК; bad — атака, best — её хороший сосед): "
+              "IoU undef и % к нему", "",
               "Одна и та же модель CatBoost (обучена на всех разметках), строки — подвыборки боксов.", "",
               "| разметка | блок | группа | n | " + " | ".join(LABEL[m] for m in cols) + " |",
               "|---|---|---|---|" + "---|" * len(cols)]
@@ -628,7 +631,12 @@ def run(a) -> int:
     pool_dir = Path(a.pool_dir)
     P, R, meta = load(pool_dir)
     alphas = meta["alphas"]
-    astar = alpha_star(P, alphas)
+    if a.alpha_star_from:
+        # a frozen alpha* (e.g. the user-study run's, on the critical shifts)
+        src_a = json.loads((Path(a.alpha_star_from) / "meta.json").read_text(encoding="utf-8"))["alpha_star"]
+        astar = {int(mm): dict(v, cand_id=alphas.index(v["alpha"]), source=a.alpha_star_from) for mm, v in src_a.items()}
+    else:
+        astar = alpha_star(P, alphas)
     add_regressor_features(P, R, alphas, checks)
     del R
     P = exclude_A(P, meta, pool_dir, checks)
@@ -687,6 +695,8 @@ def parse_args(argv=None):
     p.add_argument("--out_dir", required=True)
     p.add_argument("--apply_model", default="", help="out_dir of another run: score this pool with its selectors")
     p.add_argument("--apply_with", default="fold", choices=["fold", "full"])
+    p.add_argument("--alpha_star_from", default="", help="out_dir of another run: take its steering alpha* "
+                                                         "(default: chosen on this pool's COCO A boxes)")
     p.add_argument("--task_type", default="GPU", choices=["GPU", "CPU"])
     p.add_argument("--devices", default="0", help="CatBoost GPU devices, e.g. 0 or 0:1")
     p.add_argument("--threads", type=int, default=-1, help="CPU threads (--task_type CPU)")

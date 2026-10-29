@@ -42,7 +42,7 @@ MEDICAL = ("ACDC", "BUID", "MedScribble")
 MODES = (0, 1)
 PRE = {0: "tok0", 1: "multi"}
 SLOTS = ("hsel", "grad_mm0", "grad_mm1", "bon_mm0", "bon_mm1")
-KIND_NAME = {"m": "mobile", "p": "desktop"}
+KIND_NAME = {"m": "mobile", "p": "desktop", "bad": "attack", "best": "clean"}
 STR = {k: str for k in KEY + ["half", "dataset", "group", "cand_kind", "method_slot", "cb_kind", "oracle_kind"]}
 
 
@@ -108,6 +108,66 @@ def image_groups(df: pd.DataFrame, by: list) -> pd.Series:
     return out
 
 
+SEL_COLS = (("catboost", "iou"), ("cb_kind", "kind"), ("cb_cand_id", "cand_id"), ("cb_alpha", "alpha"),
+            ("cb_step", "step"), ("cb_score", "score"), ("cb_margin", "margin"))
+
+
+def selector_dirs(a, model: str) -> list:
+    """[(column prefix, run dir)]: --selectors name=pattern ({model}, {tag}), or the
+    defaults -- cb (this model's CatBoost), cbT (--transfer_from's selectors on this
+    model), cb_mobile_trained (the mobile-only run's CatBoost)."""
+    exp, tag = Path(a.exp), a.tag
+    if a.selectors:
+        out = []
+        for spec in a.selectors:
+            name, pat = spec.split("=", 1)
+            out.append((name, exp / pat.format(model=model, tag=tag, src=a.transfer_from)))
+        return out
+    out = [("cb", exp / f"cb_{model}{tag}")]
+    if a.transfer_from and a.transfer_from != model:
+        out.append(("cbT", exp / f"cb_{a.transfer_from}_on_{model}{tag}"))
+    if a.mobile_tag is not None and a.mobile_tag != tag:
+        out.append(("cb_mobile_trained", exp / f"cb_{model}{a.mobile_tag}"))
+    return out
+
+
+def join_selector(D: pd.DataFrame, path: Path, name: str, c: dict):
+    """A selector run's pick per box as <name>_iou, _kind, _cand_id, _alpha, _step, _score, _margin."""
+    if not (path / "per_box.csv.gz").is_file():
+        return None
+    C = read(path / "per_box.csv.gz")
+    C["case"] = case_of(C)
+    C = C.set_index("case")
+    for col, suf in SEL_COLS:
+        if col in C.columns:
+            D[f"{name}_{suf}"] = C[col]
+    c.setdefault("selectors", {})[name] = {
+        "dir": str(path), "boxes": int(len(C)),
+        "undef_vs_pool_max_abs": float((C.undef - D.undef_iou.reindex(C.index)).abs().max())}
+    return C
+
+
+def critical_pairs(D: pd.DataFrame, cols: list, min_gap: float) -> pd.DataFrame:
+    """Critical shifts (kinds bad / best): the pair of every box, and on the
+    attacks the share of the pair's IoU drop a method restores --
+    (IoU - undef_bad) / (undef_best - undef_bad), the patching formula -- where
+    the recomputed drop is at least min_gap."""
+    if not {"bad", "best"} <= set(D.kind):
+        return D
+    pair = D.image_name + "|" + D.user + "|" + D.attempt
+    u = {k: D[D.kind == k].assign(p=pair[D.kind == k]).set_index("p").undef_iou for k in ("bad", "best")}
+    bad = (D.kind == "bad").to_numpy()
+    D["pair"] = pair
+    D["pair_undef_iou"] = np.where(bad, pair.map(u["best"]), pair.map(u["bad"]))
+    gap = (D.pair_undef_iou - D.undef_iou).where(bad)
+    D["pair_gap"] = gap
+    ok = bad & (gap >= min_gap).to_numpy()
+    for col in cols:
+        if col in D.columns and col != "undef_iou":
+            D["restore_" + col[:-4]] = np.where(ok, (D[col] - D.undef_iou) / gap, np.nan)
+    return D
+
+
 def one_model(model: str, a, checks: dict) -> pd.DataFrame | None:
     exp, tag = Path(a.exp), a.tag
     pool, cb = exp / f"pool_{model}{tag}", exp / f"cb_{model}{tag}"
@@ -147,51 +207,32 @@ def one_model(model: str, a, checks: dict) -> pd.DataFrame | None:
         D = D.join(X, how="left")
         c["pool_vs_per_box_oracle_max_abs"] = float((O.target_iou.reindex(D.index) - D.pool_oracle_iou).abs().max())
         c["pool_boxes_without_undef_row"] = int(D["undef_f_pred"].isna().sum()) if "undef_f_pred" in D else None
-    # CatBoost of this model, out of fold
-    if (cb / "per_box.csv.gz").is_file():
-        C = read(cb / "per_box.csv.gz")
-        C["case"] = case_of(C)
-        C = C.set_index("case")
-        cm = json.loads((cb / "meta.json").read_text(encoding="utf-8"))
-        for mm, st in cm.get("alpha_star", {}).items():
-            D[f"steer_mm{mm}_astar_alpha"] = st["alpha"]
-            D[f"steer_mm{mm}_astar_iou"] = D[f"steer_mm{mm}_{_a(st['alpha'])}_iou"]
+    # the selectors: CatBoost of this model out of fold, transferred ones (--selectors)
+    first = None
+    for name, path in selector_dirs(a, model):
+        C = join_selector(D, path, name, c)
+        if C is not None and first is None:
+            first = (name, path, C)
+    if first is not None:
+        name, path, C = first
         D["in_selector_eval"] = D.index.isin(C.index)
         D["argmax_pred_iou"] = C.argmax_pred
-        for col, new in (("catboost", "cb_iou"), ("cb_kind", "cb_kind"), ("cb_cand_id", "cb_cand_id"),
-                         ("cb_alpha", "cb_alpha"), ("cb_step", "cb_step"), ("cb_score", "cb_score"),
-                         ("cb_margin", "cb_margin")):
-            if col in C.columns:
-                D[new] = C[col]
-        diff = (C.undef - D.undef_iou.reindex(C.index)).abs()
-        c["cb_vs_pool_undef_max_abs"] = float(diff.max())
-        folds = json.loads((cb / "folds.json").read_text(encoding="utf-8"))["folds"]
-        f_of = {im: k for k, ims in enumerate(folds) for im in ims}
-        D["cv_fold"] = D.image_name.map(f_of).fillna(-1).astype(int)
+        if (path / "folds.json").is_file():
+            folds = json.loads((path / "folds.json").read_text(encoding="utf-8"))["folds"]
+            f_of = {im: k for k, ims in enumerate(folds) for im in ims}
+            D["cv_fold"] = D.image_name.map(f_of).fillna(-1).astype(int)
     else:
-        print(f"[warn] {model}: no CatBoost run in {cb}", flush=True)
+        print(f"[warn] {model}: none of the selector runs exists", flush=True)
         D["in_selector_eval"] = D.subset != "COCO_A"
-    # the transferred selector
-    src = a.transfer_from
-    tr = exp / f"cb_{src}_on_{model}{tag}"
-    if src and src != model and (tr / "per_box.csv.gz").is_file():
-        C = read(tr / "per_box.csv.gz")
-        C["case"] = case_of(C)
-        C = C.set_index("case")
-        D["cbT_source"] = src
-        for col, new in (("catboost", "cbT_iou"), ("cb_kind", "cbT_kind"), ("cb_alpha", "cbT_alpha"),
-                         ("cb_step", "cbT_step"), ("cb_margin", "cbT_margin")):
-            if col in C.columns:
-                D[new] = C[col]
+    ast = exp / a.alpha_star_from.format(model=model, tag=tag) if a.alpha_star_from else (first[1] if first else None)
+    if ast is not None and (ast / "meta.json").is_file():
+        for mm, st in json.loads((ast / "meta.json").read_text(encoding="utf-8")).get("alpha_star", {}).items():
+            D[f"steer_mm{mm}_astar_alpha"] = st["alpha"]
+            D[f"steer_mm{mm}_astar_iou"] = D[f"steer_mm{mm}_{_a(st['alpha'])}_iou"]
+        c["alpha_star_from"] = str(ast)
     # the mobile-only run: its CatBoost on the m rows, and the m rows reproduced
     if a.mobile_tag is not None and a.mobile_tag != tag:
-        mp_pool, mp_cb = exp / f"pool_{model}{a.mobile_tag}", exp / f"cb_{model}{a.mobile_tag}"
-        if (mp_cb / "per_box.csv.gz").is_file():
-            C = read(mp_cb / "per_box.csv.gz")
-            C["case"] = case_of(C)
-            C = C.set_index("case")
-            D["cb_mobile_trained_iou"] = C.catboost
-            D["cb_mobile_trained_kind"] = C.cb_kind
+        mp_pool = exp / f"pool_{model}{a.mobile_tag}"
         if (mp_pool / "per_box.csv.gz").is_file():
             M = read(mp_pool / "per_box.csv.gz")
             M["case"] = case_of(M)
@@ -210,6 +251,7 @@ def one_model(model: str, a, checks: dict) -> pd.DataFrame | None:
     D["undef_rank_img"] = D.groupby("image_name").undef_iou.rank(pct=True)
     D["n_ann_img"] = D.groupby("image_name").case.transform("size")
     D["n_ann_img_kind"] = D.groupby(["image_name", "kind"]).case.transform("size")
+    D = critical_pairs(D, main_columns(a), a.min_gap)
     c["boxes"] = int(len(D))
     c["by_kind"] = D.kind.value_counts().to_dict()
     c["in_selector_eval"] = int(D.in_selector_eval.sum())
@@ -221,16 +263,23 @@ def one_model(model: str, a, checks: dict) -> pd.DataFrame | None:
 FRONT = ["model", "image_name", "dataset", "subset", "domain", "kind", "annotation", "user", "attempt", "case", "half",
          "steer_fold", "cv_fold", "in_selector_eval", "group", "group_kind", "undef_rank_img", "n_ann_img",
          "n_ann_img_kind", "clean_iou", "pool_oracle_iou", "n_candidates"]
-MAIN = ["undef_iou", "hsel_iou", "grad_mm0_iou", "grad_mm1_iou", "bon_mm0_iou", "bon_mm1_iou", "steer_mm0_astar_iou",
-        "steer_mm1_astar_iou", "argmax_pred_iou", "cb_iou", "cbT_iou", "cb_mobile_trained_iou", "pool_oracle_iou"]
+METHODS = ["undef_iou", "hsel_iou", "grad_mm0_iou", "grad_mm1_iou", "bon_mm0_iou", "bon_mm1_iou",
+           "steer_mm0_astar_iou", "steer_mm1_astar_iou", "argmax_pred_iou"]
+
+
+def main_columns(a) -> list:
+    """The methods, every selector's pick, the pool's oracle."""
+    names = [n for n, _ in selector_dirs(a, "{model}")]
+    return METHODS + [f"{n}_iou" for n in names] + ["pool_oracle_iou"]
 
 
 def columns_md(df: pd.DataFrame, a, checks: dict, overview: pd.DataFrame) -> str:
     al = sorted({c.split("_")[2] for c in df.columns if c.startswith("steer_mm0_a") and c.endswith("_iou")
                  and "astar" not in c}, key=lambda s: float(s[1:]))
     L = [f"# {Path(a.out).name}.csv: что в каждом столбце", "",
-         f"Одна строка — одна модель × одна пользовательская разметка. Модели: {', '.join(df.model.unique())}; "
-         f"строк {len(df)}; столбцов {df.shape[1]}. Разметки: m — мобильная, p — с ПК (`annotation`). Собрано "
+         f"Одна строка — одна модель × один бокс (`kind`: m / p — разметка пользователя, мобильная / с ПК; bad / "
+         f"best — атака и её хороший сосед). Модели: {', '.join(df.model.unique())}; строк {len(df)}; столбцов "
+         f"{df.shape[1]}. Собрано "
          f"{time.strftime('%Y-%m-%d %H:%M')} из `{a.exp}/pool_<model>{a.tag}`, `cb_<model>{a.tag}`"
          + (f", `cb_{a.transfer_from}_on_<model>{a.tag}`" if a.transfer_from else "") + ".", "",
          "## Как устроены данные", "",
@@ -251,8 +300,25 @@ def columns_md(df: pd.DataFrame, a, checks: dict, overview: pd.DataFrame) -> str
          "- **Группы:** `group` — внутри картинки по `undef_iou` среди всех её разметок: худшие round(n/2) — "
          "bottom50, остальные — top50 (так считались все таблицы прогонов); `group_kind` — то же внутри картинки и "
          "типа разметки (как в мобильных таблицах, 12 / 13).",
-         "- Признаки без GT пригодны как входы селектора; столбцы `*_iou` и `pool_oracle_*` — только для оценки.", "",
-         "## Столбцы", "", "| столбец | что это |", "|---|---|"]
+         "- Признаки без GT пригодны как входы селектора; столбцы `*_iou` и `pool_oracle_*` — только для оценки.",
+         "- **Селекторы** (`<имя>_iou`, `_kind`, `_cand_id`, `_alpha`, `_step`, `_score`, `_margin`): "
+         + "; ".join(f"`{n}` — `{v['dir']}`" for n, v in next(iter(checks.values()), {}).get("selectors", {}).items())
+         + ". Прогон с `_on_` в имени — селектор, обученный на другой модели или другой задаче и применённый сюда "
+         "(модель фолда, в котором картинка была тестовой).", ""]
+    if {"bad", "best"} <= set(df.kind):
+        L += ["## Критические сдвиги", "",
+              "- Каждый случай атаки — два бокса одной картинки в нескольких пикселях друг от друга: `bad` (маска "
+              "сломана) и `best` (маска хорошая); `user` — номер случая в картинке, `pair` — ключ пары. Атаки свои у "
+              "каждой модели (`exp_res/critical_shifts_full/<model>`), поэтому строки моделей не совпадают по боксам.",
+              "- `cs_json_iou`, `cs_pair_json_iou`, `cs_iou_drop` — IoU бокса, его пары и падение из JSON атак "
+              "(тепловая карта comp_hw); `undef_iou` — то же, пересчитанное здесь.",
+              "- `pair_undef_iou` — undef второго бокса пары; `pair_gap` (на bad) — пересчитанное падение "
+              "undef_best − undef_bad; `restore_<метод>` (на bad, где pair_gap ≥ "
+              f"{a.min_gap:g}) — доля падения, которую метод вернул: (IoU − undef_bad) / pair_gap. На строках best "
+              "смотрите разницу `<метод>_iou − undef_iou`: насколько метод портит хорошую маску.",
+              "- Группы `group` / `group_kind` на атаках не имеют смысла (в картинке 2–10 боксов); сравнивайте по `kind`.",
+              ""]
+    L += ["## Столбцы", "", "| столбец | что это |", "|---|---|"]
     desc = [
         ("model", "SAM (vit_b), SAM2.1 (hiera_base_plus), SAM3"),
         ("image_name / dataset / subset", "картинка; набор; набор с половиной COCO (COCO_A / COCO_B)"),
@@ -298,9 +364,9 @@ def columns_md(df: pd.DataFrame, a, checks: dict, overview: pd.DataFrame) -> str
     return "\n".join(L)
 
 
-def overview_table(df: pd.DataFrame) -> pd.DataFrame:
+def overview_table(df: pd.DataFrame, main: list) -> pd.DataFrame:
     E = df[df.in_selector_eval]
-    cols = [c for c in MAIN if c in E.columns]
+    cols = [c for c in main if c in E.columns]
     O = E.groupby(["model", "annotation", "domain"])[cols].mean().round(4).reset_index()
     A = E.groupby(["model", "annotation"])[cols].mean().round(4).reset_index().assign(domain="all")
     return pd.concat([O, A], ignore_index=True).sort_values(["model", "annotation", "domain"]).reset_index(drop=True)
@@ -314,6 +380,13 @@ def main(argv=None) -> int:
     p.add_argument("--transfer_from", default="SAM3", help="model whose selectors were applied to the others ('' = none)")
     p.add_argument("--mobile_tag", default="", help="suffix of the mobile-only runs to join and check against "
                                                      "(none: --mobile_tag none)")
+    p.add_argument("--selectors", nargs="*", default=[],
+                   help="name=dir pattern under --exp ({model}, {tag}, {src}): the selector runs to join as "
+                        "<name>_iou, _kind, ... (default: cb, cbT, cb_mobile_trained)")
+    p.add_argument("--alpha_star_from", default="", help="dir pattern of the run whose steering alpha* to use "
+                                                         "(default: the first selector's)")
+    p.add_argument("--min_gap", type=float, default=0.1,
+                   help="critical shifts: restore_* only where the attack's recomputed drop is at least this")
     p.add_argument("--no_pool", action="store_true", help="skip pool.csv.gz (the undef features, box moves, oracle)")
     p.add_argument("--out", default="exp_res/paper_table_mp")
     a = p.parse_args(argv)
@@ -326,13 +399,14 @@ def main(argv=None) -> int:
         raise SystemExit("no model has a pool under --exp with this --tag")
     df = pd.concat(parts, ignore_index=True, sort=False)
     front = [c for c in FRONT if c in df.columns]
-    main_cols = [c for c in MAIN if c in df.columns and c not in front]
+    main = main_columns(a)
+    main_cols = [c for c in main if c in df.columns and c not in front]
     rest = sorted(c for c in df.columns if c not in front and c not in main_cols)
     df = df[front + main_cols + rest]
     out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out.with_suffix(".csv"), index=False, float_format="%.6g")
-    ov = overview_table(df)
+    ov = overview_table(df, main)
     out.with_name(out.name + "_columns.md").write_text(columns_md(df, a, checks, ov), encoding="utf-8")
     with pd.option_context("display.width", 250, "display.max_columns", 30):
         print(ov.to_string(index=False))

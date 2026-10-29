@@ -25,6 +25,7 @@ THREADS=${THREADS:--1}
 ITER=${ITER:-800}
 SMOKE=${SMOKE:-0}
 TAG=${TAG:-}
+ALPHA_STAR_FROM=${ALPHA_STAR_FROM:-}   # e.g. 'exp_res/cb_{model}_mp': a frozen steering alpha* ({model} = the pool's)
 status=0
 
 extra=(--task_type "$TASK_TYPE" --threads "$THREADS")
@@ -44,7 +45,8 @@ for model in $MODELS; do
     if [ ! -f "$pool/pool.csv.gz" ]; then echo "$model: no merged pool in $pool"; status=1; continue; fi
     mkdir -p "$out"
     echo "=== $model CatBoost $pool -> $out $(date)"
-    python scripts/train_pool_catboost.py --pool_dir "$pool" --out_dir "$out" --devices 0 "${extra[@]}" \
+    asf=(); [ -n "$ALPHA_STAR_FROM" ] && asf=(--alpha_star_from "${ALPHA_STAR_FROM//\{model\}/$model}")
+    python scripts/train_pool_catboost.py --pool_dir "$pool" --out_dir "$out" --devices 0 "${asf[@]}" "${extra[@]}" \
         2>&1 | tee "$out/run.log"
     [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "$model CatBoost FAILED"; status=1; }
 done
@@ -60,8 +62,9 @@ if [ -n "$TRANSFER_FROM" ]; then
         fi
         mkdir -p "$out"
         echo "=== transfer $TRANSFER_FROM -> $model $pool -> $out $(date)"
+        asf=(); [ -n "$ALPHA_STAR_FROM" ] && asf=(--alpha_star_from "${ALPHA_STAR_FROM//\{model\}/$model}")
         python scripts/train_pool_catboost.py --apply_model "$src" --pool_dir "$pool" --out_dir "$out" --devices 0 \
-            "${extra[@]}" 2>&1 | tee "$out/run.log"
+            "${asf[@]}" "${extra[@]}" 2>&1 | tee "$out/run.log"
         [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "transfer $TRANSFER_FROM -> $model FAILED"; status=1; }
     done
 fi

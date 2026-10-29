@@ -15,6 +15,8 @@
 #   THREADS=4 ...       CPU threads per process (the mask features run on the CPU)
 #   USE=mp ...          the mobile and the desktop annotations (default m: mobile only); the out
 #                       dirs get TAG (default _mp), so the mobile pools are left alone
+#   CS_DIR=exp_res/critical_shifts_full ...   the model's attacks instead of the user annotations:
+#                       <CS_DIR>/<model>/critical_shifts_all.json (sample_critical_shifts.py), TAG default _cs
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -31,7 +33,8 @@ GPUS=${GPUS//,/ }                 # "0,1,2" or "0 1 2"
 THREADS=${THREADS:-4}
 SMOKE=${SMOKE:-0}
 USE=${USE:-m}
-TAG=${TAG-$([ "$USE" = "m" ] && echo "" || echo "_$USE")}
+CS_DIR=${CS_DIR:-}
+if [ -n "$CS_DIR" ]; then TAG=${TAG-_cs}; else TAG=${TAG-$([ "$USE" = "m" ] && echo "" || echo "_$USE")}; fi
 status=0
 
 extra=()
@@ -52,16 +55,22 @@ for model in $MODELS; do
     esac
     scan=exp_res/steer_scan_${model}
     if [ ! -f "$scan/vectors.npz" ]; then echo "$model: no scan in $scan"; status=1; continue; fi
+    cs=()
+    if [ -n "$CS_DIR" ]; then
+        js=$CS_DIR/$model/critical_shifts_all.json
+        if [ ! -f "$js" ]; then echo "$model: no $js"; status=1; continue; fi
+        cs=(--critical_shifts "$js"); ref=""          # the user-study references do not apply
+    fi
     out=exp_res/pool_${model}${TAG}${suffix}
     mkdir -p "$out"
-    echo "=== $model pool (--use $USE) on GPUs ${gpus[*]} -> $out $(date)"
+    echo "=== $model pool (--use $USE${CS_DIR:+, attacks of $CS_DIR}) on GPUs ${gpus[*]} -> $out $(date)"
     pids=()
     for i in "${!gpus[@]}"; do
         mkdir -p "$out/shard_$i"
         CUDA_VISIBLE_DEVICES=${gpus[$i]} OMP_NUM_THREADS=$THREADS MKL_NUM_THREADS=$THREADS \
             python scripts/build_candidate_pool.py --model_name "$model" --root "$ROOT" --checkpoint_path "$ckpt" \
             --scan_dir "$scan" --site "$SITE" --use "$USE" --reference_csv "$ref" --shard "$i" --n_shards "$n" \
-            --out_dir "$out/shard_$i" "${extra[@]}" > "$out/shard_$i/run.log" 2>&1 &
+            --out_dir "$out/shard_$i" "${cs[@]}" "${extra[@]}" > "$out/shard_$i/run.log" 2>&1 &
         pids+=($!)
     done
     failed=0

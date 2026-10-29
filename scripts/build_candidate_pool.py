@@ -28,6 +28,14 @@ CANDIDATES per box (the tight bbox of the user's mask, 1024 frame)
   Methods (method_slot marks their row): undef, hsel, grad_mm{0,1} = the last
   checkpoint, bon_mm{0,1} = argmax of the predicted IoU over the Y.
 
+CRITICAL SHIFTS (--critical_shifts critical_shifts_all.json of sample_critical_shifts.py)
+  the same candidates for the model's attacks instead of the user annotations:
+  every case of an image gives two boxes of the pool, kind "bad" (the attack,
+  bad_box) and kind "best" (its good neighbour a few px away, best_box), user =
+  the case id inside the image; cs_json_iou / cs_pair_json_iou / cs_iou_drop
+  carry the JSON's numbers, and checks.json compares the single output's IoU
+  here with the JSON's (critical_shifts_json).
+
 EFFICIENCY  the image is encoded once and all its boxes go through the decoder
   together: the BoN boxes of every box of the image as one batch (in chunks of
   --batch), and the ascents of all of them at once -- the boxes share no
@@ -211,6 +219,7 @@ def image_rows(ctx: dict, item: dict, res: dict, bon: dict, grad: dict, clean: f
         ub = item["boxes"][i].astype(np.float64)
         ident = {"image_name": item["stem"], "kind": row["kind"], "user": row["user"], "attempt": row["attempt"],
                  "dataset": item["dataset"], "half": item["half"], "fold": item["fold"], "group": groups[i]}
+        ident.update({k: v for k, v in row.items() if k.startswith("cs_")})       # critical shifts: the JSON's numbers
         bpick = {mm: int(np.argmax(bon[mm]["pred"][i])) for mm in MODES}
         ref = {"undef": res[0]["small"][0][i], "hsel": res[1]["small"][0][i],
                "bon_mm0": bon[0]["small"][i][bpick[0]], "bon_mm1": bon[1]["small"][i][bpick[1]],
@@ -286,6 +295,74 @@ def method_summary(PB: pd.DataFrame, alphas) -> str:
         L.append(f"{c[:-4]:22s} {v['all']:8.4f} {v['bottom50']:9.4f} {v['top50']:8.4f}   "
                  + " / ".join(f"{(v[g] / base[g] - 1) * 100:+.2f}" for g in base))
     return "\n".join(L)
+
+
+CS_ROLES = ("bad", "best")
+
+
+def load_cs_plan(path: Path, A: list, B: list, lim) -> tuple[list, dict]:
+    """--critical_shifts: the JSON's cases grouped by image, in the subsets'
+    order -> (plan [(dataset, half, stem)], {stem: [case, ...]})."""
+    cases = json.loads(Path(path).read_text(encoding="utf-8"))
+    by = {}
+    for c in cases:
+        by.setdefault((c["dataset"], c["image_name"]), []).append(c)
+    order = ["COCO", "Berkeley", "GrabCut", "DAVIS", "PASCAL", "ADE20K", "TETRIS", "ACDC", "BUID", "MedScribble"]
+    plan, per = [], {}
+    for ds in order + sorted({d for d, _ in by} - set(order)):
+        stems = sorted(s for d, s in by if d == ds)
+        if ds == "COCO":
+            halves = [("A", s) for s in stems if s in set(A)] + [("B", s) for s in stems if s in set(B)]
+            halves = [x for h in ("A", "B") for x in lim([x for x in halves if x[0] == h])]
+        else:
+            halves = [("-", s) for s in lim(stems)]
+        for half, s in halves:
+            plan.append((ds, half, s))
+            # the JSON lists biggest drop first; keep a stable per-image order for the case ids
+            per[s] = sorted(by[(ds, s)], key=lambda c: (-c["iou_drop"], c["bad_box"], c["best_box"]))
+    return plan, per
+
+
+def load_cs_item(dec, root: Path, dataset: str, half: str, stem: str, cases: list, fold: int):
+    """An image of --critical_shifts as an item of the pool: every case gives two
+    boxes, the attack (kind "bad": bad_box) and its good neighbour (kind "best":
+    best_box), both in SAM-1's 1024 frame as the JSON keeps them; user = the
+    case id inside the image. cs_* carry the JSON's numbers (never features)."""
+    import refine_box_iou_grad as R
+    from heatmaps.defend_critical_shifts import _find_file, _prepare_image
+    img_path, gt_path = _find_file(str(root / "images"), stem), _find_file(str(root / "masks"), stem)
+    if img_path is None or gt_path is None:
+        raise FileNotFoundError(f"{stem}: {'image' if img_path is None else 'mask'} not found under {root}")
+    _prepare_image(str(img_path), dec.p)
+    gt = R._load_gt(gt_path, dec.p)
+    rows, boxes = [], []
+    for j, c in enumerate(cases):
+        for role in CS_ROLES:
+            other = "best" if role == "bad" else "bad"
+            boxes.append(c[f"{role}_box"])
+            rows.append({"dataset": dataset, "image_name": stem, "kind": role, "user": f"c{j:02d}", "attempt": "own",
+                         "half": half, "fold": fold, "cs_json_iou": float(c[f"{role}_iou"]),
+                         "cs_pair_json_iou": float(c[f"{other}_iou"]), "cs_iou_drop": float(c["iou_drop"])})
+    rmin, rmax, cmin, cmax = R.get_bbox_from_mask(gt.numpy().astype(np.uint8))
+    tight = R.original_to_1024(np.array([[cmin, rmin, cmax, rmax]], dtype=np.int32), R.get_original_size(dec.p))[0]
+    boxes = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
+    return {"stem": stem, "dataset": dataset, "half": half, "fold": fold, "rows": rows, "boxes": boxes,
+            "b": dec.model_boxes(boxes), "gt": gt.to(dec.device), "best_box": tight.tolist()}
+
+
+def json_check(PB: pd.DataFrame) -> dict:
+    """--critical_shifts: the single output's IoU here against the JSON's (comp_hw's
+    batched heatmap), per role. Critical boxes sit on a knife edge, so a few can
+    flip on batch-dependent numerics (SAM-3)."""
+    if "cs_json_iou" not in PB.columns:
+        return {"available": False}
+    out = {"available": True}
+    for role, s in PB.groupby("kind"):
+        d = (s.undef_iou - s.cs_json_iou).abs()
+        out[role] = {"boxes": int(len(s)), "max_abs": float(d.max()), "share_over_0.01": float((d > 0.01).mean()),
+                     "share_over_0.1": float((d > 0.1).mean()), "mean_ours": float(s.undef_iou.mean()),
+                     "mean_json": float(s.cs_json_iou.mean())}
+    return out
 
 
 def group_check(PB: pd.DataFrame) -> dict:
@@ -378,8 +455,14 @@ def run(args) -> int:
     Vdev = {k: torch.as_tensor(v, device=device) for k, v in scan["V"].items()}
     alphas = list(args.alphas)
     lim = (lambda xs: list(xs)[:args.limit_images]) if args.limit_images > 0 else list
-    plan = [("COCO", "A", s) for s in lim(A)] + [("COCO", "B", s) for s in lim(B)]
-    plan += [(d, "-", s) for d in datasets[1:] for s in lim(index[d].keys())]
+    cs_cases = None
+    if args.critical_shifts:
+        plan, cs_cases = load_cs_plan(Path(args.critical_shifts), A, B, lim)
+        print(f"critical shifts {args.critical_shifts}: {sum(len(v) for v in cs_cases.values())} cases on "
+              f"{len(cs_cases)} images (x2 boxes: the attack and its good neighbour)", flush=True)
+    else:
+        plan = [("COCO", "A", s) for s in lim(A)] + [("COCO", "B", s) for s in lim(B)]
+        plan += [(d, "-", s) for d in datasets[1:] for s in lim(index[d].keys())]
     # one process per GPU: every n-th image (images are independent; groups are inside an image)
     plan = plan[args.shard::args.n_shards]
 
@@ -389,7 +472,8 @@ def run(args) -> int:
         for k, (ds, half, stem) in enumerate(plan):
             table = f"COCO_{half}" if ds == "COCO" else ds
             fold = fold_of[stem] if half == "A" else -1
-            item = SMS.load_item(dec, root, ds, half, stem, index[ds], fold)
+            item = (load_cs_item(dec, root, ds, half, stem, cs_cases[stem], fold) if cs_cases is not None
+                    else SMS.load_item(dec, root, ds, half, stem, index[ds], fold))
             first = table not in seen
             seen.add(table)
             res = SMC.image_pass(runner, dec, site, item, Vdev[fold if half == "A" else "all"], alphas, checks,
@@ -437,6 +521,7 @@ def run(args) -> int:
     D.to_csv(out / "rows.csv.gz", index=False, float_format="%.6f")
     checks["groups"] = group_check(PB)
     bad = checks["groups"]["n_images_off"]
+    checks["critical_shifts_json"] = json_check(PB)
     ref = SMS.read_reference(args.reference_csv, args.use)
     for key, col, ref_col in (("repro", "undef_iou", "undefended_iou"), ("repro_headsel", "hsel_iou", "headsel_iou")):
         r = SMS.repro(PB, ref, col, ref_col, args.repro_tol)
@@ -490,6 +575,9 @@ def parse_args(argv=None):
     p.add_argument("--stride", type=int, default=4, help="feature masks, as dump_selector_data")
     p.add_argument("--check_boxes", type=int, default=3, help="boxes per subset checked against the repo's functions")
     p.add_argument("--log_alpha", type=float, default=8.0, help="steering alpha shown in the per-image log line")
+    p.add_argument("--critical_shifts", default="",
+                   help="critical_shifts_all.json of sample_critical_shifts.py: its attack boxes and their good "
+                        "neighbours instead of the user annotations")
     p.add_argument("--reference_csv", default="")
     p.add_argument("--repro_tol", type=float, default=1e-3)
     p.add_argument("--keep_tf32", action="store_true")
@@ -557,6 +645,12 @@ def merge_shards(out: Path, reference_csv: str | None) -> int:
                                   for k in cs[0]["repo_equivalence"]}
     checks["groups"] = group_check(PB)
     bad = checks["groups"]["n_images_off"]
+    checks["critical_shifts_json"] = json_check(PB)
+    if checks["critical_shifts_json"].get("available"):
+        print("critical shifts, single output here vs the JSON: " + "; ".join(
+            f"{k}: max |d| {v['max_abs']:.3f}, >0.01 {v['share_over_0.01']:.1%}, >0.1 {v['share_over_0.1']:.1%}, "
+            f"mean {v['mean_ours']:.4f} vs {v['mean_json']:.4f}"
+            for k, v in checks["critical_shifts_json"].items() if isinstance(v, dict)), flush=True)
     a0 = metas[0]["args"]
     ref = SMS.read_reference(reference_csv if reference_csv is not None else a0.get("reference_csv", ""), a0["use"])
     for key, col, ref_col in (("repro", "undef_iou", "undefended_iou"), ("repro_headsel", "hsel_iou", "headsel_iou")):
