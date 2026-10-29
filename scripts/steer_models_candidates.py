@@ -91,15 +91,20 @@ def mask_change(m: torch.Tensor, m0: torch.Tensor) -> torch.Tensor:
     return x / u.clamp_min(1.0)
 
 
-def load_scan(scan: Path, site: str, dec, A, args) -> dict:
+def site_shape(dec, site, v: np.ndarray) -> tuple:
+    """The shape a site's vector must have on this decoder."""
+    return {"tok": (dec.T, 256), "sparse": (dec.n_sparse, 256), "img": (256,)}.get(site.kind, (dec.n_mask, v.shape[-1]))
+
+
+def load_scan(scan: Path, site, dec, A, args) -> dict:
     """The scan's vectors at the site, and the checks that it is this model's."""
     meta = json.loads((scan / "meta.json").read_text(encoding="utf-8"))
     split = json.loads((scan / "split.json").read_text(encoding="utf-8"))
     z = np.load(scan / "vectors.npz")
     folds = int(meta["folds"])
-    V = {"all": z[f"all/{site}/dm"]}
+    V = {"all": z[f"all/{site.id}/dm"]}
     for k in range(folds):
-        V[k] = z[f"{k}/{site}/dm"]
+        V[k] = z[f"{k}/{site.id}/dm"]
     lay = meta["layout"]
     c = {"scan_dir": str(scan), "model": meta["model_name"], "checkpoint": meta["checkpoint"],
          "same_model": meta["model_name"] == args.model_name,
@@ -108,7 +113,7 @@ def load_scan(scan: Path, site: str, dec, A, args) -> dict:
          "same_split_A": sorted(split["A"]) == sorted(A), "folds": folds, "seed": meta["args"]["seed"],
          "vector_shape": list(V["all"].shape)}
     c["ok"] = bool(c["same_model"] and c["same_layout"] and c["same_split_A"]
-                   and tuple(V["all"].shape) == (dec.T, 256))
+                   and tuple(V["all"].shape) == site_shape(dec, site, V["all"]))
     return {"V": V, "meta": meta, "check": c}
 
 
@@ -296,7 +301,7 @@ def run(args) -> int:
     datasets = list(dict.fromkeys(["COCO", *args.datasets]))
     index = SUS.index_study(root, args.use, datasets)
     A, B = SUS.split_halves(index["COCO"].keys(), args.split_seed)
-    scan = load_scan(Path(args.scan_dir), site.id, dec, A, args)
+    scan = load_scan(Path(args.scan_dir), site, dec, A, args)
     checks["scan"] = scan["check"]
     print(f"{args.model_name}: {dec.T} tokens, fallback {dec.dynamic}, TF32 matmul {tf32['matmul_after_load']} -> "
           f"{tf32['matmul_run']}; scan {args.scan_dir}: {scan['check']}", flush=True)

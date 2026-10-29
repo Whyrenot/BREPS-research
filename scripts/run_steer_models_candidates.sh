@@ -8,6 +8,7 @@
 #
 #   CUDA_VISIBLE_DEVICES=0 bash scripts/run_steer_models_candidates.sh
 #   MODELS="SAM3" ...   only some models;  SMOKE=1 ...  2 images per half / subset, out dirs *_smoke
+#   SITES="L2.norm3 hyper" ...  steering sites (default L2.norm3), one out dir per site
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -19,6 +20,7 @@ CKPT_SAM3=${CKPT_SAM3:-}
 REF_SAM21=${REF_SAM21:-}          # results/sam21full_m.csv is hiera_large: no reference for base_plus
 MODELS=${MODELS:-"SAM SAM2.1 SAM3"}
 ALPHAS=${ALPHAS:-1,2,3,4,6,8,12,16,24,32}
+SITES=${SITES:-L2.norm3}
 SMOKE=${SMOKE:-0}
 status=0
 
@@ -37,17 +39,20 @@ for model in $MODELS; do
         *)      echo "unknown model $model"; status=1; continue ;;
     esac
     scan=exp_res/steer_scan_${model}
-    out=exp_res/steer_cand_${model}${suffix}
     if [ ! -f "$scan/vectors.npz" ]; then echo "$model: no scan in $scan, run run_steer_models_scan.sh first"; status=1; continue; fi
-    mkdir -p "$out"
-    echo "=== $model candidates $(date)"
-    python scripts/steer_models_candidates.py --model_name "$model" --root "$ROOT" --checkpoint_path "$ckpt" \
-        --scan_dir "$scan" --reference_csv "$ref" --alphas "$ALPHAS" --out_dir "$out" "${extra[@]}" 2>&1 | tee "$out/run.log"
-    if [ "${PIPESTATUS[0]}" -ne 0 ]; then echo "$model candidates FAILED"; status=1; continue; fi
-    echo "=== $model alpha regressors $(date)"
-    python scripts/steer_multimask.py --from_dump "$out/rows.csv.gz" --alphas "$ALPHAS" --fixed_alphas 1,4,12 \
-        --reference_csv "$ref" --out_dir "$out/gbm" 2>&1 | tee "$out/gbm.log"
-    [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "$model regressors FAILED"; status=1; }
+    for site in $SITES; do
+        out=exp_res/steer_cand_${model}_${site}${suffix}
+        mkdir -p "$out"
+        echo "=== $model $site candidates $(date)"
+        python scripts/steer_models_candidates.py --model_name "$model" --root "$ROOT" --checkpoint_path "$ckpt" \
+            --scan_dir "$scan" --site "$site" --reference_csv "$ref" --alphas "$ALPHAS" --out_dir "$out" \
+            "${extra[@]}" 2>&1 | tee "$out/run.log"
+        if [ "${PIPESTATUS[0]}" -ne 0 ]; then echo "$model $site candidates FAILED"; status=1; continue; fi
+        echo "=== $model $site alpha regressors $(date)"
+        python scripts/steer_multimask.py --from_dump "$out/rows.csv.gz" --alphas "$ALPHAS" --fixed_alphas 1,4,12 \
+            --reference_csv "$ref" --out_dir "$out/gbm" 2>&1 | tee "$out/gbm.log"
+        [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "$model $site regressors FAILED"; status=1; }
+    done
 done
 
 echo "=== done $(date), status $status"
