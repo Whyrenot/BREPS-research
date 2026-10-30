@@ -8,8 +8,9 @@ dataset out -- and how far to steer each box, out of fold on every image.
 What changes against steer_universal.py (A / B halves, L2.norm3, 13 best - 12 worst)
   positives    D10 - D1: inside every image the best and the worst 10% of its
                annotations by multimask=False IoU (exactly 10% of them, the
-               deciles of export_combined_deciles.py); --rules halves adds the
-               old 13 best - 12 worst as a control
+               deciles of export_combined_deciles.py); --rules decile,halves adds
+               the old 13 best - 12 worst (the runner's default), compared box by
+               box in pairs.csv
   sites        L2.norm2, L2.norm3 (token stream, all tokens) and hyper (the
                outputs of all mask tokens' hypernetwork MLPs), --sites
   folds        5 image folds stratified by subset over all images (COCO too) for
@@ -616,8 +617,11 @@ def stage_merge(args) -> int:
     checks = read_json(out / "checks_states.json") if (out / "checks_states.json").is_file() else {}
     st = sum_checks([read_json(p / "steer_checks.json") for p in shards if (p / "steer_checks.json").is_file()])
     checks["steer"] = st
-    checks["steer_coverage"] = {"images": len(study["plan"]), "merged": len(imgs),
-                                "ok": imgs == list(range(len(study["plan"])))}
+    dup = int(B.duplicated(["plan_idx", "box_idx"]).sum())       # a stale shard of an earlier run
+    want = [cfg_name(r, s, v) for r in study["rules"] for s in study["sites"] for v in study["variants"]]
+    checks["steer_coverage"] = {"images": len(study["plan"]), "merged": len(imgs), "duplicate_boxes": dup,
+                                "configs_missing": sorted(set(want) - set(names)),
+                                "ok": imgs == list(range(len(study["plan"]))) and dup == 0 and set(want) <= set(names)}
     checks["groups"] = group_check(B)
     first = Z[names[0]]
     B["undef"], B["hsel"] = first[:, 0, 0, 0], first[:, 0, 1, 0]
@@ -804,6 +808,13 @@ def stage_analyse(args) -> int:
                             b_ = f"mm{mm} · {site_label(study, rule, ref)} · {v} · CatBoost"
                             r2[f"mm{mm} · {v}: {site_label(study, rule, site)} − {site_label(study, rule, ref)} · CatBoost"] = \
                                 (res[a_][s], res[b_][s])
+        if "decile" in rules and "halves" in rules:
+            for mm in MODES:
+                for site in sites:
+                    for v in ("own", "pool", "lodo"):
+                        if v in variants:
+                            a_, b_ = (f"mm{mm} · {site_label(study, r, site)} · {v} · CatBoost" for r in ("decile", "halves"))
+                            r2[f"mm{mm} · {site} · {v}: D10−D1 − половины · CatBoost"] = (res[a_][s], res[b_][s])
         per2[d] = (Dt, r2)
     T = G.score_blocks(per, args)
     T.to_csv(out / "table.csv", index=False)

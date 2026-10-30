@@ -14,8 +14,10 @@
 #   STEPS="analyse" ...      only some steps of: states vectors steer merge analyse
 #   SMOKE=1 ...              2 images per subset, alphas 4 and 16 (hyper 4 and 32), CatBoost 50 iterations, *_smoke
 #   CB_TASK=CPU ...          the alpha regressor on the CPU (default GPU)
-#   SITES=... VARIANTS=... RULES=decile,halves ...   the study's grid (default L2.norm2,L2.norm3,hyper /
-#                            own,pool,lodo,coco,rand / decile)
+#   SITES=... VARIANTS=... RULES=... the study's grid (default L2.norm2,L2.norm3,hyper /
+#                            own,pool,lodo,coco,rand / decile,halves: D10 - D1 and 13 best - 12 worst)
+# GPUS: free cards only, the first one also runs CatBoost. The states step clears the model's
+# old shard_* (a stale shard of a run with more GPUs would mix in).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -28,7 +30,7 @@ MODELS=${MODELS:-"SAM SAM2.1 SAM3"}
 USE=${USE:-mp}
 SITES=${SITES:-L2.norm2,L2.norm3,hyper}
 VARIANTS=${VARIANTS:-own,pool,lodo,coco,rand}
-RULES=${RULES:-decile}
+RULES=${RULES:-decile,halves}
 GPUS=${GPUS:-${CUDA_VISIBLE_DEVICES:-0}}
 GPUS=${GPUS//,/ }
 THREADS=${THREADS:-4}
@@ -84,6 +86,7 @@ for model in $MODELS; do
     mkdir -p "$out"
     if has states; then
         echo "=== $model states on GPUs ${gpus[*]} $(date)"
+        rm -rf "$out"/shard_*
         shards states "$model" "$ckpt" "$out" || { status=1; continue; }
     fi
     if has vectors; then
