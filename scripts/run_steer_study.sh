@@ -52,6 +52,9 @@ n=${#gpus[@]}
 mkdir -p exp_res/steer_study
 LOG=exp_res/steer_study/run${suffix}.log
 exec > >(tee -a "$LOG") 2>&1
+# Ctrl-C / kill: background jobs of a non-interactive bash ignore SIGINT, so the shards (and SAM-3's
+# conda-run children) would go on; stop the whole process group of this run instead
+trap 'trap - INT TERM; echo "##### interrupted $(date): stopping every process of this run"; kill -TERM 0' INT TERM
 echo "##### run_steer_study: MODELS=$MODELS USE=$USE SITES=$SITES VARIANTS=$VARIANTS RULES=$RULES GPUS=${gpus[*]} STEPS=$STEPS SMOKE=$SMOKE $(date)"
 
 has() { [[ " $STEPS " == *" $1 "* ]]; }
