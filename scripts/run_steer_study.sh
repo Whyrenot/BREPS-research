@@ -3,8 +3,9 @@
 # m + p annotations: D10 - D1 vectors per subset at L2.norm2, L2.norm3 and the hypernetwork
 # outputs; own / pooled / leave-one-dataset-out (+ COCO, random) vectors out of fold on 5 image
 # folds; every alpha, both output modes; the CatBoost alpha regressor out of fold.
-# Per model:  states (all GPUs) -> vectors (CPU) -> steer (all GPUs) -> merge (CPU)
-#             -> analyse (CatBoost on the first GPU, in the background while the next model runs)
+# Per model:  states (all GPUs) -> vectors (CPU) -> steer (all GPUs) -> merge (CPU); then, after the
+# GPU stages of every model, the analyses of all models at once, each with CatBoost on its own GPU
+# of GPUS (at most --cb_gpu_ram_part 0.25 of the card)
 #   exp_res/steer_study/<model>/summary.md, per_box.csv.gz, table.csv, pairs.csv, steer.npz, ...
 # merge checks undef / head-select against the model's m + p pool (exp_res/pool_<model>_mp).
 # SAM-3 re-execs itself into the sam3 conda env. A failing model does not stop the next.
@@ -16,8 +17,8 @@
 #   CB_TASK=CPU ...          the alpha regressor on the CPU (default GPU)
 #   SITES=... VARIANTS=... RULES=... the study's grid (default L2.norm2,L2.norm3,hyper /
 #                            own,pool,lodo,coco,rand / decile,halves: D10 - D1 and 13 best - 12 worst)
-# GPUS: free cards only, the first one also runs CatBoost. The states step clears the model's
-# old shard_* (a stale shard of a run with more GPUs would mix in).
+# GPUS: free cards only. The states step clears the model's old shard_* (a stale shard of a run
+# with more GPUs would mix in). STEPS="analyse" MODELS=... reruns the analysis alone.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -73,7 +74,7 @@ shards() {
 }
 
 status=0
-bg=()
+ready=()
 for model in $MODELS; do
     case "$model" in
         SAM)    ckpt=$CKPT_SAM ;;
@@ -103,14 +104,23 @@ for model in $MODELS; do
         python scripts/steer_study.py --stage merge --out_dir "$out" --pool_dir "$pool" 2>&1 | tee "$out/merge.log"
         [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "$model merge FAILED"; status=1; continue; }
     fi
-    if has analyse; then
-        echo "=== $model analyse in the background (CatBoost on $CB_TASK, GPU ${gpus[0]}; log $out/analyse.log) $(date)"
-        ( CUDA_VISIBLE_DEVICES=${gpus[0]} OMP_NUM_THREADS=$THREADS python scripts/steer_study.py --stage analyse \
+    ready+=("$model")
+done
+
+# the analyses only now, when no shard holds a card: CatBoost of one model per GPU, all at once
+if has analyse; then
+    bg=()
+    for j in "${!ready[@]}"; do
+        model=${ready[$j]}
+        out=exp_res/steer_study/${model}${suffix}
+        gpu=${gpus[$((j % n))]}
+        echo "=== $model analyse (CatBoost on $CB_TASK, GPU $gpu; log $out/analyse.log) $(date)"
+        ( CUDA_VISIBLE_DEVICES=$gpu OMP_NUM_THREADS=$THREADS python scripts/steer_study.py --stage analyse \
             --out_dir "$out" --devices 0 "${analyse[@]}" > "$out/analyse.log" 2>&1 \
             && echo "=== $model done: $out/summary.md $(date)" || { echo "$model analyse FAILED (see $out/analyse.log)"; exit 1; } ) &
         bg+=($!)
-    fi
-done
-for p in ${bg[@]+"${bg[@]}"}; do wait "$p" || status=1; done
+    done
+    for p in ${bg[@]+"${bg[@]}"}; do wait "$p" || status=1; done
+fi
 echo "##### done $(date), status $status (log: $LOG)"
 exit $status

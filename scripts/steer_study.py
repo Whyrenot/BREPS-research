@@ -696,7 +696,7 @@ def policies(p: dict, alphas, B: pd.DataFrame, lodo: bool, args, cache_dir: Path
     h.update(np.ascontiguousarray(W).tobytes())
     h.update(np.ascontiguousarray(p["curve"]).tobytes())
     h.update(json.dumps([tag, list(alphas), lodo, args.cb_iterations, args.cb_depth, args.cb_lr, args.seed,
-                         fold.tolist()]).encode())
+                         args.task_type, fold.tolist()]).encode())
     cpath = cache_dir / f"{h.hexdigest()[:24]}.npz"
     if cpath.is_file():
         c = np.load(cpath)
@@ -716,7 +716,8 @@ def policies(p: dict, alphas, B: pd.DataFrame, lodo: bool, args, cache_dir: Path
         kw = dict(iterations=args.cb_iterations, depth=args.cb_depth, learning_rate=args.cb_lr, loss_function="RMSE",
                   random_seed=args.seed, verbose=False, allow_writing_files=False, task_type=args.task_type)
         if args.task_type == "GPU":
-            kw["devices"] = args.devices
+            # CatBoost takes 95% of the card's free memory by default: a shared card then runs out
+            kw["devices"], kw["gpu_ram_part"] = args.devices, args.cb_gpu_ram_part
         else:
             kw["thread_count"] = args.threads
         m = CatBoostRegressor(**kw).fit(X, y)
@@ -1019,6 +1020,8 @@ def parse_args(argv=None):
     m.add_argument("--cb_lr", type=float, default=0.08)
     m.add_argument("--task_type", choices=["CPU", "GPU"], default="CPU")
     m.add_argument("--devices", default="0")
+    m.add_argument("--cb_gpu_ram_part", type=float, default=0.25,
+                   help="share of the GPU's memory CatBoost may take (its default 0.95 starves other jobs on the card)")
     m.add_argument("--threads", type=int, default=-1)
     m.add_argument("--n_boot", type=int, default=2000)
     m.add_argument("--n_split", type=int, default=200)
