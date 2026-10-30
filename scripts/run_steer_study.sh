@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# The full steering study (scripts/steer_study.py) for SAM-1, SAM-2.1 and SAM-3 on the
+# m + p annotations: D10 - D1 vectors per subset at L2.norm2, L2.norm3 and the hypernetwork
+# outputs; own / pooled / leave-one-dataset-out (+ COCO, random) vectors out of fold on 5 image
+# folds; every alpha, both output modes; the CatBoost alpha regressor out of fold.
+# Per model:  states (all GPUs) -> vectors (CPU) -> steer (all GPUs) -> merge (CPU)
+#             -> analyse (CatBoost on the first GPU, in the background while the next model runs)
+#   exp_res/steer_study/<model>/summary.md, per_box.csv.gz, table.csv, pairs.csv, steer.npz, ...
+# merge checks undef / head-select against the model's m + p pool (exp_res/pool_<model>_mp).
+# SAM-3 re-execs itself into the sam3 conda env. A failing model does not stop the next.
+#
+#   GPUS="0 1 2 3 4 5 6 7" bash scripts/run_steer_study.sh
+#   MODELS="SAM3" ...        only some models
+#   STEPS="analyse" ...      only some steps of: states vectors steer merge analyse
+#   SMOKE=1 ...              2 images per subset, alphas 4 and 16 (hyper 4 and 32), CatBoost 50 iterations, *_smoke
+#   CB_TASK=CPU ...          the alpha regressor on the CPU (default GPU)
+#   SITES=... VARIANTS=... RULES=decile,halves ...   the study's grid (default L2.norm2,L2.norm3,hyper /
+#                            own,pool,lodo,coco,rand / decile)
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+ROOT=${ROOT:-/home/jovyan/shares/SR006.nfs2/pishugin/user_study/FOR_TEST}
+CKPTS=${CKPTS:-/home/jovyan/shares/SR006.nfs2/pishugin/temp/rclicks/MODEL_CHECKPOINTS}
+CKPT_SAM=${CKPT_SAM:-$CKPTS/SAM/sam_vit_b_01ec64.pth}
+CKPT_SAM21=${CKPT_SAM21:-$CKPTS/SAM2.1/sam2.1_hiera_base_plus.pt}
+CKPT_SAM3=${CKPT_SAM3:-}          # "" = the builder reuses facebook/sam3 from the HF cache
+MODELS=${MODELS:-"SAM SAM2.1 SAM3"}
+USE=${USE:-mp}
+SITES=${SITES:-L2.norm2,L2.norm3,hyper}
+VARIANTS=${VARIANTS:-own,pool,lodo,coco,rand}
+RULES=${RULES:-decile}
+GPUS=${GPUS:-${CUDA_VISIBLE_DEVICES:-0}}
+GPUS=${GPUS//,/ }
+THREADS=${THREADS:-4}
+CB_TASK=${CB_TASK:-GPU}
+STEPS=${STEPS:-"states vectors steer merge analyse"}
+SMOKE=${SMOKE:-0}
+
+study=(--use "$USE" --sites "$SITES" --variants "$VARIANTS" --rules "$RULES")
+analyse=(--task_type "$CB_TASK")
+suffix=""
+if [ "$SMOKE" = "1" ]; then
+    study+=(--limit_images 2 --alphas 4,16 --alphas_hyper 4,32)
+    analyse+=(--cb_iterations 50 --n_boot 200 --n_split 20)
+    suffix="_smoke"
+fi
+read -r -a gpus <<< "$GPUS"
+n=${#gpus[@]}
+mkdir -p exp_res/steer_study
+LOG=exp_res/steer_study/run${suffix}.log
+exec > >(tee -a "$LOG") 2>&1
+echo "##### run_steer_study: MODELS=$MODELS USE=$USE SITES=$SITES VARIANTS=$VARIANTS RULES=$RULES GPUS=${gpus[*]} STEPS=$STEPS SMOKE=$SMOKE $(date)"
+
+has() { [[ " $STEPS " == *" $1 "* ]]; }
+
+# one GPU stage of one model, one process per GPU; returns non-zero if any shard failed
+shards() {
+    local stage=$1 model=$2 ckpt=$3 out=$4 pids=() fail=0
+    for i in "${!gpus[@]}"; do
+        mkdir -p "$out/shard_$i"
+        CUDA_VISIBLE_DEVICES=${gpus[$i]} OMP_NUM_THREADS=$THREADS MKL_NUM_THREADS=$THREADS \
+            python scripts/steer_study.py --stage "$stage" --model_name "$model" --root "$ROOT" \
+            --checkpoint_path "$ckpt" --shard "$i" --n_shards "$n" --out_dir "$out" "${study[@]}" \
+            > "$out/shard_$i/$stage.log" 2>&1 &
+        pids+=($!)
+    done
+    for i in "${!pids[@]}"; do
+        wait "${pids[$i]}" || { echo "$model $stage shard $i FAILED (see $out/shard_$i/$stage.log)"; fail=1; }
+    done
+    return $fail
+}
+
+status=0
+bg=()
+for model in $MODELS; do
+    case "$model" in
+        SAM)    ckpt=$CKPT_SAM ;;
+        SAM2.1) ckpt=$CKPT_SAM21 ;;
+        SAM3)   ckpt=$CKPT_SAM3 ;;
+        *)      echo "unknown model $model"; status=1; continue ;;
+    esac
+    out=exp_res/steer_study/${model}${suffix}
+    pool=exp_res/pool_${model}_${USE}
+    mkdir -p "$out"
+    if has states; then
+        echo "=== $model states on GPUs ${gpus[*]} $(date)"
+        shards states "$model" "$ckpt" "$out" || { status=1; continue; }
+    fi
+    if has vectors; then
+        echo "=== $model vectors $(date)"
+        python scripts/steer_study.py --stage vectors --out_dir "$out" 2>&1 | tee "$out/vectors.log"
+        [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "$model vectors FAILED"; status=1; continue; }
+    fi
+    if has steer; then
+        echo "=== $model steer on GPUs ${gpus[*]} $(date)"
+        shards steer "$model" "$ckpt" "$out" || { status=1; continue; }
+    fi
+    if has merge; then
+        echo "=== $model merge $(date)"
+        python scripts/steer_study.py --stage merge --out_dir "$out" --pool_dir "$pool" 2>&1 | tee "$out/merge.log"
+        [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "$model merge FAILED"; status=1; continue; }
+    fi
+    if has analyse; then
+        echo "=== $model analyse in the background (CatBoost on $CB_TASK, GPU ${gpus[0]}; log $out/analyse.log) $(date)"
+        ( CUDA_VISIBLE_DEVICES=${gpus[0]} OMP_NUM_THREADS=$THREADS python scripts/steer_study.py --stage analyse \
+            --out_dir "$out" --devices 0 "${analyse[@]}" > "$out/analyse.log" 2>&1 \
+            && echo "=== $model done: $out/summary.md $(date)" || { echo "$model analyse FAILED (see $out/analyse.log)"; exit 1; } ) &
+        bg+=($!)
+    fi
+done
+for p in ${bg[@]+"${bg[@]}"}; do wait "$p" || status=1; done
+echo "##### done $(date), status $status (log: $LOG)"
+exit $status
