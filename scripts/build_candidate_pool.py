@@ -350,6 +350,39 @@ def load_cs_item(dec, root: Path, dataset: str, half: str, stem: str, cases: lis
             "b": dec.model_boxes(boxes), "gt": gt.to(dec.device), "best_box": tight.tolist()}
 
 
+def load_plain_plan(root: Path, name: str, lim) -> tuple[list, dict]:
+    """--plain_root: a set made by fetch_transfer_sets.py (images/, masks/, annotations.csv
+    with x1 y1 x2 y2 in the saved image's pixels, width / height of it) -> (plan, {stem: rows})."""
+    ann = pd.read_csv(root / "annotations.csv", dtype={"image_id": str, "rad_id": str})
+    per = {s: g.to_dict("records") for s, g in ann.groupby("image_id", sort=True)}
+    return [(name, "-", s) for s in lim(sorted(per))], per
+
+
+def load_plain_item(dec, root: Path, dataset: str, stem: str, recs: list):
+    """An image of --plain_root as an item of the pool: its boxes (one per annotator; user =
+    rad_id if given, else u<j>), the GT mask and its tight box (1024 frame), as load_cs_item."""
+    import refine_box_iou_grad as R
+    from heatmaps.defend_critical_shifts import _find_file, _prepare_image
+    img_path, gt_path = _find_file(str(root / "images"), stem), _find_file(str(root / "masks"), stem)
+    if img_path is None or gt_path is None:
+        raise FileNotFoundError(f"{stem}: {'image' if img_path is None else 'mask'} not found under {root}")
+    _prepare_image(str(img_path), dec.p)
+    gt = R._load_gt(gt_path, dec.p)
+    H, W = R.get_original_size(dec.p)
+    rows, boxes = [], []
+    for j, r in enumerate(recs):
+        sx, sy = W / float(r["width"]), H / float(r["height"])
+        boxes.append([r["x1"] * sx, r["y1"] * sy, r["x2"] * sx, r["y2"] * sy])
+        user = str(r["rad_id"]) if isinstance(r.get("rad_id"), str) and r["rad_id"] else f"u{j:02d}"
+        rows.append({"dataset": dataset, "image_name": stem, "kind": "box", "user": user, "attempt": "own",
+                     "half": "-", "fold": -1})
+    boxes = R.original_to_1024(np.asarray(boxes, dtype=np.float64), (H, W)).astype(np.float32).reshape(-1, 4)
+    rmin, rmax, cmin, cmax = R.get_bbox_from_mask(gt.numpy().astype(np.uint8))
+    tight = R.original_to_1024(np.array([[cmin, rmin, cmax, rmax]], dtype=np.int32), (H, W))[0]
+    return {"stem": stem, "dataset": dataset, "half": "-", "fold": -1, "rows": rows, "boxes": boxes,
+            "b": dec.model_boxes(boxes), "gt": gt.to(dec.device), "best_box": tight.tolist()}
+
+
 def json_check(PB: pd.DataFrame) -> dict:
     """--critical_shifts: the single output's IoU here against the JSON's (comp_hw's
     batched heatmap), per role. Critical boxes sit on a knife edge, so a few can
@@ -441,7 +474,8 @@ def run(args) -> int:
     ctx = {"predictor": predictor, "device": device}
 
     root = Path(args.root)
-    datasets = list(dict.fromkeys(["COCO", *args.datasets]))
+    # --plain_root: the user study is only read for the COCO split the scan was made on
+    datasets = ["COCO"] if args.plain_root else list(dict.fromkeys(["COCO", *args.datasets]))
     index = SUS.index_study(root, args.use, datasets)
     A, B = SUS.split_halves(index["COCO"].keys(), args.split_seed)
     scan = SMC.load_scan(Path(args.scan_dir), site, dec, A, args)
@@ -455,8 +489,12 @@ def run(args) -> int:
     Vdev = {k: torch.as_tensor(v, device=device) for k, v in scan["V"].items()}
     alphas = list(args.alphas)
     lim = (lambda xs: list(xs)[:args.limit_images]) if args.limit_images > 0 else list
-    cs_cases = None
-    if args.critical_shifts:
+    cs_cases = plain = None
+    if args.plain_root:
+        plan, plain = load_plain_plan(Path(args.plain_root), args.plain_name, lim)
+        print(f"plain set {args.plain_root} as {args.plain_name}: {len(plan)} images, "
+              f"{sum(len(plain[s]) for _, _, s in plan)} boxes; steering vector 'all'", flush=True)
+    elif args.critical_shifts:
         plan, cs_cases = load_cs_plan(Path(args.critical_shifts), A, B, lim)
         print(f"critical shifts {args.critical_shifts}: {sum(len(v) for v in cs_cases.values())} cases on "
               f"{len(cs_cases)} images (x2 boxes: the attack and its good neighbour)", flush=True)
@@ -472,8 +510,12 @@ def run(args) -> int:
         for k, (ds, half, stem) in enumerate(plan):
             table = f"COCO_{half}" if ds == "COCO" else ds
             fold = fold_of[stem] if half == "A" else -1
-            item = (load_cs_item(dec, root, ds, half, stem, cs_cases[stem], fold) if cs_cases is not None
-                    else SMS.load_item(dec, root, ds, half, stem, index[ds], fold))
+            if plain is not None:
+                item = load_plain_item(dec, Path(args.plain_root), ds, stem, plain[stem])
+            elif cs_cases is not None:
+                item = load_cs_item(dec, root, ds, half, stem, cs_cases[stem], fold)
+            else:
+                item = SMS.load_item(dec, root, ds, half, stem, index[ds], fold)
             first = table not in seen
             seen.add(table)
             res = SMC.image_pass(runner, dec, site, item, Vdev[fold if half == "A" else "all"], alphas, checks,
@@ -578,6 +620,10 @@ def parse_args(argv=None):
     p.add_argument("--critical_shifts", default="",
                    help="critical_shifts_all.json of sample_critical_shifts.py: its attack boxes and their good "
                         "neighbours instead of the user annotations")
+    p.add_argument("--plain_root", default="",
+                   help="a transfer set of fetch_transfer_sets.py (images/, masks/, annotations.csv) instead of "
+                        "the user study; --root still gives the COCO split of the scan")
+    p.add_argument("--plain_name", default="OpenImages", help="the dataset name of --plain_root in the outputs")
     p.add_argument("--reference_csv", default="")
     p.add_argument("--repro_tol", type=float, default=1e-3)
     p.add_argument("--keep_tf32", action="store_true")

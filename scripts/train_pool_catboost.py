@@ -386,6 +386,20 @@ def train(P: pd.DataFrame, X: pd.DataFrame, spec: dict, a, out: Path, checks: di
     return s
 
 
+def regroup_by_dataset(P: pd.DataFrame, checks: dict) -> None:
+    """--regroup dataset: bottom50 / top50 over all boxes of a subset by the single
+    output's IoU (round(n / 2) worst = bottom50, ties by case) instead of inside the
+    image -- for sets with one box per image (transfer sets)."""
+    u = P[P.method_slot == "undef"].drop_duplicates("case")[["case", "key", "target_iou"]]
+    u = u.sort_values(["key", "target_iou", "case"], kind="mergesort")
+    rank = u.groupby("key").cumcount().to_numpy()
+    n = u.groupby("key").case.transform("size").to_numpy()
+    g = pd.Series(np.where(rank < np.round(n * 0.5), "bottom50", "top50"), index=u.case.to_numpy())
+    P["group"] = P.case.map(g).fillna("")
+    checks["regroup"] = {"by": "dataset", "boxes": int(len(u)), "bottom50": int((g == "bottom50").sum()),
+                         "unmapped_rows": int((P.group == "").sum())}
+
+
 def apply(P: pd.DataFrame, X: pd.DataFrame, src: Path, a, checks: dict) -> np.ndarray:
     """Score this pool with another run's selectors (--apply_with fold | full)."""
     from catboost import CatBoostRanker
@@ -547,6 +561,9 @@ def summary_md(T: pd.DataFrame, K: pd.DataFrame, meta: dict, astar: dict, checks
           + ("; разметки m и p ранжируются вместе" if len(kinds) > 1 else "") + "). % — прирост к undef; «CatBoost к "
           "методу» — прирост CatBoost в % от метода, 95% CI парным бутстрепом по картинкам; для блоков — среднее по "
           "наборам.", ""]
+    if a.regroup == "dataset":
+        L += ["**Здесь группы — по всем боксам набора** (`--regroup dataset`, одна рамка на картинку): худшая "
+              "половина боксов набора по IoU одного выхода — bottom50.", ""]
     for g in ("bottom50", "top50", "all"):
         L += [f"## {g}: IoU (% к undef)", "",
               "| блок | " + " | ".join(LABEL[m] for m in METHODS if m in set(T.method)) + " |",
@@ -640,6 +657,8 @@ def run(a) -> int:
     add_regressor_features(P, R, alphas, checks)
     del R
     P = exclude_A(P, meta, pool_dir, checks)
+    if a.regroup == "dataset":
+        regroup_by_dataset(P, checks)
     src_meta = None
     if a.apply_model:
         src = Path(a.apply_model)
@@ -695,6 +714,9 @@ def parse_args(argv=None):
     p.add_argument("--out_dir", required=True)
     p.add_argument("--apply_model", default="", help="out_dir of another run: score this pool with its selectors")
     p.add_argument("--apply_with", default="fold", choices=["fold", "full"])
+    p.add_argument("--regroup", default="image", choices=["image", "dataset"],
+                   help="bottom50 / top50 inside each image (the user study) or over each subset's boxes "
+                        "(one box per image)")
     p.add_argument("--alpha_star_from", default="", help="out_dir of another run: take its steering alpha* "
                                                          "(default: chosen on this pool's COCO A boxes)")
     p.add_argument("--task_type", default="GPU", choices=["GPU", "CPU"])
