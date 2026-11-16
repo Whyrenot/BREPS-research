@@ -374,7 +374,8 @@ def load_plain_item(dec, root: Path, dataset: str, stem: str, recs: list):
         sx, sy = W / float(r["width"]), H / float(r["height"])
         boxes.append([r["x1"] * sx, r["y1"] * sy, r["x2"] * sx, r["y2"] * sy])
         user = str(r["rad_id"]) if isinstance(r.get("rad_id"), str) and r["rad_id"] else f"u{j:02d}"
-        rows.append({"dataset": dataset, "image_name": stem, "kind": "box", "user": user, "attempt": "own",
+        kind = str(r["kind"]) if isinstance(r.get("kind"), str) and r["kind"] else "box"   # e.g. NuCLS NP / JP / SP
+        rows.append({"dataset": dataset, "image_name": stem, "kind": kind, "user": user, "attempt": "own",
                      "half": "-", "fold": -1})
     boxes = R.original_to_1024(np.asarray(boxes, dtype=np.float64), (H, W)).astype(np.float32).reshape(-1, 4)
     rmin, rmax, cmin, cmax = R.get_bbox_from_mask(gt.numpy().astype(np.uint8))

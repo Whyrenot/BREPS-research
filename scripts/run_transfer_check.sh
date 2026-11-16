@@ -12,6 +12,7 @@
 #   DATA=/.../datasets/OpenImagesV7_test500 GPUS="0 1 2 3" bash scripts/run_transfer_check.sh
 #   MODEL=SAM (default) | SAM2.1 | SAM3;  NAME=OpenImages;  SMOKE=1: 4 images, dirs *_smoke
 #   STEPS="cb" ...  only the CatBoost step (the pool is there)
+#   REGROUP=image ...  groups inside each image (many boxes per object: NuCLS); default dataset (one box per image)
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -32,6 +33,7 @@ GPUS=${GPUS//,/ }
 THREADS=${THREADS:-4}
 STEPS=${STEPS:-"pool cb"}
 SMOKE=${SMOKE:-0}
+REGROUP=${REGROUP:-dataset}   # image: bottom50 / top50 inside each image (sets with many raters per object, e.g. NuCLS)
 CB_SRC=${CB_SRC:-exp_res/cb_${MODEL}_mp}
 read -r -a gpus <<< "$GPUS"
 n=${#gpus[@]}
@@ -67,7 +69,7 @@ fi
 if [[ " $STEPS " == *" cb "* ]]; then
     mkdir -p "$OUT"
     CUDA_VISIBLE_DEVICES=${gpus[0]} python scripts/train_pool_catboost.py --apply_model "$CB_SRC" --apply_with full \
-        --alpha_star_from "$CB_SRC" --regroup dataset --pool_dir "$POOL" --out_dir "$OUT" --devices 0 \
+        --alpha_star_from "$CB_SRC" --regroup "$REGROUP" --pool_dir "$POOL" --out_dir "$OUT" --devices 0 \
         || { echo "CatBoost FAILED"; exit 1; }
     echo "##### done $(date): $OUT/summary.md"
 fi
